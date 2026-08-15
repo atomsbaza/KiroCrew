@@ -10,8 +10,8 @@ import SkillForm, { assembleSkillContent, parseSkillContent, type SkillFormData 
 import SkillDirectoryBrowser from '../../components/SkillDirectoryBrowser'
 import SkillBrowserModal from '../../components/SkillBrowserModal'
 import DiffBlock from '../../components/DiffBlock'
-import MasterDetailBack from '../../components/MasterDetailBack'
-import { useMasterDetailView } from '../../hooks/useMasterDetailView'
+import ListDetailBack from '../../components/ListDetailBack'
+import { useListDetailView } from '../../hooks/useListDetailView'
 import { useProvider } from '../../providers'
 import type { Skill } from '../../types'
 import SkillContextBudget from './SkillContextBudget'
@@ -24,7 +24,7 @@ import { SettingRef } from '../../components/settingRef/SettingRef'
 const EMPTY_FORM: SkillFormData = { name: '', category: '', description: '', triggers: '', tags: '', always: false, body: '' }
 
 /**
- * The master-detail shell's height.
+ * The list-detail shell's height.
  *
  * `svh` (the viewport with browser chrome SHOWING) rather than `vh`: `vh`
  * resolves against the large viewport, so on a phone the pane runs under the
@@ -161,7 +161,7 @@ export default function SkillsTab() {
   const selectedSkill = useMemo(() => skills.find(s => s.key === selectedKey) ?? null, [skills, selectedKey])
 
   // Narrow viewport shows one pane at a time; a desktop shows both.
-  const { isMobile, showList, showDetail, openDetail, closeDetail } = useMasterDetailView()
+  const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
 
   // Keep a valid selection: default to the first skill, and recover if the
   // current selection is filtered out or deleted.  Suspended while editing:
@@ -254,7 +254,7 @@ export default function SkillsTab() {
       </div>
 
       {skills.length === 0 ? <EmptyState icon={<Sparkles className="lucide-inline" />} title={i18nT('pages.overview.skillsTab.no_skills_yet')} subtitle={i18nT('pages.overview.skillsTab.empty_subtitle')} action={<Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn>} /> : (
-        /* Master-detail: skill list (pane 1) on the left, then the directory
+        /* List-detail: skill list (pane 1) on the left, then the directory
          *  browser (panes 2+3: file tree + file content) on the right. */
         <div className={PANE_SHELL_CLASS}>
           {/* Pane 1 — skill list.  ``scrollbar-overlay`` keeps the scrollbar
@@ -280,7 +280,7 @@ export default function SkillsTab() {
             ) : detailEditing ? (
               <div className="flex flex-col h-full min-h-0">
                 <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-2.5 border-b border-border shrink-0">
-                  {isMobile && <MasterDetailBack label={i18nT('pages.overview.skillsTab.skills')} onBack={closeDetail} />}
+                  {isMobile && <ListDetailBack label={i18nT('pages.overview.skillsTab.skills')} onBack={closeDetail} />}
                   <span className="text-sm font-mono font-bold text-text-strong truncate">{selectedSkill.key}</span>
                   <div className="flex gap-2 shrink-0">
                     <Btn onClick={() => setDetailEditing(false)}>{i18nT('pages.overview.skillsTab.cancel')}</Btn>
@@ -295,7 +295,7 @@ export default function SkillsTab() {
               <div className="flex flex-col h-full min-h-0">
                 {/* Detail header: name, source badge, Edit/Delete (kirocrew only) */}
                 <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-2.5 border-b border-border shrink-0">
-                  {isMobile && <MasterDetailBack label={i18nT('pages.overview.skillsTab.skills')} onBack={closeDetail} />}
+                  {isMobile && <ListDetailBack label={i18nT('pages.overview.skillsTab.skills')} onBack={closeDetail} />}
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="text-sm font-bold text-text-strong truncate">{displayName(selectedSkill)}</span>
                     {sourceLabel(selectedSkill.source) && (

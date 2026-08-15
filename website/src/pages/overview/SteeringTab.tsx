@@ -7,8 +7,8 @@ import InfoTip from '../../components/InfoTip'
 import Modal from '../../components/Modal'
 import SearchableSelect from '../../components/SearchableSelect'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
-import MasterDetailBack from '../../components/MasterDetailBack'
-import { useMasterDetailView } from '../../hooks/useMasterDetailView'
+import ListDetailBack from '../../components/ListDetailBack'
+import { useListDetailView } from '../../hooks/useListDetailView'
 import type { SteeringFile, SteeringList } from '../../types'
 
 import { i18nT } from '../../i18n/t'
@@ -57,7 +57,7 @@ const EDITOR_CLASS =
   'w-full h-full min-h-[320px] bg-bg-elevated border border-border rounded-md p-3 text-text font-mono text-[13px] outline-none resize-none focus-ring'
 
 /**
- * The master-detail shell's height.
+ * The list-detail shell's height.
  *
  * `svh` (the viewport with browser chrome SHOWING) rather than `vh`: `vh`
  * resolves against the large viewport, so on a phone the pane runs under the
@@ -145,7 +145,7 @@ export default function SteeringTab() {
   const selected = useMemo(() => files.find(f => f.key === selectedKey) ?? null, [files, selectedKey])
 
   // Narrow viewport shows one pane at a time; a desktop shows both.
-  const { isMobile, showList, showDetail, openDetail, closeDetail } = useMasterDetailView()
+  const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
 
   // Keep a valid selection; suspended while editing so an unsaved draft is
   // never discarded by a background refetch reordering the list.
@@ -319,7 +319,7 @@ export default function SteeringTab() {
                     the Edit/Delete pair do not fit on one line, and squeezing
                     them onto one overlapped the two buttons. */}
                 <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-2.5 border-b border-border shrink-0">
-                  {isMobile && <MasterDetailBack label={i18nT('pages.overview.steeringTab.steering_files')} onBack={closeDetail} />}
+                  {isMobile && <ListDetailBack label={i18nT('pages.overview.steeringTab.steering_files')} onBack={closeDetail} />}
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="text-sm font-bold text-text-strong truncate">{selected.rel}</span>
                     <span className="text-[11px] px-1.5 py-[1px] rounded-full bg-bg-elevated text-muted border border-border font-bold shrink-0">

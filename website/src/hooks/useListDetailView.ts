@@ -17,7 +17,7 @@ import { useIsMobile } from './useIsMobile'
  * detail before the user picked anything: the list would be unreachable, and
  * Back a no-op because the auto-select effect re-fires on the next render.
  */
-export function useMasterDetailView() {
+export function useListDetailView() {
   const isMobile = useIsMobile()
   const [detailOpen, setDetailOpen] = useState(false)
 

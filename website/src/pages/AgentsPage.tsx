@@ -13,12 +13,12 @@ import SimpleSelect from '../components/SimpleSelect'
 import CrewAvatar from '../components/CrewAvatar'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import InfoTip from '../components/InfoTip'
-import MasterDetailBack from '../components/MasterDetailBack'
+import ListDetailBack from '../components/ListDetailBack'
 import { useProvider } from '../providers'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
-import { useMasterDetailView } from '../hooks/useMasterDetailView'
+import { useListDetailView } from '../hooks/useListDetailView'
 import { fmtPercent } from '../i18n/format'
 import { formatCost } from '../utils/formatCost'
 
@@ -431,7 +431,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
 
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null)
   // Narrow viewport shows one pane at a time; a desktop shows both.
-  const { isMobile, showList, showDetail, openDetail, closeDetail } = useMasterDetailView()
+  const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
   const [tab, setTab] = useState<DetailTab>('overview')
   const [filter, setFilter] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -461,7 +461,17 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   })
   const deleteAgentMut = useMutation({
     mutationFn: (name: string) => api.agentDelete(name),
-    onSuccess: (_r, name) => { if (selectedAgent?.name === name) setSelectedAgent(null); setDeleteError(null); refetchInstalled() },
+    // Deleting the agent you were looking at must also leave its detail pane.
+    // On a phone the panes are exclusive, so clearing the selection alone left
+    // `detailOpen` true with nothing selected: the placeholder branch renders
+    // without the Back control (that lives in the `selectedAgent` branch) and
+    // the roster — including its filter — is inside the hidden list pane, so
+    // there was no in-page way back.
+    onSuccess: (_r, name) => {
+      if (selectedAgent?.name === name) { setSelectedAgent(null); closeDetail() }
+      setDeleteError(null)
+      refetchInstalled()
+    },
     /*  The handler — not this page — is the authority on references: it checks
      *  the fallback and crew bindings under the same config lock the writers
      *  take, so it refuses (409) races this cached snapshot cannot see. Show its
@@ -743,7 +753,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
               {selectedAgent ? (<>
                 <div className="px-4 pt-3.5 border-b border-border">
                   <div className="flex items-center gap-2 flex-wrap">
-                    {isMobile && <MasterDetailBack label={i18nT('pages.agentsPage.installed_agents')} onBack={closeDetail} />}
+                    {isMobile && <ListDetailBack label={i18nT('pages.agentsPage.installed_agents')} onBack={closeDetail} />}
                     <span className="text-[15px] font-mono font-bold text-text-strong">{selectedAgent.name}</span>
                     {listed?.source && <SourceBadge source={listed.source} />}
                     {defaultAgent === selectedAgent.name && (

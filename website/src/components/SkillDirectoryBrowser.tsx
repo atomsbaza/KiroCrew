@@ -260,7 +260,7 @@ export default function SkillDirectoryBrowser({
 
   return (
     <div className={`flex gap-3 h-full min-h-0 ${isMobile ? 'flex-col' : ''}`} data-testid="skill-directory-browser">
-      {/* File-tree pane (pane 2 of the master-detail layout).
+      {/* File-tree pane (pane 2 of the list-detail layout).
        *
        * This is the SECOND fixed-width column inside an already-narrow detail
        * pane, so at 390px the two of them left the file viewer unreadable.

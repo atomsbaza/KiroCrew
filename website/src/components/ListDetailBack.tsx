@@ -1,8 +1,8 @@
 import { ArrowLeft } from 'lucide-react'
 
 /**
- * Return-to-list control for the narrow-viewport master-detail drill-down
- * (see `hooks/useMasterDetailView`). Rendered only while the detail pane is the
+ * Return-to-list control for the narrow-viewport list-detail drill-down
+ * (see `hooks/useListDetailView`). Rendered only while the detail pane is the
  * one visible pane, so it is the sole way back — component selection state is
  * not history, and a browser back-swipe would leave the page entirely.
  *
@@ -15,7 +15,7 @@ import { ArrowLeft } from 'lucide-react'
  * (44pt default, 28pt floor) and what Fluent and Primer recommend for mobile.
  * WCAG 2.2 SC 2.5.8's 24px is a floor to clear, not a target to design to.
  */
-export default function MasterDetailBack({ label, onBack }: { label: string; onBack: () => void }) {
+export default function ListDetailBack({ label, onBack }: { label: string; onBack: () => void }) {
   return (
     <button
       type="button"
