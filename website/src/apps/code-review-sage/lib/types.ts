@@ -174,6 +174,50 @@ export interface RunReport {
   report_slug: string | null
 }
 
+export type LocalReviewStatus = 'reviewing' | 'completed' | 'partially_completed' | 'failed'
+
+export interface LocalFinding {
+  id: string
+  file: string
+  side: 'new' | 'old'
+  line: number
+  end_line?: number | null
+  severity: 'info' | 'warning' | 'error'
+  category?: string | null
+  title: string
+  message: string
+  suggestion?: string | null
+  confidence?: number | null
+  status: 'open' | 'accepted' | 'fixing' | 'resolved' | 'dismissed' | 'stale'
+  user_instruction?: string | null
+  fingerprint?: string
+}
+
+export interface LocalReviewSession {
+  id: string
+  repository: string
+  mode: string
+  status: LocalReviewStatus
+  revision?: string
+  files?: Array<{
+    path: string
+    status: string
+    additions: number
+    deletions: number
+    hunks?: Array<{ old_start: number; new_start: number; lines: Array<{
+      kind: 'context' | 'add' | 'delete'
+      content: string
+      old_line?: number | null
+      new_line?: number | null
+    }> }>
+  }>
+  skipped_files?: string[]
+  warning?: string | null
+  findings: LocalFinding[]
+  error?: string
+  fix_runs?: Array<{ id: string; status: string; changed_files?: string[]; error?: string }>
+}
+
 // --- Repos + PRs -------------------------------------------------------------
 
 export interface PinnedRepo {
@@ -325,7 +369,7 @@ export interface LearningsResponse {
 
 // --- Navigation --------------------------------------------------------------
 
-export type MainView = 'reviews' | 'learning' | 'settings'
+export type MainView = 'reviews' | 'local' | 'learning' | 'settings'
 /** Which list the middle column shows: the active repo's PRs, or the threads. */
 export type ListTab = 'pulls' | 'reviews'
 export type RailSection = 'repos' | 'reviews' | 'learning' | 'settings'

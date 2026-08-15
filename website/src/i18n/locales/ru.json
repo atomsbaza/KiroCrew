@@ -366,6 +366,7 @@
         "pattern_other": "{{count}} шаблона"
       },
       "components": {
+        "localReview": {"local": "Local", "repository_path": "Repository path", "repository_path_hint": "Absolute path to a Git worktree", "start_review": "Run local review", "reviewing": "Reviewing local changes…", "no_findings": "No actionable findings", "files_reviewed": "{{count}} files reviewed", "select_finding": "Select this finding", "dismiss": "Dismiss", "accept": "Accept", "severity_info": "informational", "human_instruction": "Guidance for the fix agent (optional)", "fix_selected": "Fix selected", "revision": "Revision {{revision}}"},
         "addReposModal": {
           "add": "Добавить",
           "add_one_by_url_above": "Добавь его по URL выше.",

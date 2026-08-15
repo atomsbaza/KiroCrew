@@ -994,6 +994,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # are the app's own surface, same classification as its siblings above.
         "apps/builtins/code_review_sage/sage_lib/store.py",
         "apps/builtins/code_review_sage/sage_lib/discovery.py",
+        # Local-review input and findings stay inside the app's own persisted
+        # session/UI surface: routes scrub human instructions before persistence
+        # or an agent prompt, while local_review scrubs model findings before the
+        # app stores and returns them. The app surface is not a core egress row.
+        "apps/builtins/code_review_sage/backend/routes.py",
+        "apps/builtins/code_review_sage/sage_lib/local_review.py",
         # `chat_session` scrubs every turn of a post-review conversation at its
         # serialization boundary: the reviewer can repeat a credential it read in
         # the diff, and a tool title carries the arguments it was called with. Same

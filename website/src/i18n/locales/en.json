@@ -256,6 +256,22 @@
         "pattern_other": "{{count}} patterns"
       },
       "components": {
+        "localReview": {
+          "local": "Local",
+          "repository_path": "Repository path",
+          "repository_path_hint": "Absolute path to a Git worktree",
+          "start_review": "Run local review",
+          "reviewing": "Reviewing local changes…",
+          "no_findings": "No actionable findings",
+          "files_reviewed": "{{count}} files reviewed",
+          "select_finding": "Select this finding",
+          "dismiss": "Dismiss",
+          "accept": "Accept",
+          "severity_info": "informational",
+          "human_instruction": "Guidance for the fix agent (optional)",
+          "fix_selected": "Fix selected",
+          "revision": "Revision {{revision}}"
+        },
         "addReposModal": {
           "add": "Add",
           "add_one_by_url_above": "Add one by URL above.",
@@ -648,13 +664,13 @@
         }
       },
       "manifest": {
-        "description": "Deep-reviews GitHub pull requests and tells you which changes actually deserve your attention. Every changed file is reviewed in its own isolated agent session, weighted by how much blast radius it carries, and rolled up into a prioritized Focus Report. Findings are staged as a draft GitHub review that stays unpublished until you submit it, and the reviewer keeps learning your repository's real standards from shipped fixes and past review comments.",
+        "description": "Reviews local working-tree changes with structured inline findings, human guidance, and bounded agent-assisted fixes. GitHub pull-request review remains an optional secondary surface.",
         "display_name": "Code Review Sage",
         "highlight_1": "Focus Report ranks changes by blast radius so the risky files get read first",
         "highlight_2": "One isolated agent session per change, so findings never bleed between files",
         "highlight_3": "Reviews are read in the app — nothing is posted to your pull request unless you ask",
         "highlight_4": "Learns per-repository from shipped fixes, review comments, and design discussions",
-        "highlight_5": "Reviews GitHub pull requests; needs an authenticated `gh` CLI on the gateway host",
+        "highlight_5": "Reviews local working-tree changes before a pull request exists",
         "page_label": "Code Review Sage"
       },
       "views": {

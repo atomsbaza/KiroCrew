@@ -131,9 +131,6 @@
         "state_working": "Working"
       }
     },
-    "codeReviewSage": {
-      "codeReviewSagePage": {}
-    },
     "fileExplorer": {
       "fileViewer": {
         "copy_path_2": "Copy path: {{path}}",

@@ -1,8 +1,17 @@
-import { memo, lazy, Suspense } from 'react'
+import {
+  memo,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  type ComponentProps,
+} from 'react'
 import { monacoLang, useIsDark } from './MonacoCodeBlock'
 import { kirocrewDark, kirocrewLight } from './monacoTheme'
 import Clickable from './Clickable'
 import { copyToClipboard } from '../utils/clipboard'
+import { useStableMonacoLayout } from '../hooks/useStableMonacoLayout'
 
 import { i18nT } from '../i18n/t'
 const MonacoDiffEditor = lazy(async () => {
@@ -11,6 +20,11 @@ const MonacoDiffEditor = lazy(async () => {
   const { DiffEditor } = await import('@monaco-editor/react')
   return { default: DiffEditor }
 })
+
+type DiffEditorProps = ComponentProps<typeof MonacoDiffEditor>
+type DiffBeforeMount = NonNullable<DiffEditorProps['beforeMount']>
+type DiffOnMount = NonNullable<DiffEditorProps['onMount']>
+type DiffDisposable = { dispose: () => void }
 
 function extOf(fp: string) {
   const i = fp.lastIndexOf('.')
@@ -29,7 +43,41 @@ export default memo(function DiffPanel({ filePath, original, modified, sideBySid
   lineNumbers?: boolean
 }) {
   const isDark = useIsDark()
+  const editorRef = useRef<{ layout: () => void } | null>(null)
+  const themesRegisteredRef = useRef(false)
+  const diffSubscriptionRef = useRef<DiffDisposable | null>(null)
+  const { hostRef: editorHostRef, requestLayout } = useStableMonacoLayout(editorRef)
   const lang = monacoLang(extOf(filePath)) || 'plaintext'
+  const beforeMount = useCallback<DiffBeforeMount>((monaco) => {
+    if (themesRegisteredRef.current) return
+    themesRegisteredRef.current = true
+    monaco.editor.defineTheme('kirocrew-dark', kirocrewDark)
+    monaco.editor.defineTheme('kirocrew-light', kirocrewLight)
+  }, [themesRegisteredRef])
+  const onMount = useCallback<DiffOnMount>((editor) => {
+    if (editorRef.current) return
+    editorRef.current = editor
+    requestLayout()
+    // Jump to the first change once the diff is computed (async).
+    let settled = false
+    const revealFirstChange = () => {
+      if (settled) return
+      settled = true
+      const subscription = diffSubscriptionRef.current
+      diffSubscriptionRef.current = null
+      subscription?.dispose()
+      const first = editor.getLineChanges()?.[0]
+      if (first) editor.getModifiedEditor().revealLineInCenter(first.modifiedStartLineNumber || first.modifiedEndLineNumber || 1)
+    }
+    const subscription = editor.onDidUpdateDiff(revealFirstChange)
+    if (settled) subscription.dispose()
+    else diffSubscriptionRef.current = subscription
+  }, [requestLayout])
+  useEffect(() => () => {
+    diffSubscriptionRef.current?.dispose()
+    diffSubscriptionRef.current = null
+    editorRef.current = null
+  }, [])
   // Show the banner only when both sides carry content and it's the same.
   // Both-empty is a degenerate "new empty file" state, not a meaningful
   // identical comparison — let it fall through to the editor gracefully.
@@ -44,25 +92,15 @@ export default memo(function DiffPanel({ filePath, original, modified, sideBySid
           </span>
         </div>
       ) : (
-        <div className="flex-1 overflow-hidden">
+        <div ref={editorHostRef} className="flex-1 min-h-0 overflow-hidden">
           <Suspense fallback={<div className="flex items-center justify-center h-full text-muted text-sm">{i18nT('components.diffPanel.loading_diff')}</div>}>
             <MonacoDiffEditor
               original={original}
               modified={modified}
               language={lang}
               theme={isDark ? 'kirocrew-dark' : 'kirocrew-light'}
-              beforeMount={(monaco) => {
-                monaco.editor.defineTheme('kirocrew-dark', kirocrewDark)
-                monaco.editor.defineTheme('kirocrew-light', kirocrewLight)
-              }}
-              onMount={(editor) => {
-                // Jump to the first change once the diff is computed (async).
-                const nav = editor.onDidUpdateDiff(() => {
-                  nav.dispose()
-                  const first = editor.getLineChanges()?.[0]
-                  if (first) editor.getModifiedEditor().revealLineInCenter(first.modifiedStartLineNumber || first.modifiedEndLineNumber || 1)
-                })
-              }}
+              beforeMount={beforeMount}
+              onMount={onMount}
               options={{
                 readOnly: true,
                 renderSideBySide: sideBySide,
@@ -81,7 +119,9 @@ export default memo(function DiffPanel({ filePath, original, modified, sideBySid
                 scrollBeyondLastLine: false,
                 fontSize: 13,
                 lineNumbers: lineNumbers ? 'on' : 'off',
-                automaticLayout: true,
+                // Layout is driven by useStableMonacoLayout so panel resize and
+                // flex reflow cannot make Monaco's observer repaint in a loop.
+                automaticLayout: false,
                 renderValidationDecorations: 'off',
                 guides: { indentation: false },
                 stickyScroll: { enabled: false },

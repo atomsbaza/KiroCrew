@@ -16,6 +16,7 @@ import type {
   Run,
   RunReport,
   RunsResponse,
+  LocalReviewSession,
   Settings,
   SettingsResponse,
   UserReposResponse,
@@ -153,6 +154,37 @@ export const sageApi = {
     force = false,
   ): Promise<{ run_id?: string; repo: string; changes: string[]; skipped: number; status: string; message?: string }> =>
     sendJSON('/review-repo', 'POST', { repo, force }),
+
+  localSessions: (): Promise<{ sessions: LocalReviewSession[] }> =>
+    getJSON('/local/sessions'),
+
+  localReview: (repository: string, mode = 'all-working-tree', previousSessionId?: string):
+  Promise<{ session: LocalReviewSession }> =>
+    sendJSON('/local/review', 'POST', {
+      repository, mode, ...(previousSessionId ? { previous_session_id: previousSessionId } : {}),
+    }),
+
+  localSession: (id: string): Promise<{ session: LocalReviewSession }> =>
+    getJSON(`/local/sessions/${encodeURIComponent(id)}`),
+
+  localDisposition: (
+    id: string,
+    findingId: string,
+    status: string,
+    userInstruction?: string,
+  ): Promise<{ finding: LocalReviewSession['findings'][number] }> =>
+    sendJSON(`/local/sessions/${encodeURIComponent(id)}/disposition`, 'POST', {
+      finding_id: findingId, status, user_instruction: userInstruction,
+    }),
+
+  localFix: (
+    sessionId: string,
+    findingIds: string[],
+    instruction: string,
+  ): Promise<{ fix_id: string; status: string; finding_ids: string[] }> =>
+    sendJSON('/local/fix', 'POST', {
+      session_id: sessionId, finding_ids: findingIds, instruction,
+    }),
 
   // --- Repo + PR discovery ---
   recentRepos: (days?: number): Promise<RecentReposResponse> =>

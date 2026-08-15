@@ -21,6 +21,7 @@ import {
 } from './lib/layout'
 import LearningView from './views/LearningView'
 import SettingsView from './views/SettingsView'
+import LocalReviewView from './views/LocalReviewView'
 
 import { i18nT } from '../../i18n/t'
 /** The 6px vertical drag handle between two columns. */
@@ -77,6 +78,8 @@ export default function Workspace() {
             )}
           </main>
         </>
+      ) : mainView === 'local' ? (
+        <main className="flex-1 min-w-0 min-h-0 flex flex-col"><LocalReviewView /></main>
       ) : mainView === 'learning' ? (
         <main className="flex-1 min-w-0 min-h-0 flex flex-col"><LearningView /></main>
       ) : (

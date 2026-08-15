@@ -10,7 +10,7 @@
 // to be, under the repo picker that scopes them. Folding them into the rail
 // leaves the whole rest of the window to the report, which is the widest thing
 // the app renders.
-import { Brain, ScanSearch, Settings } from 'lucide-react'
+import { Brain, GitBranch, ScanSearch, Settings } from 'lucide-react'
 
 import { useSage } from '../context'
 import MiddleColumn from './MiddleColumn'
@@ -88,6 +88,12 @@ export default function LeftRail() {
           onClick={() => setMainView('reviews')}
         />
         <NavRow
+          label={i18nT('apps.codeReviewSage.components.localReview.local')}
+          icon={GitBranch}
+          active={mainView === 'local'}
+          onClick={() => setMainView('local')}
+        />
+        <NavRow
           label={i18nT('apps.codeReviewSage.components.leftRail.learning')}
           icon={Brain}
           active={mainView === 'learning'}
@@ -112,7 +118,7 @@ export default function LeftRail() {
         <div className="flex-1 min-h-0 mx-2 overflow-hidden rounded-xl border border-border bg-bg-elevated shadow-sm flex flex-col">
           <LearningRail />
         </div>
-      ) : mainView === 'settings' ? (
+      ) : mainView === 'settings' || mainView === 'local' ? (
         <div className="flex-1 min-h-0" />
       ) : (
         <>

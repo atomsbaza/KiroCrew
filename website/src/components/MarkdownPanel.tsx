@@ -217,6 +217,7 @@ import { kirocrewDark, kirocrewLight } from './monacoTheme'
 import type { IDisposable } from 'monaco-editor'
 import { useLineReveal, type RevealTarget } from '../hooks/useLineReveal'
 import { i18nT } from '../i18n/t'
+import { useStableMonacoLayout } from '../hooks/useStableMonacoLayout'
 const MonacoDiffEditor = lazy(async () => {
   const { ensureMonacoLocal } = await import('../utils/monacoLocal')
   await ensureMonacoLocal()
@@ -723,14 +724,18 @@ function DiffEditorBlock({ diffMode, lang, originalContent, content, dark, diffA
   const onSelectRef = useRef(onSelect); onSelectRef.current = onSelect
   const disposableRef = useRef<IDisposable | null>(null)
   const selDisposableRef = useRef<IDisposable | null>(null)
+  const editorRef = useRef<{ layout: () => void } | null>(null)
+  const { hostRef: editorHostRef, requestLayout } = useStableMonacoLayout(editorRef)
   useEffect(() => () => { disposableRef.current?.dispose(); selDisposableRef.current?.dispose() }, [])
   if (!diffMode) return null
   return (
-    <div className={`w-full h-full overflow-hidden ${flush ? '' : 'border border-border rounded-md'}`}>
+    <div ref={editorHostRef} className={`w-full h-full min-h-0 overflow-hidden ${flush ? '' : 'border border-border rounded-md'}`}>
       <Suspense fallback={<div className="p-3 text-muted text-[12px] animate-pulse">{i18nT('components.markdownPanel.loading_diff')}</div>}>
         <MonacoDiffEditor height="100%" language={monacoLang(lang)} original={originalContent} modified={content}
           beforeMount={(monaco) => { if (!diffThemesRegistered) { monaco.editor.defineTheme('kirocrew-dark', kirocrewDark); monaco.editor.defineTheme('kirocrew-light', kirocrewLight); diffThemesRegistered = true } }}
           theme={dark ? 'kirocrew-dark' : 'kirocrew-light'} onMount={(editor) => {
+            editorRef.current = editor
+            requestLayout()
             // Jump to the first change once the diff is computed (fires async).
             const nav = editor.onDidUpdateDiff(() => {
               nav.dispose()
@@ -755,7 +760,7 @@ function DiffEditorBlock({ diffMode, lang, originalContent, content, dark, diffA
                 onSelectRef.current?.(text.trim(), rect)
               }, 10)
             })
-          }} options={{ minimap: { enabled: false }, readOnly: !editing, renderSideBySide: sideBySide, useInlineViewWhenSpaceIsLimited: false, renderValidationDecorations: 'off', guides: { indentation: false }, stickyScroll: { enabled: false }, renderLineHighlight: 'none', scrollBeyondLastLine: false, fontSize: 13, lineNumbers: lineNums ? 'on' : 'off', wordWrap: wordWrap ? 'on' : 'off', quickSuggestions: autocomplete, automaticLayout: true, hover: { enabled: editing } }} />
+          }} options={{ minimap: { enabled: false }, readOnly: !editing, renderSideBySide: sideBySide, useInlineViewWhenSpaceIsLimited: false, renderValidationDecorations: 'off', guides: { indentation: false }, stickyScroll: { enabled: false }, renderLineHighlight: 'none', scrollBeyondLastLine: false, fontSize: 13, lineNumbers: lineNums ? 'on' : 'off', wordWrap: wordWrap ? 'on' : 'off', quickSuggestions: autocomplete, automaticLayout: false, hover: { enabled: editing } }} />
       </Suspense>
     </div>
   )
