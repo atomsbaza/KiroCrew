@@ -8,6 +8,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers import knowledge as kh
 from kiro_crew.knowledge.store import KnowledgeStore
 
@@ -33,15 +34,18 @@ def store(tmp_path):
     value.close()
 
 
-def _config():
-    return SimpleNamespace(
-        knowledge=SimpleNamespace(extraction_pool_size=3),
-        agent=SimpleNamespace(resolve_effort=lambda role: "high"),
-    )
+def _config(background_effort: str | None = None):
+    cfg = KiroCrewConfig()
+    if background_effort is not None:
+        cfg.agent.role_efforts = {"background": background_effort}
+    return cfg
 
 
 class TestKnowledgePoolSetup:
-    def test_setup_creates_isolated_extraction_and_fetch_pools(self, monkeypatch):
+    @pytest.mark.parametrize("background_effort", [None, "low"])
+    def test_setup_creates_isolated_extraction_and_fetch_pools(
+        self, monkeypatch, background_effort
+    ):
         app = web.Application()
         app["state"] = SimpleNamespace(knowledge_store=object())
         pools: list[_FakePool] = []
@@ -58,7 +62,9 @@ class TestKnowledgePoolSetup:
             extractor_calls.append(kwargs)
             return extractor
 
-        monkeypatch.setattr(kh.KiroCrewConfig, "load", _config)
+        monkeypatch.setattr(
+            kh.KiroCrewConfig, "load", lambda: _config(background_effort)
+        )
         monkeypatch.setattr(kh, "LLMPool", _pool_factory)
         monkeypatch.setattr(kh, "EntityExtractor", _extractor_factory)
         monkeypatch.setattr(kh, "IngestionPipeline", lambda **kwargs: pipeline)

@@ -46,6 +46,9 @@ DEFAULT_POOL_SIZE = 3
 DEFAULT_TIMEOUT = 60.0
 FETCH_TIMEOUT = 120.0
 AGENT_NAME = "kirocrew-knowledge"
+# Knowledge extraction is deliberately high-effort by default. URL fetching uses
+# a separate pool and passes no explicit effort, so it retains provider default.
+DEFAULT_EXTRACTION_EFFORT = "high"
 
 # Seconds the pool may sit FULLY idle (no worker checked out) before it is
 # scaled to zero — all workers shut down, freeing ~1GB of held process trees.

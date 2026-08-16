@@ -48,7 +48,7 @@ from kiro_crew.knowledge.ingestion import (
     rebuild_embeddings,
     start_rebuild_job,
 )
-from kiro_crew.knowledge.llm_pool import LLMPool
+from kiro_crew.knowledge.llm_pool import DEFAULT_EXTRACTION_EFFORT, LLMPool
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.spend import source_spend
@@ -1792,7 +1792,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
         cfg = KiroCrewConfig.load()
         extraction_pool = LLMPool(
             pool_size=cfg.knowledge.extraction_pool_size,
-            effort=cfg.agent.resolve_effort("background"),
+            effort=DEFAULT_EXTRACTION_EFFORT,
             use_config_pool_size=False,
         )
         fetch_pool = LLMPool(
