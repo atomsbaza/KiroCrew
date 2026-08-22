@@ -9,5 +9,6 @@ proposal lands.
 |---|---|
 | [pipeline-conductor.md](pipeline-conductor.md) | A dedicated fleet-orchestrator agent + harness skill for the issue→PR pipelines: probe/verify/intervene/adjudicate loop, resource-posture flow control, per-item credit budgets, and the PipelineSpec template seams for running the same conductor on any repository and campaign type. |
 | [playwright-cli-migration.md](playwright-cli-migration.md) | Moving browsing onto `playwright-cli`: the capability model, the install flow, snapshot retention, and the dashboard surface. |
+| [2026-08-20-quality-engineering-crew.md](2026-08-20-quality-engineering-crew.md) | Approved Quality Engineering Crew roles, routes, bounded evidence, automatic routing, and direct command design. |
 
 Indexed from [../README.md](../README.md).

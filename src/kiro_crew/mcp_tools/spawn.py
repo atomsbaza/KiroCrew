@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 from kiro_crew import mcp_core
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS
+from kiro_crew.crew_registry import is_internal_crew_worker
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -873,7 +874,11 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
     # elsewhere because it is reached by omitting ``agent`` -- but it is still a
     # name the gateway accepts, so a full listing shows it.
     try:
-        names, _ = visible_agent_names((a.name or "" for a in mcp_core.list_agents()), exclude=())
+        names = [
+            _redact(a.name)
+            for a in mcp_core.list_agents()
+            if _AGENT_NAME_RE.fullmatch(a.name or "") and not is_internal_crew_worker(a.name)
+        ]
         if names:
             lines.append(f"\nAvailable agents: {', '.join(names)}")
     except Exception:

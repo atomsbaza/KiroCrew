@@ -58,6 +58,7 @@ ALLOWED_SIBLING_IMPORTS: dict[str, set[str]] = {
         "library",
         "events",
     },
+    "role_resolver": set(),  # workflow-local role adapter; depends only on package contracts
 }
 
 # Modules outside the package the engine must never import directly (F1).

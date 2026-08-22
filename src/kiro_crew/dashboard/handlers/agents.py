@@ -19,6 +19,7 @@ from aiohttp import web
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp_backends import selectable_backend_values
+from kiro_crew.crew_registry import is_internal_crew_worker
 from kiro_crew.agent import (
     AGENT_FILENAME,
     _spec_path_is_safe,
@@ -1680,7 +1681,7 @@ async def api_agents_installed(request: web.Request) -> web.Response:
     # event loop past the loop-stall watchdog when a browser loads the dashboard.
     # Offload to the discovery pool, same as /api/skills.
     def _collect() -> list[Any]:
-        agents = list(list_agents())
+        agents = [a for a in list(list_agents()) if not is_internal_crew_worker(a.name)]
         agents.sort(key=lambda a: (0 if a.name == "kirocrew" else 1, a.name))
         return agents
 
@@ -2544,6 +2545,8 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     agents = [
         {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
         for name, agent_cfg in cfg.agents.items()
+        if not is_internal_crew_worker(name)
+        and not is_internal_crew_worker(getattr(agent_cfg, "kiro_agent", ""))
     ]
 
     state: DashboardState | None = request.app.get("state")
@@ -2564,6 +2567,7 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
         agents.extend(
             {"name": name, "scope": "project", **base}
             for name in sorted(project_names - set(cfg.agents.keys()))
+            if not is_internal_crew_worker(name)
         )
 
     # Reorder by usage frequency (most-used first). Derived read-only from chat
@@ -2619,9 +2623,13 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
     synced: list[str] = []
     pruned: list[str] = []
     try:
-        discovered_agents = await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), lambda: list(list_agents())
-        )
+        discovered_agents = [
+            agent
+            for agent in await asyncio.get_running_loop().run_in_executor(
+                discovery_executor(), lambda: list(list_agents())
+            )
+            if not is_internal_crew_worker(agent.name)
+        ]
         discovered_names = {a.name for a in discovered_agents}
 
         # Add new agents

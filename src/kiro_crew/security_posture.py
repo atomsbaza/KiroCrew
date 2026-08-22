@@ -1199,6 +1199,12 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "exception -- so the `job_start_failed` body funnels through one `_safe` "
         "chokepoint that applies the credential + exfiltration-URL chain before the "
         "text reaches the dashboard.",
+        "Quality Engineering evidence and reports",
+        "crews/quality_engineering/package.py",
+        "Bounded evidence records and role handoffs are persisted under the evidence root "
+        "or returned to the dashboard/agent context. They contain project-derived paths, "
+        "tool output, and model-authored report text, so credentials and exfiltration URLs "
+        "must be redacted before persistence or delivery.",
     ),
 )
 
@@ -1461,6 +1467,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "workflows/agent_pool.py",
         "workflows/runner.py",
         "workflows/store.py",
+        # Native automatic-routing adapter: bounds and scrubs internal Crew result
+        # envelopes before the downstream dashboard/chat egress applies its own
+        # registered boundary scan; this helper does not publish independently.
+        "crew_dispatch.py",
+        # Knowledge Quality's internal audit envelope: payloads are scrubbed before
+        # the dispatcher consumes them, while the actual user-facing result path is
+        # covered by the downstream dashboard/chat sink.
+        "crews/knowledge_quality/package.py",
         "apps/event_bus.py",
         # Redacts agent progress text INBOUND, before it is persisted into the
         # app's own queue JSON (`/thread`). Because the stored copy is already
