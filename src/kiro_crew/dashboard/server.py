@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
-from kiro_crew import platform_compat
+from kiro_crew import platform_compat, port_resolution
 from kiro_crew.apps.backend import start_enabled_app_backends
 from kiro_crew.apps.hooks_integration import (
     init_hooks_system,
@@ -26,6 +26,7 @@ from kiro_crew.apps.hooks_integration import (
 from kiro_crew.apps.manager import cleanup_migrated_builtin, register_builtin_apps
 from kiro_crew.autonudge import get_instance as _autonudge_get
 from kiro_crew.autonudge_authz import authorize_and_add_nudge
+from kiro_crew.browser_cli import launch as browser_cli_launch
 from kiro_crew.browser_cli import snapshots as browser_cli_snapshots
 from kiro_crew.browser_cli import token as browser_cli_token
 from kiro_crew.browser_cli import view as browser_cli_view
@@ -99,8 +100,10 @@ from kiro_crew.dashboard.handlers.artifacts import (
     api_remote_artifacts_clone,
     api_remote_artifacts_fork,
 )
+from kiro_crew.dashboard.handlers.feedback import setup_feedback_routes
 from kiro_crew.dashboard.handlers.knowledge import setup_knowledge_routes
 from kiro_crew.dashboard.handlers.link_meta import setup_link_meta_routes
+from kiro_crew.dashboard.handlers.secrets import setup_secrets_routes
 from kiro_crew.dashboard.handlers.source_providers import (
     register_status_delta_sink,
     unregister_status_delta_sink,
@@ -138,6 +141,7 @@ from kiro_crew.deploy import _register_core_skills as _register_deploy_skills
 from kiro_crew.deploy.handlers import register_routes as _register_deploy_routes
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import ScriptHookStore, set_global_hook_store
+from kiro_crew.instances import run_marker
 from kiro_crew.instances.registry import InstancesRegistry
 from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager, TunnelState
 from kiro_crew.mcp_gateway.socketsec import chmod_socket_0600
@@ -1226,14 +1230,7 @@ def _export_bound_port(runner: web.AppRunner, port: int) -> None:
     Best-effort: when no TCP address is readable the environment is left
     untouched, which is exactly the pre-export behavior.
     """
-    bound = port
-    if not bound:
-        for addr in runner.addresses:
-            # TCP socknames are (host, port[, flowinfo, scope_id]) tuples; a
-            # unix socket's would be a bare str path.
-            if isinstance(addr, (tuple, list)) and len(addr) >= 2 and isinstance(addr[1], int):
-                bound = addr[1]
-                break
+    bound = _resolved_bound_port(runner, port)
     if bound:
         os.environ["KIROCREW_BOUND_PORT"] = str(bound)
         logger.debug("Exported KIROCREW_BOUND_PORT=%d for child processes", bound)
@@ -1242,6 +1239,29 @@ def _export_bound_port(runner: web.AppRunner, port: int) -> None:
             "Could not read the bound dashboard port; child processes will "
             "re-derive it from config and the run-marker"
         )
+
+
+def _resolved_bound_port(runner: web.AppRunner, port: int) -> int:
+    """The port actually bound: *port*, or the OS-assigned one when it is ``0``.
+
+    ``0`` means an ephemeral bind (``--port auto``, which ``--test-mode`` also
+    implies), so the declared value names no listener and anything keyed by it
+    would name the wrong one. Shared by the child-env export and the credential
+    publication, which must agree: a credential filed under port ``0`` is
+    unreachable for every client, and they would fall back to the shared file --
+    which is exactly what the live-sibling guard deliberately leaves pointing at
+    the sibling, so the ephemeral gateway would 403 every internal call.
+
+    Returns ``0`` only when no TCP address is readable at all.
+    """
+    if port:
+        return port
+    for addr in runner.addresses:
+        # TCP socknames are (host, port[, flowinfo, scope_id]) tuples; a
+        # unix socket's would be a bare str path.
+        if isinstance(addr, (tuple, list)) and len(addr) >= 2 and isinstance(addr[1], int):
+            return addr[1]
+    return 0
 
 
 async def _start_site(
@@ -1396,6 +1416,66 @@ def _register_unix_socket_cleanup(app: web.Application, holder: dict[str, Path |
             logger.debug("dashboard unix socket cleanup failed", exc_info=True)
 
     app.on_cleanup.append(_unlink_unix_socket)
+
+
+def _live_sibling_port(own_port: int) -> int | None:
+    """A DIFFERENT port in this data home whose gateway is verifiably alive.
+
+    ``None`` when this start is the only live gateway in the home, which is the
+    normal single-instance case. Uses the same ownership proof the client port
+    discovery already trusts (recorded pid, actually holds the port, same uid,
+    argv looks like a gateway), so a stale marker left by a crash does not count
+    as a sibling and never blocks a legitimate credential write.
+
+    Blocking (/proc + filesystem); call from the executor, never the loop.
+    """
+    try:
+        for port in run_marker.marker_ports():
+            if int(port) == int(own_port):
+                continue
+            if port_resolution._gateway_owns_port(int(port)):
+                return int(port)
+    except Exception:
+        # Discovery failing must not block startup: fall through to the write.
+        # A missed sibling degrades to the pre-existing last-writer-wins
+        # behaviour, never to a gateway that cannot start.
+        logger.debug("live-sibling discovery failed", exc_info=True)
+    return None
+
+
+def _write_instance_credentials(secret_path: Path, port: int, secret: str) -> None:
+    """Publish this gateway's internal-API credential.
+
+    Writes two files with different lifetimes:
+
+    * ``run/gateway-<port>.secret`` -- ALWAYS. Paired with the listener, so a
+      client that resolved a port reads the credential of the process that owns
+      that port rather than whichever gateway wrote the shared file last.
+    * ``.local_secret`` -- only when no other gateway in this data home is
+      verifiably alive on a different port. Overwriting it while a sibling is
+      serving is the desync this guard exists to prevent: the sibling keeps
+      comparing against its own in-memory value, every internal caller then
+      sends the newcomer's credential, and the whole internal channel answers
+      403 with a bare ``Forbidden`` until one of them restarts. The shared file
+      is still written in the single-instance case because pre-per-port clients
+      (an older CLI, a cron script from a previous install) read only that path.
+
+    Blocking fs I/O; the caller offloads this whole function.
+    """
+    _write_secret_file(run_marker.secret_path(int(port)), secret)
+    sibling = _live_sibling_port(int(port))
+    if sibling is not None:
+        logger.warning(
+            "Not overwriting %s: another gateway in this data home is live on port %d. "
+            "This instance's credential is published as %s; clients that resolve port %d "
+            "will authenticate against it.",
+            secret_path,
+            sibling,
+            run_marker.secret_path(int(port)).name,
+            port,
+        )
+        return
+    _write_secret_file(secret_path, secret)
 
 
 def _write_secret_file(secret_path: Path, secret: str) -> None:
@@ -1995,6 +2075,82 @@ def _arm_prevent_sleep_poll(state: DashboardState) -> None:
     state._prevent_sleep_task = task  # prevent GC; cancelled on cleanup
 
 
+# Deep link at the approval toggle itself (Settings -> Skills, highlighted), so
+# the notification can offer the opt-out at the exact moment the user is being
+# asked to review yet another candidate. Same highlight=key:<configKey> format
+# the frontend's <SettingRef> builds, consumed by useSettingHighlight.
+_SKILL_APPROVAL_SETTING_URL = "/settings?tab=skills&highlight=key:skills.approval_required"
+
+
+def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[str, str]]]:
+    """Build the bell-feed payload for a staged skill candidate.
+
+    Returns ``(title, body, review_url, actions)``. Module-level (rather than
+    inline in the staged hook) so the notification CONTENT is unit-testable
+    without booting the dashboard app.
+    """
+    name = str(info.get("name") or info.get("slug") or "skill")
+    slug = str(info.get("slug") or "")
+    is_update = info.get("kind") == "update"
+    target = str(info.get("target") or "")
+    description = str(info.get("description") or "").strip()
+    triggers = str(info.get("triggers") or "").strip()
+    subject = target or name if is_update else name
+    title = "Skill update awaiting review" if is_update else "New skill awaiting review"
+    # The body LEADS with name + description because the feed row
+    # renders only its first ~80 characters, stripped to one line.
+    # The title already says a skill is awaiting review, so opening
+    # with "was generated from a session and needs your approval"
+    # spends exactly the characters that decide whether the reader
+    # opens the queue on words they have already read. Identity plus
+    # purpose first; the approval sentence still follows for the
+    # detail panel, which renders the whole body as markdown.
+    head = f"**{subject}**"
+    if description:
+        head += f" — {description}"
+    lines = [head]
+    lines.append(
+        "\nGenerated from a session. Needs your approval before "
+        + ("it takes effect." if is_update else "it can be used.")
+    )
+    if triggers:
+        lines.append(f"\n**Triggers:** {triggers}")
+    if info.get("has_scripts"):
+        lines.append("\n_Bundles executable scripts — review them before approving._")
+    body = "\n".join(lines)
+    # Deep-link straight at the candidate, not just the tab: the
+    # queue can hold several rows, and "go find it" is the failure
+    # mode this notification exists to prevent. quote() keeps a slug
+    # from opening a second query parameter -- slugs are validated
+    # against a restrictive pattern upstream, but the URL is built
+    # here and must not depend on that invariant holding.
+    review_url = "/capabilities?tab=skills"
+    if slug:
+        review_url += f"&review={quote(slug, safe='')}"
+    actions = [
+        {
+            "id": "review-skill",
+            "label": "Review update" if is_update else "Review skill",
+            "url": review_url,
+        },
+        # The opt-out shortcut: lands on the approval_required toggle in
+        # Settings. Offered on every staged candidate — including
+        # script-bearing ones, where it still governs FUTURE prose-only
+        # skills (scripts always stage; the setting's own description
+        # explains that boundary). The label shares the destination
+        # toggle's polarity ("Require approval …" is ON; this stops it),
+        # and the trailing ellipsis signals that the button NAVIGATES to a
+        # settings page rather than flipping the setting itself —
+        # notification actions are navigation-only.
+        {
+            "id": "auto-approve-skills",
+            "label": "Stop requiring skill approval…",
+            "url": _SKILL_APPROVAL_SETTING_URL,
+        },
+    ]
+    return title, body, review_url, actions
+
+
 async def start_dashboard(
     sessions: SessionManager,
     crons: CronService,
@@ -2082,63 +2238,17 @@ async def start_dashboard(
         # call ``asyncio.ensure_future``, which RAISES off-loop — and
         # ``_send_ws_all`` treats that raise as a dead socket and EVICTS every
         # connected client. Marshal the emit back onto the loop instead.
-        try:
-            _gw_loop: "asyncio.AbstractEventLoop | None" = asyncio.get_running_loop()
-        except RuntimeError:  # pragma: no cover - sync/embedded launch
-            _gw_loop = None
-
         def _on_pending_skill_staged(info: dict) -> None:
             try:
-                name = str(info.get("name") or info.get("slug") or "skill")
                 slug = str(info.get("slug") or "")
                 is_update = info.get("kind") == "update"
                 target = str(info.get("target") or "")
-                description = str(info.get("description") or "").strip()
-                triggers = str(info.get("triggers") or "").strip()
-                subject = target or name if is_update else name
-                title = "Skill update awaiting review" if is_update else "New skill awaiting review"
-                # The body LEADS with name + description because the feed row
-                # renders only its first ~80 characters, stripped to one line.
-                # The title already says a skill is awaiting review, so opening
-                # with "was generated from a session and needs your approval"
-                # spends exactly the characters that decide whether the reader
-                # opens the queue on words they have already read. Identity plus
-                # purpose first; the approval sentence still follows for the
-                # detail panel, which renders the whole body as markdown.
-                head = f"**{subject}**"
-                if description:
-                    head += f" — {description}"
-                lines = [head]
-                lines.append(
-                    "\nGenerated from a session. Needs your approval before "
-                    + ("it takes effect." if is_update else "it can be used.")
-                )
-                if triggers:
-                    lines.append(f"\n**Triggers:** {triggers}")
-                if info.get("has_scripts"):
-                    lines.append("\n_Bundles executable scripts — review them before approving._")
-                body = "\n".join(lines)
+                title, body, review_url, actions = _pending_skill_notification(info)
                 payload = {
                     "slug": slug,
                     "candidate_kind": "update" if is_update else "new",
                     "target": target,
                 }
-                # Deep-link straight at the candidate, not just the tab: the
-                # queue can hold several rows, and "go find it" is the failure
-                # mode this notification exists to prevent. quote() keeps a slug
-                # from opening a second query parameter -- slugs are validated
-                # against a restrictive pattern upstream, but the URL is built
-                # here and must not depend on that invariant holding.
-                review_url = "/capabilities?tab=skills"
-                if slug:
-                    review_url += f"&review={quote(slug, safe='')}"
-                actions = [
-                    {
-                        "id": "review-skill",
-                        "label": "Review" if is_update else "Review skill",
-                        "url": review_url,
-                    }
-                ]
 
                 def _emit() -> None:
                     try:
@@ -2154,11 +2264,12 @@ async def start_dashboard(
                     except Exception:
                         logger.debug("pending-skill notification failed", exc_info=True)
 
-                if _gw_loop is not None and not _gw_loop.is_closed():
+                loop = state.serving_loop
+                if loop is not None and not loop.is_closed():
                     # Safe from the loop thread too — call_soon_threadsafe just
                     # schedules. RuntimeError means the loop is shutting down.
                     try:
-                        _gw_loop.call_soon_threadsafe(_emit)
+                        loop.call_soon_threadsafe(_emit)
                     except RuntimeError:  # pragma: no cover - loop closing
                         pass
                 else:
@@ -2193,9 +2304,10 @@ async def start_dashboard(
                     except Exception:
                         logger.debug("pending-skill notification resolve failed", exc_info=True)
 
-                if _gw_loop is not None and not _gw_loop.is_closed():
+                loop = state.serving_loop
+                if loop is not None and not loop.is_closed():
                     try:
-                        _gw_loop.call_soon_threadsafe(_resolve)
+                        loop.call_soon_threadsafe(_resolve)
                     except RuntimeError:  # pragma: no cover - loop closing
                         pass
                 # Without a loop there is no serving dashboard (sync/embedded
@@ -2350,6 +2462,12 @@ async def start_dashboard(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    # Bind the serving loop once, here: this runs ON that loop, so every
+    # surface that later hands work in from a foreign thread -- slots
+    # coalescing, an off-loop websocket send, the log handler's fan-out --
+    # resolves the same loop instead of each latching its own copy from
+    # whichever thread happens to arrive first.
+    state.bind_serving_loop(asyncio.get_running_loop())
     # Voice settings live in slack/handler's module state and are otherwise
     # loaded only on the Slack startup path (set_orch_cfg) — without this a
     # dashboard-only gateway (no Slack tokens) resets TTS to defaults on
@@ -2518,6 +2636,8 @@ async def start_dashboard(
     await asyncio.to_thread(state._initialize_knowledge_store)
     setup_knowledge_routes(app)
     setup_weixin_routes(app)
+    setup_feedback_routes(app)
+    setup_secrets_routes(app)
 
     # Link previews (chat unfurl). Route is always registered; the handler gates
     # itself on cfg.dashboard.link_previews, so toggling the feature needs no
@@ -2885,10 +3005,16 @@ async def start_dashboard(
     # Port bind succeeded — now safe to write the secret file. Offloaded:
     # _write_secret_file does blocking fs I/O (os.open/os.close and, on Windows,
     # an icacls subprocess via restrict_to_owner), so it must not run on the
-    # event loop (no-blocking-call-on-event-loop).
+    # event loop (no-blocking-call-on-event-loop). The port is passed so the
+    # credential is published per listener, not only into the shared file every
+    # gateway in this data home writes (see _write_instance_credentials).
     try:
         await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _write_secret_file, _secret_path, _internal_secret
+            subprocess_executor(),
+            _write_instance_credentials,
+            _secret_path,
+            _resolved_bound_port(runner, port),
+            _internal_secret,
         )
     except OSError:
         await runner.cleanup()
@@ -3079,6 +3205,15 @@ async def start_dashboard(
     # agent runs the CLI as a shell command, so only an inherited environment
     # reaches it. Absent by default, in which case this adds nothing.
     os.environ.update(browser_cli_token.cli_env_overrides())
+    # Name the engine Kiro Crew actually installs. The CLI's own default is the
+    # branded Chrome channel at an OS path the product never provisions, so
+    # without this the first browse fails on a host where every readiness signal
+    # is honestly green. Same channel and same reason as the two above; defers to
+    # an operator who set the variable themselves.
+    #
+    # Off the event loop: computing the override writes the config file, and this
+    # runs on the gateway's startup path.
+    os.environ.update(await asyncio.to_thread(browser_cli_launch.cli_env_overrides))
     _snap_pruner = asyncio.create_task(_prune_browser_snapshots_loop())
     _snap_pruner.add_done_callback(lambda t: t.result() if not t.cancelled() else None)
     state._browser_snapshot_pruner = _snap_pruner  # prevent GC
@@ -3315,6 +3450,12 @@ async def start_api_server(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    # Bind the serving loop once, here: this runs ON that loop, so every
+    # surface that later hands work in from a foreign thread -- slots
+    # coalescing, an off-loop websocket send, the log handler's fan-out --
+    # resolves the same loop instead of each latching its own copy from
+    # whichever thread happens to arrive first.
+    state.bind_serving_loop(asyncio.get_running_loop())
     # Voice settings live in slack/handler's module state and are otherwise
     # loaded only on the Slack startup path (set_orch_cfg) — without this a
     # dashboard-only gateway (no Slack tokens) resets TTS to defaults on
@@ -3527,10 +3668,16 @@ async def start_api_server(
     # start_dashboard: write deferred so a failed bind can't poison it).
     # Offloaded: _write_secret_file does blocking fs I/O (os.open/os.close and,
     # on Windows, an icacls subprocess via restrict_to_owner), so it must not run
-    # on the event loop (no-blocking-call-on-event-loop).
+    # on the event loop (no-blocking-call-on-event-loop). Same per-listener
+    # publication as start_dashboard: both surfaces must pair the credential
+    # with the port or a client cannot tell which generation it reached.
     try:
         await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _write_secret_file, _secret_path, _internal_secret
+            subprocess_executor(),
+            _write_instance_credentials,
+            _secret_path,
+            _resolved_bound_port(runner, port),
+            _internal_secret,
         )
     except OSError:
         await runner.cleanup()

@@ -35,7 +35,11 @@ from kiro_crew.acp.liveness import (
     VERDICT_WORKING,
     LivenessOracle,
 )
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpPromptStats
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    JSONRPC_METHOD_NOT_FOUND,
+    AcpPromptStats,
+)
 
 # Windows lacks os.killpg and POSIX process-tree APIs (ps, /proc).
 # Tests that exercise these paths are skipped on Windows.
@@ -3306,6 +3310,87 @@ class TestMakeUnifiedDiff:
     def test_truncation(self):
         result = _make_unified_diff("", "x\n" * 5000, "file.py", max_len=100)
         assert len(result) <= 100
+
+    def test_truncation_cuts_at_line_boundary_and_is_marked(self):
+        """A cut diff ends with the ``\\ diff truncated`` annotation on its own
+        line (unified-diff escape convention — renderers skip it), never with a
+        garbled half-row, so downstream +/- counting can detect understatement."""
+        from kiro_crew.acp._dispatch import DIFF_TRUNCATION_MARK
+
+        result = _make_unified_diff("", "wordwordword\n" * 5000, "file.py", max_len=200)
+        assert len(result) <= 200
+        assert result.endswith("\n" + DIFF_TRUNCATION_MARK)
+        # Every line before the marker is a complete diff row from the
+        # original (starts with a diff prefix, never a mid-word fragment).
+        body_lines = result.split("\n")[:-1]
+        assert all(
+            line.startswith(("---", "+++", "@@", "+", "-", " ")) for line in body_lines if line
+        )
+
+    def test_under_cap_diff_is_not_marked(self):
+        from kiro_crew.acp._dispatch import DIFF_TRUNCATION_MARK
+
+        result = _make_unified_diff("old\n", "new\n", "file.py")
+        assert DIFF_TRUNCATION_MARK not in result
+
+
+class TestDeriveEditDiff:
+    """Bare-JSON edit payloads derive a diff from their own arguments, so a
+    tool_call with no diff content block still displays what changed."""
+
+    def test_create_content_becomes_addition_diff(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff({"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"})
+        assert "+x = 1" in diff
+        assert "+y = 2" in diff
+        assert "+++ /a/new.py" in diff
+
+    def test_str_replace_pair_becomes_replace_hunk(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff(
+            {"path": "/a/b.py", "command": "strReplace", "oldStr": "x = 1\n", "newStr": "x = 2\n"}
+        )
+        assert "-x = 1" in diff
+        assert "+x = 2" in diff
+
+    def test_unrecognized_shapes_yield_empty(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": "/a/b", "command": "create"}) == ""
+        assert derive_edit_diff({"command": "create", "fileText": "x"}) == ""  # no path
+        assert derive_edit_diff("not a dict") == ""
+        assert derive_edit_diff(None) == ""
+
+    def test_non_string_arguments_never_reach_difflib(self):
+        """Malformed args (numeric path, dict oldStr) must yield "" instead of
+        letting a TypeError out of difflib abort the whole dispatch mid-turn."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"}) == ""
+        assert derive_edit_diff({"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}) == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        assert derive_edit_diff({"path": ["/a"], "command": "create", "fileText": "x"}) == ""
+        assert derive_edit_diff({"path": "/a/b", "command": "create", "fileText": 7}) == ""
+
+    def test_insert_with_line_number_derives_positioned_hunk(self):
+        """An insert IS additions-only, so with a line number the derived
+        hunk is exact: zero old lines at insertLine, additions after it."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff(
+            {"path": "/a/b.py", "command": "insert", "insertLine": 4, "content": "x = 1\ny = 2"}
+        )
+        assert "@@ -4,0 +5,2 @@" in diff
+        assert "+x = 1" in diff
+        assert "+y = 2" in diff
+
+    def test_insert_without_line_number_derives_nothing(self):
+        """Without a line number the hunk position would be a guess — the
+        row keeps its fold-proof trace via the file_changes snapshot."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": "/a/b.py", "command": "insert", "content": "x = 1"}) == ""
 
     def test_no_trailing_newline(self):
         result = _make_unified_diff("old", "new", "file.py")
@@ -6637,6 +6722,72 @@ class TestExtractToolCallRefinement:
         assert event is not None
         assert event.title == "List KiroCrew dashboard module files"
 
+    def test_generic_shell_title_yields_the_command(self):
+        # A backend whose shell `title` is a kind label ("Run Command") names no
+        # command; every pill in the transcript would read the same. The command
+        # is the ground truth of the call, so it is what the pill shows.
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-2d",
+                "title": "Run Command",
+                "kind": "execute",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        event = client._extract_tool_call_refinement(msg)
+        assert event is not None
+        assert event.title == "git status"
+
+    def test_kindless_refinement_inherits_the_shell_classification(self):
+        # `kind` is optional on an update. Reading its absence as "not shell"
+        # repainted the pill with the generic title the initial tool_call had
+        # already resolved to a command, so the cached classification decides.
+        client = self._client()
+        call = self._make_msg(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-2e",
+                "title": "Run Command",
+                "kind": "execute",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        assert client._extract_tool_event(call).title == "git status"
+        refinement = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-2e",
+                "title": "Run Command",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        event = client._extract_tool_call_refinement(refinement)
+        assert event is not None
+        assert event.title == "git status"
+
+    def test_title_only_refinement_reads_the_cached_params(self):
+        # A refinement can repeat the title without resending rawInput; the
+        # command then has to come from the params the initial call cached.
+        client = self._client()
+        call = self._make_msg(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-2f",
+                "title": "Run Command",
+                "kind": "execute",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        client._extract_tool_event(call)
+        refinement = self._make_msg(
+            {"sessionUpdate": "tool_call_update", "toolCallId": "tc-2f", "title": "Run Command"}
+        )
+        event = client._extract_tool_call_refinement(refinement)
+        assert event is not None
+        assert event.title == "git status"
+
     def test_blank_description_falls_back_to_title(self):
         # Whitespace-only description shouldn't override a useful title.
         client = self._client()
@@ -7064,7 +7215,6 @@ class TestProcessMessageUnknownServerRequest:
 
     @pytest.mark.asyncio
     async def test_reject_sends_method_not_found_error(self, tmp_path):
-        from kiro_crew.acp.client import _JSONRPC_METHOD_NOT_FOUND
         from kiro_crew.acp.types import JsonRpcMessage
 
         client = AcpClient(work_dir=tmp_path)
@@ -7077,7 +7227,7 @@ class TestProcessMessageUnknownServerRequest:
         written = client._process.stdin.write.call_args[0][0].decode()
         payload = json.loads(written)
         assert payload["id"] == 42
-        assert payload["error"]["code"] == _JSONRPC_METHOD_NOT_FOUND
+        assert payload["error"]["code"] == JSONRPC_METHOD_NOT_FOUND
         assert "terminal/create" in payload["error"]["message"]
 
     @pytest.mark.asyncio
@@ -7532,6 +7682,48 @@ class TestFormatAcpError:
         assert "transient error" not in out.lower()
         assert "retry in a moment" not in out.lower()
 
+    def test_invalid_bearer_token_rewrite(self):
+        """The account-switch rejection: a credential the running child still
+        holds is rejected as invalid, with no status code and no expiry wording,
+        so it must still reach the sign-in guidance instead of the raw string."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "The bearer token included in the request is invalid.",
+        }
+        out = _format_acp_error(err)
+        assert "kiro-cli login" in out.lower()
+        assert "retry" in out.lower() and "will not help" in out.lower()
+        # Must NOT show the misleading transient-5xx advice.
+        assert "transient error" not in out.lower()
+        assert "retry in a moment" not in out.lower()
+
+    def test_invalid_bearer_token_wins_over_transport_error(self):
+        """An aborted request leaves a transport error beside the rejection; the
+        credential branch is checked first so the 5xx family cannot win."""
+        err = {
+            "code": -32603,
+            "message": "Encountered an error in the response stream",
+            "data": "DispatchFailure ConnectionResetError: the bearer token is invalid",
+        }
+        out = _format_acp_error(err)
+        assert "kiro-cli login" in out.lower()
+        assert "transient error" not in out.lower()
+
+    def test_unrelated_invalid_does_not_read_as_credential_failure(self):
+        """The fenced gap must not let an unrelated 'invalid' in a combined
+        haystack turn a validation fault into a sign-in prompt."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "ValidationException: refreshed the bearer token successfully. "
+                "Field 'temperature' is invalid"
+            ),
+        }
+        out = _format_acp_error(err)
+        assert "kiro-cli login" not in out.lower()
+
     def test_genuine_5xx_still_transient_with_auth_absent(self):
         """The new auth-status branch must not swallow real 5xx errors."""
         err = {
@@ -7640,6 +7832,41 @@ class TestIsTransientRawError:
         )
         assert _is_transient_raw_error(None) is False
         assert _is_transient_raw_error("boom") is False
+
+    def test_invalid_bearer_token_is_not_transient(self):
+        """A rejected credential must be terminal, not fed to the retry ladder.
+
+        The rejection carries no status code and no expiry wording, so without
+        its own pattern it reaches the 5xx family — and a co-occurring transport
+        error is enough to make it look retryable, spending the whole ladder on
+        a credential no retry can revive.
+        """
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert (
+            _is_transient_raw_error(
+                {"data": "The bearer token included in the request is invalid."}
+            )
+            is False
+        )
+        assert _is_transient_raw_error({"data": "invalid bearer token"}) is False
+        # A co-occurring transport error must not flip it to retryable.
+        assert (
+            _is_transient_raw_error(
+                {
+                    "message": "Encountered an error in the response stream",
+                    "data": "ConnectionResetError: the bearer token is invalid",
+                }
+            )
+            is False
+        )
+        # An unrelated 'invalid' must stay out of the credential class.
+        assert (
+            _is_transient_raw_error(
+                {"data": "ServiceUnavailableException: HTTP 503, invalid window"}
+            )
+            is True
+        )
 
     def test_session_expired_is_not_transient(self):
         """Regression test: kiro-cli session expiry must be terminal.

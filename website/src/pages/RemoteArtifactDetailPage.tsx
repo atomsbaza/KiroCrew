@@ -8,6 +8,7 @@ import { sanitizeCssValue } from '../lib/cssSanitize'
 import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
 import { api } from '../api/client'
 import { PageHeader, Card, Badge, Btn } from '../components/ui'
+import ErrorNotice from '../components/ErrorNotice'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { CommentsSidebar } from '../components/CommentsSidebar'
 import { CommentPopover } from '../components/CommentOverlay'
@@ -264,13 +265,13 @@ export default function RemoteArtifactDetailPage() {
       <>
         <div className="sticky top-0 z-10 bg-bg border-b border-border">
           <PageHeader title={i18nT('pages.remoteArtifactDetailPage.remote_artifact')} subtitle={externalId} />
-          <div className="px-6 py-2 flex flex-wrap items-center gap-2">
+          <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
             <Btn onClick={() => navigate('/artifacts')} className="flex items-center gap-1">
               <ArrowLeft size={13} /> {i18nT('pages.remoteArtifactDetailPage.back')}
             </Btn>
           </div>
         </div>
-        <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
           <Card>
             <div className="flex items-start gap-3">
               <AlertTriangle className="lucide-inline text-danger" />
@@ -297,7 +298,7 @@ export default function RemoteArtifactDetailPage() {
     <>
       <div className="sticky top-0 z-10 bg-bg border-b border-border">
         <PageHeader title={title} subtitle={i18nT('pages.remoteArtifactDetailPage.remote_artifact_2', { provider })} />
-        <div className="px-6 py-2 flex flex-wrap items-center gap-2">
+        <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
           <Btn onClick={() => navigate('/artifacts')} className="flex items-center gap-1">
             <ArrowLeft size={13} /> {i18nT('pages.remoteArtifactDetailPage.back')}
           </Btn>
@@ -343,11 +344,13 @@ export default function RemoteArtifactDetailPage() {
           </span>
         </div>
       </div>
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
 
         {art.summary && <div className="mb-3 text-sm text-muted italic">{art.summary}</div>}
         {forkError && (
-          <div className="mb-3 px-3 py-2 rounded-md border border-danger/40 bg-danger-subtle text-[13px] text-danger">{forkError}</div>
+          /* No hand-off: the comments sidebar's draft shares this page —
+             navigating away would discard an in-progress comment. */
+          <ErrorNotice message={forkError} className="mb-3" />
         )}
 
         <div className="flex gap-4 items-start">

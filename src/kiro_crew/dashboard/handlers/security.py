@@ -48,6 +48,7 @@ from aiohttp import web
 
 from kiro_crew.apps.execution import APP_NAME_RE, builtin_app_names, trusted_app_names
 from kiro_crew.apps.manager import disable_app, get_app, list_apps
+from kiro_crew.apps.official_catalog import CatalogUnavailable
 from kiro_crew.apps.registry import get_registry_app
 from kiro_crew.apps.routes import app_lifecycle_lock
 from kiro_crew.apps.teardown import teardown_app_runtime
@@ -80,6 +81,7 @@ from kiro_crew.platform.governance import (
 from kiro_crew.platform.governance_profiles import (
     HOST_SESSION_KEY,
     bound_surfaces,
+    fallback_profile_names,
     resolve_active_scope,
 )
 from kiro_crew.security import DENY_REASON_MATCH_PREFIX
@@ -1000,7 +1002,15 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
         # Offloaded: both read from disk (installed.json + app.json; the registry
         # file and its cached external-index snapshots).
         def _is_known_app() -> bool:
-            return get_app(name) is not None or get_registry_app(name) is not None
+            if get_app(name) is not None:
+                return True
+            try:
+                return get_registry_app(name) is not None
+            except CatalogUnavailable:
+                # Resolution was refused because the catalog could not be consulted.
+                # Treat as not-known: this gates an execution grant, so declining
+                # while the source cannot be confirmed is the safe direction.
+                return False
 
         # Whether the app is INSTALLED right now, kept separate from "known". A
         # registry-only name is grantable on purpose (the install-consent flow grants
@@ -1796,6 +1806,21 @@ def build_governance_policy_snapshot() -> dict:
             # under these profiles. Naming them is what lets the viewer show a
             # host row as one surface's posture instead of an install-wide "off".
             "other_bound_surfaces": _other_bound_surfaces(),
+            # Every profile currently replaced by the deny-all fallback, by file
+            # stem, sorted. NAMES ONLY — the same exposure contract as
+            # ``other_bound_surfaces`` above, and no rule content, so the
+            # posture-only rule in :func:`_serialize_ruleset` still holds.
+            #
+            # Deliberately NOT narrowed to the host profile. The store knows every
+            # unusable profile, and a bound non-host one (``cron``, ``subagent``,
+            # an app bind) deny-alls its own surface just as silently: it appears
+            # in ``other_bound_surfaces`` looking healthy while the operator is
+            # back to reading server logs, which is the exact harm this signal
+            # exists to remove. Reporting the set also removes an ambiguity a
+            # host-only boolean had: matching a resolved profile's ``name``
+            # against file stems mislabels a profile whose declared name collides
+            # with a broken sibling's stem, whereas these ARE the stems.
+            "fallback_profiles": sorted(fallback_profile_names()),
             "unavailable": False,
             "scopes": scopes,
         }
@@ -1808,6 +1833,7 @@ def build_governance_policy_snapshot() -> dict:
             "profile": None,
             "surface": "host",
             "other_bound_surfaces": [],
+            "fallback_profiles": [],
             "unavailable": True,
             "scopes": [],
         }

@@ -34,6 +34,7 @@ mint, diagnostics, injection validation, run-marker) plus
 - [12. The gateway run-marker (`run_marker.py`)](#12-the-gateway-run-marker-run_markerpy)
 - [13. The SSM connection method (`connection_method`)](#13-the-ssm-connection-method-connection_method)
 - [14. Session transfer (send a session to another instance)](#14-session-transfer-send-a-session-to-another-instance)
+- [15. Federated session search (search every connected instance at once)](#15-federated-session-search-search-every-connected-instance-at-once)
 
 ---
 
@@ -522,10 +523,17 @@ clicked, since the menu has already closed by then.
 ### Pinned crew chips
 
 Switching between two crews through the dropdown costs a click every time. Any
-entry — including **Local** — can be PINNED from the dropdown's *Pin crews*
-section, which lifts it out of the menu into an always-visible chip beside the
-trigger. Nothing is pinned by default, so a single-crew user pays no header width
-for the feature and sees no chip row at all.
+entry — including **Local** — can be PINNED from the pin icon on its own dropdown
+row (lit for pinned, unlit outline for not), which lifts it out of the menu into
+an always-visible chip beside the trigger. Nothing is pinned by default, so a
+single-crew user pays no header width for the feature and sees no chip row at all.
+
+The pin sits on the row rather than in a second list of the same crews below it,
+and it is a SIBLING menu item of the row's switch target rather than a button
+inside it: a `menuitemradio` may not contain another interactive element, so a
+nested pin would be invalid ARIA and unreachable by the menu's own arrow keys.
+Clicking a pin toggles it and leaves the menu open, so several crews can be
+pinned in one visit without navigating anywhere.
 
 Pinning is per crew rather than one expand-everything switch because the header's
 budget is a PIXEL budget, not a crew count: three crews named after real hosts
@@ -855,9 +863,80 @@ file-permission argument does not hold, so Windows users keep `--port` /
 `KIROCREW_PORT`. This module deliberately offers no bare "is something
 listening" helper, so no caller can mistake reachability for identity.
 
-The live gateway prunes markers naming other ports on startup: a gateway is a
-singleton per data home, so any other marker belongs to a crashed earlier run,
-and each stale one costs a future client command a listener lookup.
+The live gateway prunes markers naming other ports on startup, EXCEPT any whose
+gateway passes the same ownership proof its readers use. `gateway.lock` makes a
+gateway a singleton per data home only when every start goes through it, and in
+practice one machine runs several that share a home (a second gateway launched by
+hand, one started from another checkout that inherits the default data home, a
+cutover overlapping its predecessor). A blanket prune deletes a LIVE gateway's
+marker and pid sidecar, which makes it undiscoverable to `token` / `status` /
+`stop` and destroys the evidence section 12.1 depends on. The ownership check fails
+closed by RETURNING FALSE rather than raising -- non-POSIX returns False outright,
+and a missing or throwing listener-lookup tool is folded into False as well -- so a
+False answer means "ownership not proven", NOT "process gone", and the two cases are
+indistinguishable from the caller. Such a marker still prunes, so markers do not
+accumulate forever -- but the prune removes only the marker and pid sidecar, never
+the credential, because treating False as death would strip a LIVE incumbent's
+credential on every Windows host and push its clients onto a shared file a newcomer
+may have replaced. `clear_marker()` owns credential deletion.
+
+### 12.1 The internal-API credential is keyed by port
+
+`<data-home>/run/gateway-<port>.secret` holds the internal-API credential of the
+gateway serving that port, written `0600` beside the marker and removed by
+`clear_marker()` with it.
+
+The credential is generated per gateway start (`os.urandom(16).hex()`) and kept in
+memory as the value the auth middleware compares against, so it identifies ONE
+generation. Published only to the single shared `<data-home>/.local_secret`, it
+was last-writer-wins per home: a second gateway starting in the same home replaced
+the file while the first kept serving the port, the incumbent went on comparing
+against its own in-memory value, and every internal caller then sent the
+newcomer's credential to the incumbent. The whole internal channel answers 403
+with a body of exactly `Forbidden` until one of them restarts: `learn_add`,
+`spawn`, `session-keepalive`, artifact writes, the task runner, all at once, with
+no warning and no metric.
+
+Two rules keep the two halves paired:
+
+- **The writer** (`dashboard.server._write_instance_credentials`) always writes the
+  per-port file, and writes the shared `.local_secret` only when no other gateway
+  in the home is verifiably alive on a different port. The shared file is still
+  written in the single-instance case because pre-per-port readers (an older CLI,
+  a cron script from a previous install) know only that path.
+- **The reader** is ONE shared helper, `config.loader.read_local_secret(port)`: it
+  returns the credential for the port the caller is about to dial and falls back to
+  `.local_secret` when no per-port file exists. It lives there rather than in each
+  reader because every surface that implements its own read reintroduces the bug for
+  itself. **`port` is required.** An optional port would resolve the dial target from
+  process context, so a converted call site could read the credential for one gateway
+  while dialing another -- the same desync, reintroduced one call site at a time and
+  invisible in the hunk under review. A caller with no port resolves one explicitly
+  and passes it, where the choice is reviewable. `mcp_core`, `mcp_shared`,
+  `cron_script`, `computer_use/screencast` and the Sage review driver each name their
+  dial target; a test greps for a no-argument call so the shape cannot come back.
+- **The dialed port's own credential outranks any path a caller names.**
+  `cron_trigger.trigger_cron_job` reads the per-port credential for the port it posts
+  to FIRST, and falls back to the `secret_path` its caller named only when that is
+  absent. The order is deliberate and is dictated by the callers: both of them pass
+  `config_dir() / ".local_secret"`, the home-wide file, which is exactly the file a
+  second gateway generation replaces -- so preferring the named path would reinstate
+  the defect this module exists to prevent.
+  The cost of that order, stated rather than hidden: a crash-orphaned
+  `run/gateway-<port>.secret` (the prune never deletes credentials, see section 12)
+  is preferred over a correct named path, so a caller that genuinely names another
+  home's credential for a port this home once served would send the stale one and get
+  a 403. No caller does that today -- both name the ambient home-wide file -- and
+  closing it properly means the credential-path parameter going away rather than the
+  order flipping.
+
+A denial carries a machine-readable `code` (`internal_auth_mismatch`) beside the
+prose, because a genuine permission denial produces the same `Forbidden` body and a
+consumer matching on text misdiagnoses one as the other. It also names both sides by
+fingerprint (a short SHA-256 prefix plus length, never the value), so a
+cross-generation mismatch is distinguishable from a forged header and from a caller
+that had no credential at all; without it a real desync is unattributable from the
+log.
 
 ### Why `run/` is on the sensitive-path floor
 
@@ -1140,3 +1219,98 @@ other direction is therefore done by registering the peers you want on each host
 that should originate a transfer, and a hub-initiated **pull** (read a peer's
 session over the same forward) is the natural follow-on that would make
 remote → hub and remote → remote work without any reverse reachability.
+
+## 15. Federated session search (search every connected instance at once)
+
+`GET /api/instances/search-sessions` answers one query with sessions from the
+local gateway **and** every instance whose tunnel is currently `CONNECTED`. The
+dashboard's two search surfaces switch to it automatically whenever at least one
+warm connection exists (the ⌘K palette's Sessions tab and the sidebar's Older
+Sessions search); with no warm instance they keep calling the plain local
+`/api/sessions/search`, so a peerless install never pays the detour.
+
+### 15.1 It is the hub-initiated pull §14.6 anticipated
+
+The search reuses the transfer's transport shape exactly: the hub GETs a peer's
+own `/api/sessions/search` **over the already-open forward** — no SSH spawn, no
+new port, no reverse reachability. `SshTunnelManager.search_sessions_remote`
+follows `send_session_bundle`'s credential rules to the letter: **the token
+never leaves the manager** (§6's invariant holds — `connect` and `refresh-token`
+remain the only routes whose response carries one), it travels as the
+port-scoped cookie so it cannot land in the peer's access log, and a `401/403`
+gets exactly one transparent re-mint retry, because a retained credential can go
+stale while the tunnel stays `CONNECTED`.
+
+Each peer request runs under `DEFAULT_SEARCH_PROXY_TIMEOUT_SECS` (6s) — sized
+between the token probe (2s, a bare ping, which would produce false
+"unreachable" verdicts on a loaded peer doing real scan work) and the transfer
+budget (30s, which would let one dead tunnel stall a keystroke-driven search).
+Peers are fanned out concurrently, so the slowest peer bounds the whole reply.
+
+### 15.2 Merging without a cross-instance score
+
+The aggregator **rank-interleaves**: position *k* of the reply cycles through
+each source's *k*-th best hit, local source first. Raw scores are never compared
+across gateways — each instance may run a different ranking version (a newer hub
+searching an older peer, or vice versa), so a numeric merge would silently
+prefer whichever version inflates its scores. Interleaving needs no score wire
+format, keeps every source represented in the top rows, and preserves each
+source's own internal order.
+
+An unreachable or refusing peer never fails the request: it is reported in the
+reply's `unreachable` array as `{id, name, code}` so a caller can tell what was
+NOT searched instead of having the result set silently narrowed. The shipped
+dashboard surfaces log the report (a visible "N instances unreachable" affordance
+is a follow-up); only CONNECTED peers are fanned out, so a miss here is a rare
+mid-search transient rather than the steady state for a down instance.
+Machine-readable codes distinguish a stale credential (`search_unauthorized`)
+from a dead tunnel (`search_unreachable`), a peer error (`search_peer_refused`),
+and a garbled reply (`search_malformed_reply`); the same codes are recorded in
+the SEL audit event for the request, so an operator can audit which peer failed
+and why without reproducing the search.
+
+### 15.3 Peer replies are untrusted input
+
+A peer's rows are re-shaped through a strict allowlist before they reach the
+browser: only known fields are copied, strings are type-checked, and `title` /
+`snippet` are re-run through the local credential + exfiltration redaction — the
+peer claims to have redacted, but this hub does not take its word for it. Rows
+from a peer additionally carry `instance_id` + `instance_name`; local rows carry
+neither, so the reply shape for a hub with no peers degrades to exactly the
+local search's own.
+
+The endpoint runs behind the same `_guard()` as every §6 route (owner-only,
+never Slack, `instances.enabled`, SEL-audited as `instances_search_sessions`)
+and mirrors the local search's input contract (`q` sanitized, capped at 256
+chars, min `SEARCH_MIN_CHARS`; `limit` default 50, max 200). The local rows are
+also redacted here: the aggregator calls `conversation_log.search_sessions`
+directly rather than going through the `/api/sessions/search` handler where the
+local redaction normally lives.
+
+### 15.4 What the UI does with a remote row
+
+A remote row's transcript lives on the other gateway, so the local dashboard can
+neither resume nor delete it:
+
+- **Activation switches panes.** Both surfaces route through
+  `useSelectInstance` (the single owner of switch-to-a-pane semantics, §3), so
+  clicking a remote row activates that instance's embedded pane —
+  reconnecting it first if needed. Deep-linking to the specific session inside
+  the embedded SPA is a follow-up: the iframe protocol has no open-session
+  message yet.
+- **The local delete action is hidden** on remote rows. `deleteHistorySession`
+  targets the LOCAL session file; with colliding keys across gateways it would
+  delete a same-keyed, unrelated local conversation.
+- **⌘Enter (open in local split grid) is inert** for remote rows in the
+  palette — bound to an explicit no-op, because an absent handler makes the
+  palette's Enter dispatch fall back to plain activation and the chord would
+  silently switch panes.
+- Remote rows are badged with the instance's **raw name** (never translated —
+  it is the user's own label, which also keeps the change i18n-neutral), and
+  result ids are namespaced by instance so two gateways' same-keyed sessions
+  cannot collide in the palette's keyed list. Snippet-highlight offsets are
+  shifted by the prefix length so remote rows highlight the same match a local
+  row would.
+- Any federated-endpoint failure in the UI — including the `403` when the
+  instances feature is off — falls back to the plain local search, which is
+  always the floor.

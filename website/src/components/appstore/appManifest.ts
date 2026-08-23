@@ -58,7 +58,8 @@ import { i18nT } from '../../i18n/t'
 type ManifestKeys = {
   displayName: string
   description: string
-  pageLabel: string
+  /** Absent for an app that contributes no page (e.g. an overlay-only app). */
+  pageLabel?: string
   highlights: string[]
 }
 
@@ -126,6 +127,12 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.codeReviewSage.manifest.highlight_5',
     ],
   },
+  // Overlay-only: no `pageLabel`, because this app contributes no page.
+  'command-bar': {
+    displayName: 'apps.commandBar.manifest.display_name',
+    description: 'apps.commandBar.manifest.description',
+    highlights: [],
+  },
   'crew-companion': {
     displayName: 'apps.crewCompanion.manifest.display_name',
     description: 'apps.crewCompanion.manifest.description',
@@ -152,6 +159,15 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.designCritique.manifest.highlight_7',
       'apps.designCritique.manifest.highlight_8',
     ],
+  },
+  // `design-tweak` ships no `highlights` (matching `spec-builder`'s precedent
+  // below): app.json declares no `highlights` field, so the App Store card
+  // shows displayName/description/pageLabel only.
+  'design-tweak': {
+    displayName: 'apps.designTweak.manifest.display_name',
+    description: 'apps.designTweak.manifest.description',
+    pageLabel: 'apps.designTweak.manifest.page_label',
+    highlights: [],
   },
   'dev-fleet': {
     displayName: 'apps.devFleet.manifest.display_name',
@@ -367,7 +383,9 @@ export function appDescription(app: { name?: string; description?: string; _regi
  */
 export function appPageLabel(name: string | undefined, label?: string, displayName?: string): string {
   const k = keysFor({ name })
-  return k ? i18nT(k.pageLabel) : (label || displayName || name || '')
+  // An overlay-only builtin declares no page-label key; fall through to the caller's
+  // own strings exactly as a third-party app does.
+  return k?.pageLabel ? i18nT(k.pageLabel) : (label || displayName || name || '')
 }
 
 /**

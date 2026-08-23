@@ -34,7 +34,12 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
-from kiro_crew.messaging.dispatch import ChannelTurn, drive_turn, inbound_permitted
+from kiro_crew.messaging.dispatch import (
+    ChannelTurn,
+    build_directive_consumer,
+    drive_turn,
+    inbound_permitted,
+)
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
 from kiro_crew.messaging.transport import InboundMessage
@@ -241,6 +246,13 @@ class WeixinDispatcher:
             ChannelTurn(
                 channel_type="weixin",
                 session_key=session_key,
+                # Session-directive consumer: monitor_start / autonudge_stop /
+                # ... return a marker TurnDriver decodes; apply it against THIS
+                # turn's session key (dashboard-only directives stay refused
+                # for channel sessions).
+                directive_consumer=build_directive_consumer(
+                    session_key=session_key, sessions=self.sessions, dispatcher=self
+                ),
                 conversation_id=conversation_id,
                 agent=agent,
                 user_text=text,
@@ -248,7 +260,7 @@ class WeixinDispatcher:
                 approval_mode=self.approval_mode,
                 decider=None,  # iLink can't render approve/deny buttons
                 persist=lambda user_text, reply, is_new: self._persist_turn(
-                    session_key, user_text, reply, is_new
+                    session_key, user_text, reply, is_new, agent
                 ),
                 after_persist=self._surface_own_session,
                 notice=lambda sk, provider: self._maybe_notice(user_id, sk, provider),
@@ -324,14 +336,19 @@ class WeixinDispatcher:
         )
 
     def _persist_turn(
-        self, session_key: str, user_text: str, reply_text: str, is_new: bool
+        self,
+        session_key: str,
+        user_text: str,
+        reply_text: str,
+        is_new: bool,
+        agent: str | None = None,
     ) -> None:
         """Record the turn to conversation_log (dashboard visibility + restart)."""
         if self.conv_log is None:
             return
-        self.conv_log.append(session_key, "user", user_text)
+        self.conv_log.append(session_key, "user", user_text, agent=agent)
         if reply_text:
-            self.conv_log.append(session_key, "assistant", reply_text)
+            self.conv_log.append(session_key, "assistant", reply_text, agent=agent)
         if is_new:
             title = (user_text or "").strip().replace("\n", " ")[:40] or "WeChat"
             self.conv_log.set_title(session_key, title)

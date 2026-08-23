@@ -412,6 +412,19 @@ async def api_cron_update(request: web.Request) -> web.Response:
     ):
         if key in body:
             kwargs[key] = body[key]
+    # name routes through the same validator as POST (type check +
+    # sanitize_string + length cap) so the two REST surfaces cannot diverge:
+    # PATCH previously passed it through entirely unvalidated, letting a
+    # non-string or oversize name persist verbatim into crons.json.
+    if "name" in kwargs:
+        try:
+            kwargs["name"] = validate_string_field(
+                body, "name", max_len=MAX_SHORT_STRING
+            )
+        except ValidationError as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "invalid_name"}, status=400
+            )
     # message routes through the same validator as POST (type check +
     # sanitize_string + length cap) so the two REST surfaces cannot diverge:
     # PATCH previously passed it through entirely unvalidated. Sanitizing here
@@ -1057,6 +1070,10 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # omitted the kwarg -- so every NOT-clause sent to this route, from the
     # learn_add MCP tool, the dashboard, or the CLI, was silently lost.
     negative = cleaned.get("negative") or None
+    # Restricts the lesson to one repository; absent means it applies everywhere.
+    # Both write paths carry it, so the JSONL fallback store gates identically to
+    # the vector store rather than injecting a scoped lesson the other withholds.
+    repo_scope = cleaned.get("repo_scope") or None
     # Write to vector store if available, else JSONL
     vs = _get_memory(state).vector_store
     if vs:
@@ -1086,6 +1103,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             "user_explicit",
             rule_emb,
             rule_emb_generation,
+            repo_scope,
         )
         # Sweep ONLY when the lesson actually landed. write_lesson returns False
         # for a value its preflight refuses (reachable now that ``negative`` is
@@ -1098,7 +1116,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # wrong for BOTH False cases, so gate on the result rather than the cause.
         if wrote:
             candidates = await asyncio.to_thread(
-                vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb
+                vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb, repo_scope
             )
             if candidates:
                 # Fire-and-forget via this module's _background_tasks
@@ -1116,6 +1134,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             rule=rule,
             category=category,
             negative=negative,
+            repo_scope=repo_scope,
             ts=datetime.now(timezone.utc).isoformat(),
         )
         store = _get_lessons(state, cleaned.get("workspace")) if scope == "workspace" else (
@@ -1219,11 +1238,27 @@ async def api_crons(request: web.Request) -> web.Response:
             "created_ts": j.created_ts or None,
             "last_status": j.last_status,
             "agent": redact_credentials(redact_exfiltration_urls(j.agent_id or "")[0])[0] or None,
+            # The crews a sequence job actually wakes. Serialized because
+            # `agent_sequence` takes PRECEDENCE over `agent_id` at run time, so a
+            # consumer reading only `agent` would attribute such a job to the
+            # wrong crew (an empty `agent_id` reads as "the default crew").
+            "agent_sequence": [
+                redact_credentials(redact_exfiltration_urls(a or "")[0])[0]
+                for a in (j.agent_sequence or [])
+            ],
             "model": redact_credentials(redact_exfiltration_urls(j.model or "")[0])[0] or None,
             "channel": redact_credentials(redact_exfiltration_urls(j.channel or "")[0])[0] or None,
             "approval_mode": redact_credentials(redact_exfiltration_urls(j.approval_mode or "")[0])[
                 0
             ]
+            or None,
+            # The chat session that owns this job. Ownership decides chat-side
+            # reachability: cron_list only shows a session its own jobs, so a job
+            # whose key is empty (None here) is invisible to every chat session
+            # and manageable only from this page or the CLI. Raw value on
+            # purpose — the frontend decides presentation, and a derived
+            # "reachable" boolean would be a second encoding of the same fact.
+            "session_key": redact_credentials(redact_exfiltration_urls(j.session_key or "")[0])[0]
             or None,
             "silent": j.silent,
             "strict_schedule": j.strict_schedule,

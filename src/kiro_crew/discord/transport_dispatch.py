@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from kiro_crew.discord.attachments import (
@@ -38,13 +39,18 @@ from kiro_crew.discord.commands import (
     parse_mid_turn_override,
 )
 from kiro_crew.discord.renderer import DiscordApprovalDecider, DiscordRenderer
-from kiro_crew.discord.session_resume import DiscordSessionResume
+from kiro_crew.discord.session_resume import (
+    DiscordSessionResume,
+    ResumeReleaseError,
+    RoutingDecision,
+)
 from kiro_crew.discord.transport import DISCORD_CAPABILITIES
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.history import is_incognito_transcript
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
-from kiro_crew.messaging.dispatch import delivery_is_muted
+from kiro_crew.messaging.dispatch import build_directive_consumer, delivery_is_muted
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -63,6 +69,8 @@ from kiro_crew.sel import sel
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from kiro_crew.config.loader import KiroCrewConfig
     from kiro_crew.context import ContextBuilder
     from kiro_crew.discord.client import DiscordClient, DiscordInteraction
@@ -76,6 +84,41 @@ from kiro_crew.messaging.queue_receipt import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _persisted_mode_is_restricted(session_key: str) -> bool:
+    """Whether ``dashboard:<slot>``'s PERSISTED transcript says it is restricted.
+
+    Blocking (it reads the transcript's metadata line), so callers run it off the
+    event loop. Uses ``_probe_persisted_session``, NOT
+    ``_persisted_session_memory_mode``: the namespace is stripped off the key
+    before it gets here, so one stem can match several transcripts (a legacy bare
+    ``<name>.jsonl`` and an archived ``dashboard_<name>.jsonl``), and the
+    memory-mode helper answers from the FIRST candidate -- letting a persistent
+    file answer for an incognito session. The probe refuses to guess and reports
+    unknown, which denies, as does a header no normal session wrote. Existence is
+    ignored: unknown denies either way.
+
+    Imported inside the function because ``discord`` has no module-level dependency on
+    ``dashboard`` and adding one would cycle through the gateway; import failure denies.
+    """
+    slot_name = session_key.split(":", 1)[-1]
+    try:
+        # circular import: the dashboard gateway imports the Discord transport.
+        from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
+
+        _exists, mode = _probe_persisted_session(slot_name)
+    except Exception:
+        logger.warning(
+            "discord: could not resolve the persisted memory mode for %s; denying uploads",
+            session_key,
+            exc_info=True,
+        )
+        return True
+    if mode is None:
+        return True
+    return is_incognito_transcript(mode)
+
 
 # Canonical kiro-cli agent fallback so Discord sessions load kirocrew-core
 # (spawn_run etc.) — mirrors the Slack/Telegram paths.
@@ -92,6 +135,14 @@ _MAX_COLLAPSE = 50
 # Keep queue collapse within the shared ingestion layer's per-turn file cap.
 _MAX_COLLAPSED_ATTACHMENTS = IngestLimits().max_attachments
 
+#: Commands that still run while this conversation owes the user a detach notice.
+#: Everything else targets a session or is a plain turn and must be refused until
+#: the user has been told — including a bare message, whose ``cmd`` is ``None``.
+_DETACH_EXEMPT_COMMANDS = frozenset({"new", "unlink", "sessions", "help"})
+_RELEASE_FAILURE = (
+    "⚠️ Couldn't save the session release, so the command was NOT completed. "
+    "Fix the gateway's storage problem, then retry."
+)
 _HELP_TEXT = """\
 🦞 **Kiro Crew — Discord**
 
@@ -149,6 +200,10 @@ class DiscordDispatcher:
         self._queue = ReceiptQueue()
         # session_key -> the running turn's renderer (for steer chips).
         self._active_renderers: dict[str, DiscordRenderer] = {}
+        # channel_id -> (lock, in-flight deciders); dropped when the last one leaves.
+        self._routing_locks: dict[str, tuple[asyncio.Lock, list[int]]] = {}
+        # A message in governance predates a refusal but is not a decider yet.
+        self._routing_checks: dict[str, int] = {}
         self._session_resume = DiscordSessionResume(
             sessions,
             conv_log,
@@ -156,6 +211,10 @@ class DiscordDispatcher:
         )
         # Kept as a direct alias for diagnostics/tests; the controller owns it.
         self._session_pickers = self._session_resume.pickers
+
+    def register_allowed_thread(self, thread_id: str) -> None:
+        """Authorize interactions in a thread created by the inbound transport."""
+        self._allowed_threads.add(thread_id)
 
     # ── Turn dispatch (transport's dispatch callback) ──────────────────────
 
@@ -168,16 +227,25 @@ class DiscordDispatcher:
     ) -> None:
         """Drive one authorized inbound message through TurnDriver end-to-end."""
         assert self.client is not None, "DiscordDispatcher.client must be set"
+        channel_id = msg.conversation_id
+        self._routing_checks[channel_id] = self._routing_checks.get(channel_id, 0) + 1
         # Inbound channels-governance gate (off-loop). The startup gate only stops
         # a transport from CONNECTING; a host-profile deny added after it connected
         # would otherwise keep dispatching inbound messages until restart. Recheck
         # per message so a runtime deny takes effect immediately — silently drop
         # (no reply) on deny, matching how an unauthorized user is ignored.
-        if not await channel_inbound_permitted("discord"):
+        try:
+            permitted = await channel_inbound_permitted("discord")
+        finally:
+            remaining = self._routing_checks[channel_id] - 1
+            if remaining:
+                self._routing_checks[channel_id] = remaining
+            else:
+                self._routing_checks.pop(channel_id)
+        if not permitted:
             logger.info("discord inbound dropped: denied by channels governance policy")
             return
         user_id = msg.user_id
-        channel_id = msg.conversation_id
         thread_id = msg.thread_id or ""
         scope_id = self._scope_id(user_id, thread_id)
         text = msg.text
@@ -200,8 +268,27 @@ class DiscordDispatcher:
             if interpret_as_command and override_mode is None
             else None
         )
+        # `!compact` and `!stop` act on the resolved session, so after a binding was
+        # destroyed they would compact or cancel the NATIVE DM session while the user
+        # believes they drive the resumed one; deciding here makes that structural.
+        route = RoutingDecision()
+        if interpret_commands and cmd not in _DETACH_EXEMPT_COMMANDS:
+            async with self._routing_turn(channel_id) as queued:
+                route = await self._session_resume.route(channel_id)
+                if route.refusal is not None:
+                    # Settle only once the refusal landed AND nobody who predates it
+                    # is still in governance or queued: otherwise that message could
+                    # route into a transcript the user never chose.
+                    landed = await self.client.send_message(channel_id, route.refusal)
+                    if (landed and len(queued) == 1 and not self._routing_checks.get(channel_id)):
+                        await self._session_resume.settle(channel_id, route)
+                    return
         if cmd == "new":
-            left_resumed = self._session_resume.leave_resumed_session(channel_id)
+            try:
+                left_resumed = await self._session_resume.leave_resumed_session(channel_id)
+            except ResumeReleaseError:
+                await self.client.send_message(channel_id, _RELEASE_FAILURE)
+                return
             self._conv.bump_gen(scope_id)
             message = "✅ New conversation started."
             if left_resumed is not None:
@@ -210,7 +297,7 @@ class DiscordDispatcher:
             return
         if cmd == "compact":
             self._conv.clear_awaiting(scope_id)
-            await self._handle_compact(user_id, channel_id, thread_id)
+            await self._handle_compact(user_id, channel_id, thread_id, route.resumed_key)
             return
         if cmd == "sessions":
             # DM-ONLY. The owner gate answers WHO may resume, not WHERE the
@@ -235,7 +322,7 @@ class DiscordDispatcher:
             )
             return
         if cmd == "link":
-            await self._handle_link(user_id, channel_id, thread_id)
+            await self._handle_link(user_id, channel_id, thread_id, route.resumed_key)
             return
         if cmd == "unlink":
             await self._handle_unlink(user_id, channel_id, thread_id)
@@ -244,15 +331,14 @@ class DiscordDispatcher:
             await self.client.send_message(channel_id, _HELP_TEXT)
             return
         if cmd == "stop":
-            await self._handle_stop(user_id, channel_id, thread_id)
+            await self._handle_stop(user_id, channel_id, thread_id, route.resumed_key)
             return
 
         # ── Mid-turn concurrency: check the CURRENT-generation key BEFORE any
         # idle/daily rotation (see the Telegram dispatcher's rationale). ──
-        # ``resumed_key`` is computed ONCE here and threaded through the rest of
-        # the turn: a resumed dashboard session is not this conversation's own
-        # session, and several steps below must not treat it as one.
-        resumed_key = self._session_resume.resumed_session(channel_id)
+        # ``resumed_key`` comes from the decision above and is NOT re-resolved: a
+        # second resolver call let an unlink landing mid-decision route silently.
+        resumed_key = route.resumed_key
         session_key = resumed_key or self._session_key(user_id, thread_id)
         if self.sessions.is_busy(session_key):
             if resumed_key is not None:
@@ -300,7 +386,11 @@ class DiscordDispatcher:
             else None
         )
         renderer = DiscordRenderer(
-            self.client, channel_id, DISCORD_CAPABILITIES, session_key=session_key
+            self.client,
+            channel_id,
+            DISCORD_CAPABILITIES,
+            session_key=session_key,
+            uploads_allowed=not await self._uploads_restricted(session_key),
         )
         # Discord runs its OWN copy of the turn loop instead of going through
         # ``messaging.dispatch.drive_turn``, so the disconnect gate there does not
@@ -354,6 +444,7 @@ class DiscordDispatcher:
                 session_key, agent=agent, channel_id=chan_id
             )
             _acquired = True
+            renderer.authorize_upload_root(provider.cwd)
             if msg.attachments:
                 attachment_result = await process_discord_attachments(
                     self.client, msg.attachments
@@ -450,6 +541,13 @@ class DiscordDispatcher:
                     and title == "spawn_run"
                 ),
                 tool_gate=_tool_gate,
+                # Session-directive consumer: monitor_start / autonudge_stop /
+                # ... return a marker the driver decodes; apply it against THIS
+                # turn's session key (dashboard-only directives stay refused
+                # for channel sessions).
+                directive_consumer=build_directive_consumer(
+                    session_key=session_key, sessions=self.sessions, dispatcher=self
+                ),
             )
             accumulated = await driver.run(full_message)
 
@@ -467,6 +565,7 @@ class DiscordDispatcher:
                     accumulated,
                     is_new_own_session,
                     mirrored,
+                    agent=agent,
                 )
             except Exception:
                 logger.warning(
@@ -723,10 +822,31 @@ class DiscordDispatcher:
 
         return _Surface()
 
-    async def _handle_stop(self, user_id: str, channel_id: str, thread_id: str = "") -> None:
+    @asynccontextmanager
+    async def _routing_turn(self, channel_id: str) -> "AsyncIterator[list[int]]":
+        """Serialize one channel's route -> refusal send -> settle, because delivery is
+        what retires the refusal. Only THIS channel, never the accepted turn, and not
+        `_bind_lock`, which `choose()` holds across its own Discord round-trips."""
+        lock, deciders = self._routing_locks.setdefault(channel_id, (asyncio.Lock(), []))
+        deciders.append(1)
+        try:
+            async with lock:
+                yield deciders
+        finally:
+            deciders.pop()
+            if not deciders:
+                self._routing_locks.pop(channel_id, None)
+
+    async def _handle_stop(
+        self,
+        user_id: str,
+        channel_id: str,
+        thread_id: str,
+        resumed_key: str | None,
+    ) -> None:
         """Hard cancel: abort the in-flight turn and clear everything."""
         assert self.client is not None
-        session_key = self._inbound_session_key(user_id, channel_id, thread_id)
+        session_key = resumed_key or self._session_key(user_id, thread_id)
         cancelled_turn = False
         if self.sessions.is_busy(session_key):
             provider = self.sessions.get_provider(session_key)
@@ -977,7 +1097,13 @@ class DiscordDispatcher:
             location=self._origin_mirror_link(channel_id),
         )
 
-    async def _handle_link(self, user_id: str, channel_id: str, thread_id: str = "") -> None:
+    async def _handle_link(
+        self,
+        user_id: str,
+        channel_id: str,
+        thread_id: str,
+        resumed_key: str | None,
+    ) -> None:
         """Re-enable mirroring of this conversation's dashboard tab back here.
 
         Mirroring is automatic (see :meth:`_bind_origin_mirror`), so this is the
@@ -987,8 +1113,11 @@ class DiscordDispatcher:
         """
         assert self.client is not None
         # Refuse while a resumed session owns this conversation: linking would
-        # rebind the same location and silently strand the resumed session.
-        if self._session_resume.resumed_session(channel_id) is not None:
+        # rebind the same location and silently strand the resumed session. The
+        # owner comes from the turn's routing decision, not a fresh resolve — a
+        # second resolve is a second answer, and the gap between them is where a
+        # concurrent rebind slips through.
+        if resumed_key is not None:
             await self.client.send_message(
                 channel_id,
                 "⚠️ A resumed session is active here. Send `!unlink` first.",
@@ -1043,7 +1172,12 @@ class DiscordDispatcher:
         # A resumed session takes precedence: it is what the user is actually
         # talking to, so releasing it is the only way back to their own
         # conversation from Discord.
-        if self._session_resume.leave_resumed_session(channel_id) is not None:
+        try:
+            left_resumed = await self._session_resume.leave_resumed_session(channel_id)
+        except ResumeReleaseError:
+            await self.client.send_message(channel_id, _RELEASE_FAILURE)
+            return
+        if left_resumed is not None:
             await self.client.send_message(
                 channel_id,
                 "✅ Left the resumed session. Back to your Discord conversation.",
@@ -1087,6 +1221,53 @@ class DiscordDispatcher:
             )
             return None
 
+    async def _uploads_restricted(self, session_key: str) -> bool:
+        """True when this session must not ship local file bytes to Discord.
+
+        Restricted means an incognito or temporary dashboard session this
+        conversation has resumed. Those slots are denied every artifact write, on
+        the reasoning that a session the user expected to leave no trace must not
+        persist its output; uploading a local file into a Discord channel is the
+        same disclosure with a different destination, and an approved guild thread
+        is readable by every member who can view it.
+
+        Three inputs, in the order their evidence is strongest:
+
+        * A key that is not ``dashboard:`` is a Discord-native conversation. It
+          never had a dashboard slot and has no restricted mode, so it is
+          allowed -- blanket fail-closed here would disable uploads for every
+          normal Discord session.
+        * A LIVE slot answers directly, off the same ``slot.is_restricted``
+          signal as the artifact gate, so the two cannot drift.
+        * No live slot, but a ``dashboard:`` binding still resolved. This is a
+          real state, not a defensive branch: closing the tab pops the slot from
+          ``state._slots`` AND discards its key from ``state._restricted_keys``,
+          while the mirror binding lives in the persisted session map, which only
+          an explicit unlink clears. So the next Discord message into that
+          conversation resolves an incognito session whose in-memory restriction
+          is gone. The transcript keeps its ``memory_mode`` marker, so resolve
+          the PERSISTED mode instead -- and deny when it cannot be read.
+
+        The denial is SEL-audited so the ceiling is observable, mirroring how
+        this transport audits its authorization denials.
+        """
+        if not session_key.startswith("dashboard:"):
+            return False
+        slot = self._live_dashboard_slot(session_key)
+        if slot is not None:
+            restricted = bool(getattr(slot, "is_restricted", True))
+        else:
+            restricted = await asyncio.to_thread(_persisted_mode_is_restricted, session_key)
+        if restricted:
+            sel().log_api_access(
+                caller=session_key,
+                operation="discord_dispatch.upload_files",
+                outcome="denied",
+                source="discord",
+                error="restricted_session",
+            )
+        return restricted
+
     def _mirror_turn_to_live_slot(self, session_key: str, user_text: str, reply_text: str) -> bool:
         """Land a resumed turn in the live dashboard window. Loop-side only.
 
@@ -1129,6 +1310,7 @@ class DiscordDispatcher:
         reply_text: str,
         is_new: bool,
         mirrored: bool = False,
+        agent: str | None = None,
     ) -> None:
         """Record the turn to conversation_log (dashboard visibility + restart).
 
@@ -1139,13 +1321,13 @@ class DiscordDispatcher:
         if self.conv_log is None:
             return
         if mirrored:
-            self.conv_log.append_if_absent(session_key, "user", user_text)
+            self.conv_log.append_if_absent(session_key, "user", user_text, agent=agent)
             if reply_text:
-                self.conv_log.append_if_absent(session_key, "assistant", reply_text)
+                self.conv_log.append_if_absent(session_key, "assistant", reply_text, agent=agent)
         else:
-            self.conv_log.append(session_key, "user", user_text)
+            self.conv_log.append(session_key, "user", user_text, agent=agent)
             if reply_text:
-                self.conv_log.append(session_key, "assistant", reply_text)
+                self.conv_log.append(session_key, "assistant", reply_text, agent=agent)
         if is_new:
             title = (user_text or "").strip().replace("\n", " ")[:40] or "Discord"
             self.conv_log.set_title(session_key, title)
@@ -1163,7 +1345,11 @@ class DiscordDispatcher:
     async def _maybe_notice(
         self, channel_id: str, scope_id: str, session_key: str, provider: Any
     ) -> None:
-        """Soft-threshold context warning as a SEPARATE message (not persisted)."""
+        """Soft-threshold context warning as a SEPARATE message (not persisted).
+
+        The hard-compaction backstop is the backend autocompactor
+        (``session.autocompact_pct``).
+        """
         pct = self.sessions.check_context_usage(session_key, provider)
         soft_pct = self.cfg.discord.soft_threshold_pct
         if pct >= soft_pct and not self._conv.is_awaiting(scope_id):
@@ -1175,10 +1361,16 @@ class DiscordDispatcher:
                 "`!new` to start fresh.",
             )
 
-    async def _handle_compact(self, user_id: str, channel_id: str, thread_id: str = "") -> None:
+    async def _handle_compact(
+        self,
+        user_id: str,
+        channel_id: str,
+        thread_id: str,
+        resumed_key: str | None,
+    ) -> None:
         """In-place ACP ``/compact`` on the conversation's session."""
         assert self.client is not None
-        session_key = self._inbound_session_key(user_id, channel_id, thread_id)
+        session_key = resumed_key or self._session_key(user_id, thread_id)
         if not await self.sessions.try_acquire(session_key):
             if self.sessions.has_session(session_key):
                 await self.client.send_message(

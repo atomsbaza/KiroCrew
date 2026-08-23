@@ -26,6 +26,16 @@ from kiro_crew.cron_script import (
 
 
 @pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
+
+
+@pytest.fixture(autouse=True)
 def _crons_dir_tracks_patched_home(monkeypatch):
     """Keep ``cron_script.config_dir()`` pointed at ``<patched home>/.kirocrew``.
 
@@ -1126,8 +1136,6 @@ class TestRunScriptSandboxedErrorPaths:
             "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
         ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
             "subprocess.Popen", return_value=mock_proc
-        ), patch(
-            "pathlib.Path.unlink"
         ):
             result = run_script_sandboxed("/f.py:run", "j1", "")
         assert result["status"] == "error"
@@ -1142,8 +1150,6 @@ class TestRunScriptSandboxedErrorPaths:
             "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
         ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
             "subprocess.Popen", return_value=mock_proc
-        ), patch(
-            "pathlib.Path.unlink"
         ):
             result = run_script_sandboxed("/f.py:run", "j1", "")
         assert result["status"] == "error"
@@ -1168,6 +1174,9 @@ class TestMcpCronHandlerPaths:
         job.last_status = "error"
         job.last_error = "connection refused"
         job.enabled = True
+        # cron_list scopes to the caller's own rows, so the fixture row has to
+        # name the session the autouse caller fixture provides.
+        job.session_key = os.environ["KIROCREW_SESSION_KEY"]
         with patch("kiro_crew.mcp_cron.config_dir", return_value=tmp_path), patch(
             "kiro_crew.mcp_cron.CronService"
         ) as mock_svc:
@@ -1190,6 +1199,9 @@ class TestMcpCronHandlerPaths:
         job.last_status = "ok"
         job.last_result = "CR passed"
         job.enabled = True
+        # cron_list scopes to the caller's own rows, so the fixture row has to
+        # name the session the autouse caller fixture provides.
+        job.session_key = os.environ["KIROCREW_SESSION_KEY"]
         with patch("kiro_crew.mcp_cron.config_dir", return_value=tmp_path), patch(
             "kiro_crew.mcp_cron.CronService"
         ) as mock_svc:
@@ -1309,9 +1321,7 @@ class TestRunScriptSandboxedTimeout:
             # TestKillBroadcastGuard.
             "kiro_crew.platform_compat.kill_process_tree",
             return_value=True,
-        ) as mock_tree, patch(
-            "pathlib.Path.unlink"
-        ):
+        ) as mock_tree:
             result = run_script_sandboxed("/f.py:run", "j1", "", timeout=30)
         assert result["status"] == "error"
         assert "timed out" in result["error"]
@@ -1468,7 +1478,7 @@ class TestResolveInternalSecret:
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
             (tmp_path / ".local_secret").write_text("fromfile")
-            assert _resolve_internal_secret() == "fromenv"
+            assert _resolve_internal_secret(5476) == "fromenv"
 
     def test_falls_back_to_local_secret_file(self, tmp_path):
         (tmp_path / ".local_secret").write_text("filesecret\n")
@@ -1476,21 +1486,21 @@ class TestResolveInternalSecret:
         with patch.dict(os.environ, env, clear=True), patch(
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
-            assert _resolve_internal_secret() == "filesecret"
+            assert _resolve_internal_secret(5476) == "filesecret"
 
     def test_empty_when_neither_present(self, tmp_path):
         env = {k: v for k, v in os.environ.items() if k != "KIROCREW_INTERNAL_SECRET"}
         with patch.dict(os.environ, env, clear=True), patch(
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
-            assert _resolve_internal_secret() == ""
+            assert _resolve_internal_secret(5476) == ""
 
     def test_env_empty_string_falls_back_to_file(self, tmp_path):
         (tmp_path / ".local_secret").write_text("filesecret")
         with patch.dict(os.environ, {"KIROCREW_INTERNAL_SECRET": ""}), patch(
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
-            assert _resolve_internal_secret() == "filesecret"
+            assert _resolve_internal_secret(5476) == "filesecret"
 
     def test_run_script_writes_local_secret_to_sandbox_when_env_unset(self, tmp_path):
         """End-to-end: run_script_sandboxed hands the sandbox the .local_secret value."""
@@ -1512,8 +1522,6 @@ class TestResolveInternalSecret:
             "kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)
         ), patch(
             "subprocess.Popen", side_effect=fake_popen
-        ), patch(
-            "pathlib.Path.unlink"
         ):
             run_script_sandboxed("/f.py:run", "j1", "", timeout=30)
         assert captured["secret"] == "realsecret"

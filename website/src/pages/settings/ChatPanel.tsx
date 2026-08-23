@@ -30,8 +30,8 @@ const RESTORE_OPTIONS = ['15', '30', '60', '120', '360', '720', '1440', '0']
 function restoreLabels(): string[] {
   return ['15m', '30m', '1h', '2h', '6h', '12h', '24h', i18nT('pages.settings.chatPanel.no_limit')]
 }
-const COMPACT_OPTIONS = ['20', '40', '60', '80', '90']
-const COMPACT_LABELS = ['20% (aggressive)', '40%', '60%', '80%', '90% (default)']
+const COMPACT_OPTIONS = ['20', '40', '60', '70', '80', '90']
+const COMPACT_LABELS = ['20% (aggressive)', '40%', '60%', '70% (default)', '80%', '90%']
 
 // About You — slugs shared with onboarding step 2 and context.py's prompt maps.
 const ROLE_OPTIONS = ['', ...ROLE_SLUGS]
@@ -105,7 +105,7 @@ export function ChatPanel() {
     queryKey: ['dashboardConfig'],
     queryFn: () => api.dashboardConfig(),
   })
-  const dashCfg = dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, widget_density: 'more' as const, verbosity: 'default' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, mcp_app_panel: false, auto_open_git_panel: false, folder_suggestions_enabled: true }
+  const dashCfg = dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, widget_density: 'more' as const, verbosity: 'default' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, mcp_app_panel: false, auto_open_git_panel: false, folder_suggestions_enabled: true, use_builtin_browser: true }
 
   // ── Feature Tips opt-out (server-side per-user state) ──
   const tipsQ = useQuery<{ enabled_config: boolean; opted_out: boolean }>({
@@ -581,7 +581,7 @@ export function ChatPanel() {
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.auto_compact_threshold')}
             description={i18nT('pages.settings.chatPanel.context_usage_at_which_auto_compaction_triggers')}
-            value={String(mcCfg?.session?.autocompact_pct ?? 90)}
+            value={String(mcCfg?.session?.autocompact_pct ?? 70)}
             options={COMPACT_OPTIONS}
             optionLabels={COMPACT_LABELS}
             onChange={v =>

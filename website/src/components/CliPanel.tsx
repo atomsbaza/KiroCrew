@@ -44,7 +44,20 @@ let _themeObserver: MutationObserver | null = null
 let _themeRaf = 0
 /** Coalesce multiple theme signals into one refresh, after the CSSOM settles. */
 function scheduleTermThemeRefresh() {
-  if (_themeRaf) return
+  // Replace the pending frame rather than deferring to it. A plain
+  // `if (_themeRaf) return` latch assumes every handle it stores is eventually
+  // cleared by its own callback, and requestAnimationFrame does not promise
+  // that: an implementation may hand back a live handle whose callback never
+  // runs (happy-dom returns a truthy `{}` when the window is closed or a
+  // timer-loop limit trips, and a browser drops queued frames for a page in the
+  // back/forward cache). One such handle latches the guard truthy forever and
+  // every later theme signal is dropped, so the terminal silently stops
+  // tracking the app theme for the life of the page.
+  //
+  // Cancel-and-reschedule coalesces exactly as well -- a burst of signals still
+  // yields one refresh, because each cancels the last -- while making a
+  // non-firing handle merely stale instead of permanently blocking.
+  if (_themeRaf) cancelAnimationFrame(_themeRaf)
   _themeRaf = requestAnimationFrame(() => { _themeRaf = 0; refreshTermThemes() })
 }
 function ensureThemeObserver() {
@@ -91,7 +104,10 @@ function applyTerminalFontToAll(): void {
 
 let _fontRaf = 0
 function scheduleTerminalFontApply(): void {
-  if (_fontRaf) return
+  // Same latch hazard as scheduleTermThemeRefresh -- see the comment there for
+  // why a returned frame handle cannot be trusted to fire. Fixed identically so
+  // the two schedulers cannot drift apart.
+  if (_fontRaf) cancelAnimationFrame(_fontRaf)
   _fontRaf = requestAnimationFrame(() => { _fontRaf = 0; applyTerminalFontToAll() })
 }
 
@@ -262,7 +278,18 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
     fonts.ready.then(onReady)
     try {
       const px = term.options.fontSize ?? 13
-      fonts.load(`${px}px "JetBrains Mono"`).then(onReady, () => {})
+      // Preload the family the terminal is actually configured to render. The
+      // previous version hardcoded 'JetBrains Mono' — fine for the default
+      // stack but silently miss for anyone who picked a different Terminal
+      // Font Family (e.g. the bundled OpenDyslexicMono, or a custom Nerd Font):
+      // @font-face fonts fetch lazily on first DOM use, so xterm's canvas
+      // renderer would measure and draw against the generic monospace fallback
+      // until some other var(--mono) surface pulled the resolved family in.
+      // Using `term.options.fontFamily` (already the resolved stack from
+      // resolveTerminalFontFamily — comma-separated with a generic fallback)
+      // makes the load target follow the picker.
+      const configuredFontFamily = term.options.fontFamily ?? 'monospace'
+      fonts.load(`${px}px ${configuredFontFamily}`).then(onReady, () => {})
     } catch { /* invalid spec on some engines — `ready` handler covers it */ }
     return () => { cancelled = true }
   }, [term, doRefit]) // stable — term/doRefit come from the per-session cache

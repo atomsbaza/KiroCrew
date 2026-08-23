@@ -559,6 +559,33 @@ describe('CliPanel theme and font sync', () => {
     await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
   })
 
+  it('still repaints after a frame handle whose callback never fires', async () => {
+    // requestAnimationFrame may return a live handle whose callback never runs.
+    // happy-dom does exactly that -- a truthy `{}` when the window is closed or
+    // a timer-loop limit trips -- and browsers drop queued frames for a page in
+    // the back/forward cache. A scheduler that defers to any pending handle
+    // latches on the first such frame and drops every later theme signal, so the
+    // terminal stops tracking the app theme for the life of the page. Reproduced
+    // deterministically here rather than waiting for the load-dependent version
+    // of it to bite a CI shard.
+    const { term } = mount()
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+
+    // One dead frame, exactly as the environment would hand it over.
+    vi.stubGlobal('requestAnimationFrame', () => ({}) as unknown as number)
+    act(() => { document.documentElement.setAttribute('data-theme', 'probe') })
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+
+    // Frames work again, and a real theme signal arrives.
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 0 })
+    const style = document.createElement('style')
+    style.id = 'mc-custom-theme-probe'
+    style.textContent = ':root { --accent: #ff8800; }'
+    act(() => { document.head.appendChild(style) })
+
+    await waitFor(() => expect(term.options.theme?.cursor).toBe('#ff8800'))
+  })
+
   it('ignores an unrelated style element added to <head>', async () => {
     const { term } = mount()
     // Drain any observer records queued by earlier tests before measuring.
@@ -610,7 +637,16 @@ describe('CliPanel web-font refit', () => {
     setFonts({ ready: Promise.resolve(), load })
     const { term, fit } = mount()
     await act(async () => { await Promise.resolve() })
-    expect(load).toHaveBeenCalledWith(expect.stringContaining('"JetBrains Mono"'))
+    // The pre-loaded family must match the terminal's configured stack — the
+    // previous implementation hardcoded 'JetBrains Mono', which silently
+    // missed any custom Terminal Font Family (Nerd Fonts, OpenDyslexicMono,
+    // etc.), so xterm's canvas renderer measured against the fallback until
+    // some other var(--mono) surface forced the load. Asserting against
+    // `term.options.fontFamily` pins the fix: whatever family the terminal
+    // was configured with is what gets pre-loaded.
+    const configuredFontFamily = term.options.fontFamily
+    expect(configuredFontFamily).toBeTruthy()
+    expect(load).toHaveBeenCalledWith(expect.stringContaining(configuredFontFamily!))
     expect(fit.fit).toHaveBeenCalled()
     expect(term.fontFamilyWrites).toContain('monospace')
   })

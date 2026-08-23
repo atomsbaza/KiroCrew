@@ -7,7 +7,8 @@
  * State management: polling via useQuery refetchInterval.
  * Poll faster during streaming (1s), slower when idle (5s).
  */
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, type ReactNode } from 'react'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { ArrowUp, Loader2 } from 'lucide-react'
 import ChatMessageList from './ChatMessageList'
@@ -46,6 +47,14 @@ export interface ChatEmbedProps {
    * refuse a stale send. Omitted, behaviour is unchanged.
    */
   onSend?: (message: string) => Promise<unknown> | void
+  /**
+   * Content rendered in normal flow directly ABOVE the composer, inside the
+   * embed's own column, so it always sits on top of the input regardless of the
+   * composer's height. A host uses this for a docked quote / reference bar
+   * instead of absolutely positioning one over the transcript with a brittle
+   * fixed offset that breaks whenever the composer's height changes.
+   */
+  aboveComposer?: ReactNode
 }
 
 /** Minimal shape of the chat-slot payload consumed by this embed. */
@@ -55,8 +64,9 @@ interface ChatSlotData {
   title?: string
 }
 
-function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend }: ChatEmbedProps) {
+function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer }: ChatEmbedProps) {
   const api = useAppApi()
+  const ime = useImeGuard()
   const [input, setInput] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
@@ -174,14 +184,22 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
         <div ref={endRef} />
       </div>
 
+      {aboveComposer && <div className="shrink-0">{aboveComposer}</div>}
+
       <div className={`flex items-center gap-2 px-3 py-2 shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-subtle'}`}>
         <input
           type="text"
           aria-label={i18nT('appSdk.chatEmbed.chat_message')}
-          className="flex-1 min-w-0 px-3 py-2 text-sm bg-bg-elevated border border-border rounded-md text-text outline-none focus:border-accent transition-colors"
+          className="flex-1 min-w-0 px-3 py-2 text-sm bg-bg-elevated border border-border rounded-md text-text outline-none focus-visible:border-accent transition-colors"
           value={input}
           onChange={e => setInput(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && input.trim()) { e.preventDefault(); send() } }}
+          {...ime.bindComposition()}
+          onKeyDown={e => {
+            if (e.key !== 'Enter' || e.shiftKey) return
+            // Rule 1: single-line input; the emptiness test stays outside the guard.
+            if (ime.isComposing(e)) return
+            if (input.trim()) { e.preventDefault(); send() }
+          }}
           placeholder={running ? i18nT('appSdk.chatEmbed.agent_is_working') : (placeholder || i18nT('appSdk.chatEmbed.message'))}
           disabled={sendMutation.isPending}
         />

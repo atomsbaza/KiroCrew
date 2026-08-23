@@ -72,9 +72,15 @@ from kiro_crew.apps.manager import (
     update_app,
 )
 from kiro_crew.apps.manifest import Dependencies, PlatformConfig
-from kiro_crew.apps.official_editorial import load_category_order, load_sections
+from kiro_crew.apps.official_category_order import load_category_order
+from kiro_crew.apps.official_editorial import load_sections
 from kiro_crew.apps.registry import (
+    _REGISTRY_TRUST_TIERS,
+    _TRUST_INDEX,
+    _TRUST_OWNER,
     _git_url_host,
+    _pinned_registries,
+    _registry_identity_key,
     get_registry_app_by_repo,
     get_server_platform,
     install_from_registry,
@@ -1520,20 +1526,29 @@ async def handle_registry(request: web.Request) -> web.Response:
     if not apps:
         apps = await list_registry()
     # Published rail order and layout ride along on the response the store already
-    # makes, rather than endpoints the page would have to wait on separately. Off
-    # the event loop: the first call after a cache expiry does network I/O. Both
-    # are presentation, so a failure degrades to the client's own defaults and
-    # must never 500 the store -- the same contract the catalog annotation keeps.
-    try:
-        category_order = await asyncio.to_thread(load_category_order)
-    except Exception:  # noqa: BLE001 - presentation is never worth a failed store
-        logger.warning("ignoring the editorial category order", exc_info=True)
-        category_order = []
-    try:
-        sections = await asyncio.to_thread(load_sections)
-    except Exception:  # noqa: BLE001 - same contract as the order above
-        logger.warning("ignoring the editorial sections", exc_info=True)
-        sections = []
+    # makes, rather than endpoints the page would have to wait on separately. They
+    # are two documents with two caches, loaded CONCURRENTLY: each cold-cache load
+    # does network I/O, and paying two fetch timeouts in series would delay the
+    # whole store response. Both are presentation, so a failure degrades to the
+    # client's own defaults per document and must never 500 the store -- the same
+    # contract the catalog annotation keeps.
+    order_result, sections_result = await asyncio.gather(
+        asyncio.to_thread(load_category_order),
+        asyncio.to_thread(load_sections),
+        return_exceptions=True,
+    )
+    if isinstance(order_result, BaseException):
+        logger.warning(
+            "ignoring the published category order", exc_info=order_result
+        )
+        category_order: list = []
+    else:
+        category_order = order_result
+    if isinstance(sections_result, BaseException):
+        logger.warning("ignoring the editorial sections", exc_info=sections_result)
+        sections: list = []
+    else:
+        sections = sections_result
     return web.json_response(
         {
             "apps": apps,
@@ -1965,8 +1980,13 @@ _SAFE_SCP_URL_RE = re.compile(r"^[A-Za-z0-9._\-]+@[A-Za-z0-9.\-]+:[A-Za-z0-9._/\
 _SAFE_SSH_URL_RE = re.compile(
     r"^ssh://(?:[A-Za-z0-9._\-]+@)?[A-Za-z0-9.\-]+(?::[0-9]+)?/[A-Za-z0-9._/\-]+$"
 )
-_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+# `\Z`, not `$`: Python's `$` also matches immediately BEFORE a trailing newline, so with
+# the `.match` calls in the blob handler a value like "main\n" passes -- and both of these
+# feed git argv and a filesystem join. Same defect class as the catalog-side coordinate
+# patterns; these are the blob handler's instances. (The class is wider than this file:
+# other `$`-anchored request-path patterns exist elsewhere, e.g. papyrus's GIT_URL_RE.)
+_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+\Z")
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\Z")
 _BLOB_ALLOWED_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico"})
 
 
@@ -2186,7 +2206,7 @@ async def handle_blob_proxy(request: web.Request) -> web.Response:
     if not repo or not file_path:
         return web.json_response({"error": "repo and path required"}, status=400)
     if not _is_safe_repo_identifier(repo):
-        return web.json_response({"error": "invalid repo name"}, status=400)
+        return web.json_response({"error": "invalid repo URL or name"}, status=400)
     if not _SAFE_PATH_RE.match(file_path):
         return web.json_response({"error": "invalid path characters"}, status=400)
     if not _SAFE_REF_RE.match(ref):
@@ -2551,16 +2571,30 @@ async def handle_registries(request: web.Request) -> web.Response:
     """GET/PUT /api/apps/registries — manage external federated registries."""
     if request.method == "GET":
         config = KiroCrewConfig.load()
+        # Operator rows report `index` as their tier because that is what is in
+        # FORCE for them: `registry._registry_trust_tier` resolves `owner` only
+        # from build-pinned rows, since `config.json` is agent-writable. Echoing a
+        # hand-edited `owner` back would report a grant the runtime does not honour.
         registries = [
-            {"name": r.name, "repo": r.repo, "branch": r.branch} for r in config.registries
+            {"name": r.name, "repo": r.repo, "branch": r.branch, "trust": _TRUST_INDEX}
+            for r in config.registries
+        ]
+        # Edition-pinned registries are reported SEPARATELY and read-only. They
+        # are not part of ``registries`` because PUT replaces that list verbatim:
+        # a GET→edit→PUT round-trip would persist an edition default into the
+        # operator's config.json, where a later edition change could no longer
+        # move it. The client renders these as non-editable rows.
+        pinned = [
+            {"name": r.name, "repo": r.repo, "branch": r.branch, "trust": r.trust}
+            for r in _pinned_registries()
         ]
         sel().log_api_access(
             caller="dashboard",
             operation="registries.read",
             outcome="success",
-            resources=f"count={len(registries)}",
+            resources=f"count={len(registries)} pinned={len(pinned)}",
         )
-        return web.json_response({"registries": registries})
+        return web.json_response({"registries": registries, "pinned": pinned})
 
     def _deny(msg: str, resources: str = "") -> web.Response:
         sel().log_api_access(
@@ -2584,6 +2618,13 @@ async def handle_registries(request: web.Request) -> web.Response:
     # Validate each entry
     validated: list[dict[str, str]] = []
     _blocked_repos = {"KiroCrew"}
+    # Keyed the same way `_effective_registries` decides a contest — by the cache
+    # file the registry would use, not the raw string. Comparing raw names here
+    # would let `Official` past the guard against a pinned `official`, persist it,
+    # and then have the merge drop BOTH as contested: exactly the inert-registry
+    # outcome this guard exists to prevent, now with the operator's own row lost too.
+    _pinned_names = {_registry_identity_key(r.name or r.repo) for r in _pinned_registries()}
+    _pinned_repos = {r.repo for r in _pinned_registries()}
     for entry in entries:
         if not isinstance(entry, dict):
             return _deny("each registry must be an object")
@@ -2594,10 +2635,14 @@ async def handle_registries(request: web.Request) -> web.Response:
         # vetted full git URL. Reuse the blob-proxy validator, which rejects
         # shell metacharacters / traversal and owner/repo shorthand.
         if not _is_safe_repo_identifier(repo):
-            return _deny(f"invalid repo name: {repo!r}", f"repo={repo}")
+            return _deny(f"invalid repo URL or name: {repo!r}", f"repo={repo}")
         if repo in _blocked_repos:
             return _deny(
                 f"{repo!r} is the core registry — no need to add it", f"blocked_repo={repo}"
+            )
+        if repo in _pinned_repos:
+            return _deny(
+                f"{repo!r} is already provided by this build", f"pinned_repo={repo}"
             )
         # Bare names default the display name to the repo (legacy). Full URLs
         # derive a safe slug from host+path so two URL registries never collide
@@ -2609,7 +2654,32 @@ async def handle_registries(request: web.Request) -> web.Response:
         branch = str(entry.get("branch", "main")).strip() or "main"
         if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_\-./]*$", branch) or ".." in branch:
             return _deny(f"invalid branch name: {branch!r}", f"branch={branch}")
-        validated.append({"name": name, "repo": repo, "branch": branch})
+        # `trust` is accepted only as `index` for an operator row, and that is the
+        # value stored. `registry._registry_trust_tier` resolves `owner` solely
+        # from `default_registries()` — the build — because `config.json` is
+        # agent-writable, so a tier persisted here could never be honoured.
+        # Accepting it would hand back a setting the runtime ignores, and there is
+        # correspondingly no tier to PRESERVE across a replace-all PUT: an omitted
+        # value simply means `index`, which is what an operator row always is.
+        raw_trust = entry.get("trust")
+        trust = _TRUST_INDEX if raw_trust is None else (str(raw_trust).strip() or _TRUST_INDEX)
+        if trust not in _REGISTRY_TRUST_TIERS:
+            return _deny(f"invalid registry trust: {trust!r}", f"trust={trust}")
+        if trust == _TRUST_OWNER:
+            return _deny(
+                "the trusted tier is supplied by this build, not by configuration",
+                f"owner_trust_refused={name}",
+            )
+        # A name an edition-pinned registry already owns is refused rather than
+        # persisted: `_effective_registries` drops a same-named operator row, so
+        # storing it would leave a registry in config.json that never loads and
+        # whose per-row refresh 404s, with nothing telling the operator why.
+        if _registry_identity_key(name) in _pinned_names:
+            return _deny(
+                f"{name!r} is the name of a registry this build provides — choose another",
+                f"pinned_name_collision={name}",
+            )
+        validated.append({"name": name, "repo": repo, "branch": branch, "trust": trust})
 
     # Update config file (atomic write to prevent corruption on crash)
     cfg = Path(config_path())

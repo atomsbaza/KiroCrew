@@ -23,11 +23,12 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
-from kiro_crew.executors import maintenance_executor
+from kiro_crew.executors import image_executor, maintenance_executor
 from kiro_crew.mcp_caller import (
     CALLER_CAPABILITY_KEY,
     CALLER_META_KEY,
@@ -42,6 +43,17 @@ from kiro_crew.mcp_gateway.apps import (
     extract_ui_resource_uri,
     strip_model_hidden_tools,
     write_spool,
+)
+from kiro_crew.mcp_gateway.backend_tmp import (
+    allocate_backend_tmp,
+    record_owner,
+    sweep_backend_tmp,
+    tmp_env,
+)
+from kiro_crew.mcp_gateway.image_budget import (
+    line_may_carry_image_block,
+    parse_image_bearing_frame,
+    rewrite_image_frame,
 )
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, RESPONSE_SPILL_THRESHOLD_BYTES
 from kiro_crew.mcp_gateway.spill import maybe_spill_response
@@ -480,6 +492,14 @@ class Backend:
     # freshly spawned backend so stub traffic only resumes when the new
     # backend is handshake-complete.
     _init_done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Bounds the FIRST upstream handshake. A backend that is alive but never
+    # answers ``initialize`` leaves ``_init_state`` at "in_flight" forever:
+    # every queued stub waits on a reply that never comes, and because the
+    # process has not died no death-driven recovery (breaker, zombie sweep)
+    # observes it. The timer turns that silence into the terminal "failed"
+    # state and reaps the process group. Respawn priming carries its own
+    # bounded wait, so only the lazy first handshake arms this.
+    _init_deadline_task: Optional[asyncio.Task[None]] = None
     _dead_reason: Optional[str] = None
     # Idempotency guard for _broadcast_backend_gone (see there): the terminal
     # "backend gone" broadcast is reachable near-simultaneously from several
@@ -817,6 +837,64 @@ class Backend:
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._dead_reason = f"stdin closed: {exc}"
             raise BackendGone(self._dead_reason) from exc
+        # Armed only once the forward is on the wire: a write that failed never
+        # started a handshake, and arming there would leave a timer with no
+        # in-flight window to close.
+        self._arm_init_deadline()
+
+    def _arm_init_deadline(self) -> None:
+        """Start the timer that fails and reaps a backend which never answers
+        the first ``initialize``.
+
+        Idempotent per in-flight window: an already-armed timer is left alone
+        so queued stubs cannot each extend the deadline.
+        """
+        if self._init_deadline_task is not None and not self._init_deadline_task.done():
+            return
+        self._init_deadline_task = asyncio.create_task(
+            self._init_deadline(_DEFAULT_INITIALIZE_TIMEOUT_SECS)
+        )
+
+    def _cancel_init_deadline(self) -> None:
+        """Disarm the first-handshake timer once init reaches a terminal state.
+
+        Safe from inside the timer's own coroutine: cancelling the currently
+        running task is skipped, so a terminal transition driven BY the
+        deadline does not cancel itself mid-flight.
+        """
+        task = self._init_deadline_task
+        if task is None:
+            return
+        self._init_deadline_task = None
+        if task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+
+    async def _init_deadline(self, timeout: float) -> None:
+        """Fail and reap a backend whose first ``initialize`` never resolves.
+
+        ``_fail_init`` performs the terminal transition every waiter observes
+        (failed state, done event, an explicit JSON-RPC error to each queued
+        stub); ``shutdown`` then reaps the process group, since a wedged
+        backend that is still running would otherwise hold its core until the
+        idle sweep reclaims it. shutdown() touches no pool bookkeeping, so
+        there is no reserve/evict race with a concurrent acquirer.
+        """
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+        # The handshake may have resolved while this coroutine was scheduled;
+        # only a still-in-flight window is this timer's to close.
+        if self._init_state != "in_flight":
+            return
+        reason = f"initialize did not complete within {timeout:g}s"
+        self._dead_reason = self._dead_reason or reason
+        with contextlib.suppress(Exception):
+            await self._fail_init(reason)
+        with contextlib.suppress(Exception):
+            await self.shutdown()
 
     async def _deliver_cached_initialize(
         self,
@@ -841,7 +919,7 @@ class Backend:
         self,
         init_msg: dict[str, Any],
         *,
-        timeout: float = 15.0,
+        timeout: float = _DEFAULT_INITIALIZE_TIMEOUT_SECS,
     ) -> None:
         """Re-drive the MCP ``initialize`` handshake on a freshly respawned
         backend using a stub's captured ``initialize`` request, WITHOUT
@@ -929,6 +1007,10 @@ class Backend:
         if self._gone_broadcast:
             return
         self._gone_broadcast = True
+        # The backend is terminal from here, so the first-handshake timer has
+        # nothing left to close. Disarming is a no-op when the deadline itself
+        # drove this broadcast.
+        self._cancel_init_deadline()
         # Fast-fail any in-flight prime_initialize() waiter. If the backend
         # dies mid-handshake (stdout EOF before it answered initialize),
         # neither _on_upstream_initialize nor _fail_init fires, so a
@@ -1010,8 +1092,8 @@ class Backend:
                     # (``exc.consumed``) and retry. The previous ``read(8192)``
                     # drain discarded post-newline bytes of the next response,
                     # hanging the next request. The reader ``limit`` is
-                    # ``READ_BUFFER_LIMIT_BYTES`` (1 MiB); a longer line is
-                    # pathological and dropped.
+                    # ``READ_BUFFER_LIMIT_BYTES`` (64 MiB by default, and
+                    # operator-tunable); a longer line is pathological and dropped.
                     # Keep only the first _OVERSIZE_KEEP bytes — enough for
                     # _fail_oversize_request to parse the JSON-RPC id — while
                     # still draining the whole line off the pipe. Accumulating
@@ -1043,6 +1125,48 @@ class Backend:
                     continue
                 if not line:
                     break
+                # Enforce the inline-image budget on tool results BEFORE the
+                # spill step: a downscaled image both shrinks what spill writes
+                # to disk and, more importantly, keeps an oversized image block
+                # out of kiro-cli's conversation history, where it would be
+                # replayed to the model on every later turn and wedge the
+                # session (see kiro_crew.imaging MAX_IMAGE_EDGE_PX). Two
+                # stages on two pools: the byte probe admits every frame that
+                # COULD carry an image block (its negative is provable, but
+                # any escaped non-ASCII text also matches), so a cheap
+                # parse-confirm runs on the maintenance pool first -- like the
+                # spill rewrite -- and only genuinely image-bearing frames
+                # reach the image pool, where seconds-long Pillow decodes
+                # from one server would otherwise head-of-line block every
+                # other server's text-only results behind the probe's false
+                # positives.
+                if line_may_carry_image_block(line):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        image_msg = await loop.run_in_executor(
+                            maintenance_executor(),
+                            parse_image_bearing_frame,
+                            line,
+                        )
+                        if image_msg is not None:
+                            line = await loop.run_in_executor(
+                                image_executor(),
+                                rewrite_image_frame,
+                                image_msg,
+                                line,
+                                self.pool_key.server_name,
+                            )
+                    except Exception:
+                        # The rewrite never RAN (executor shutdown/saturation);
+                        # per-block fail-closed lives inside the hook. Routing
+                        # the raw line keeps co-pooled tenants alive, but the
+                        # frame may carry an unverified image -- log loudly
+                        # enough to diagnose a wedge that follows.
+                        logger.warning(
+                            "image-budget rewrite could not run for %s; routing raw line",
+                            self.pool_key.server_name,
+                            exc_info=True,
+                        )
                 # Spill oversized (but under the read limit) responses to a
                 # sidecar file and truncate inline, so a large-but-legitimate
                 # tool result doesn't balloon the shared daemon's memory or the
@@ -1259,6 +1383,7 @@ class Backend:
         self._init_state = "failed"
         self._dead_reason = self._dead_reason or f"init failed: {reason}"
         self._init_done_event.set()
+        self._cancel_init_deadline()
         logger.error("backend pid=%s %s", self.pid, self._dead_reason)
         pending = list(self._init_pending)
         self._init_pending.clear()
@@ -1302,6 +1427,7 @@ class Backend:
         self._init_result = result
         self._init_state = "ready"
         self._init_done_event.set()
+        self._cancel_init_deadline()
         capabilities = result.get("capabilities") or {}
         experimental = capabilities.get("experimental") or {}
         self.supports_caller_identity = isinstance(experimental, dict) and (
@@ -1888,6 +2014,10 @@ class Backend:
         keeps running and leaks its stderr pipe fd whenever the
         process outlives SIGKILL — across LRU-eviction churn this exhausts fds.
         """
+        # Disarmed rather than awaited: teardown is reachable from inside the
+        # deadline's own coroutine (it calls shutdown), and awaiting the
+        # current task would deadlock. _cancel_init_deadline skips that case.
+        self._cancel_init_deadline()
         for attr in ("_stdout_task", "_stderr_task"):
             task = getattr(self, attr)
             if task is not None:
@@ -2060,6 +2190,11 @@ class Backend:
             await self._cancel_background_tasks()
             if self._dead_reason is None:
                 self._dead_reason = f"shutdown rc={self.process.returncode}"
+        # Deliberately NO temp sweep here: the launcher's exit is not proof
+        # its process TREE is gone (a wrapper launcher exits while its server
+        # child lives on and keeps using the dir). The single deletion
+        # authority is backend_tmp.sweep_all_backend_tmp, which requires the
+        # recorded owner to be dead AND the directory to be idle.
 
 
 # --- Spawn / handshake ------------------------------------------------------
@@ -2071,8 +2206,15 @@ async def spawn_backend(
     args: list[str],
     env: Mapping[str, str],
     work_dir: str,
+    declared_temp_keys: tuple[str, ...] = (),
 ) -> Backend:
     """Spawn a real MCP subprocess and wrap it in a :class:`Backend`.
+
+    ``declared_temp_keys`` are the temp-key names (``TMPDIR``/``TMP``/``TEMP``,
+    any casing) the operator's agent spec DECLARES for this server -- the
+    caller knows the declared-env set and this function does not (``env``
+    also carries the daemon's ambient values, which must not suppress
+    containment; see the containment block below).
 
     ``env`` is passed verbatim — callers MUST NOT rely on parent process
     env inheritance. The rewriter layer computes the effective env for
@@ -2112,17 +2254,72 @@ async def spawn_backend(
     # identity (unlike a per-session value, which would be a correctness bug).
     spawn_env = dict(env)
     spawn_env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
-    process = await asyncio.create_subprocess_exec(
-        command,
-        *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=work_dir,
-        env=spawn_env,
-        start_new_session=True,
-        limit=READ_BUFFER_LIMIT_BYTES,
-    )
+    # Per-process temp containment (#5064). Safe re: the pooled-backend
+    # PoolKey invariant for the same reason as the marker above -- the value
+    # is derived from the key's own digest plus a token generated AFTER
+    # pool-identity resolution and is never folded into the hash, so it can
+    # neither split nor collapse pool identity. Allocated off-loop (mkdir is
+    # filesystem work), and fail-open: containment is hygiene, not a spawn
+    # prerequisite -- a host where the dir cannot be created still gets a
+    # working backend with today's inherited-temp behavior.
+    #
+    # An OPERATOR-DECLARED temp wins: a spec that sets any of TMPDIR/TMP/TEMP
+    # deliberately points a heavy server at chosen storage (e.g. a capacity
+    # volume), and overriding it would trade litter for ENOSPC. No allocation
+    # happens at all in that case -- no empty dir, nothing to sweep.
+    #
+    # Declaration is signalled by the CALLER (``declared_temp_keys``), not
+    # read off ``spawn_env``: the resolver folds the daemon's own inherited
+    # environment into ``env``, and macOS always exports TMPDIR (Windows
+    # always exports TMP/TEMP), so an env-membership test would read the
+    # ambient value as a declaration and silently disable containment on
+    # those platforms. Ambient keys are OVERRIDDEN by the managed triple on
+    # success, left untouched on allocation failure (the documented fail-open
+    # "inherited temp" fallback), and PRUNED down to the declared set when
+    # the operator declared a temp (see the else branch).
+    backend_tmp: Optional[Path] = None
+    _declared_upper = {key.upper() for key in declared_temp_keys}
+    if not _declared_upper:
+        try:
+            backend_tmp = await asyncio.to_thread(
+                allocate_backend_tmp, pool_key.stable_hash()
+            )
+            spawn_env.update(tmp_env(backend_tmp))
+        except OSError:
+            logger.warning(
+                "backend-tmp: could not allocate a contained temp dir; spawning "
+                "with inherited temp",
+                exc_info=True,
+            )
+    else:
+        # Yielding is not enough on its own: the daemon's AMBIENT temp keys
+        # are still in ``spawn_env``, and ``tempfile`` consults TMPDIR before
+        # TMP -- a spec declaring only ``TMP`` on macOS would silently write
+        # through the inherited ambient TMPDIR. Strip the canonical keys the
+        # operator did NOT declare so the declared one actually governs.
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            if key not in _declared_upper:
+                spawn_env.pop(key, None)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            command,
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=work_dir,
+            env=spawn_env,
+            start_new_session=True,
+            limit=READ_BUFFER_LIMIT_BYTES,
+        )
+    except BaseException:
+        # The spawn itself failed: reclaim the just-allocated dir here and
+        # now. Unowned directories are deliberately never deleted by the
+        # sweeps (an owner record can fail on a live backend), so this is
+        # the ONLY reclamation point for a dir whose process never existed.
+        if backend_tmp is not None:
+            await asyncio.to_thread(sweep_backend_tmp, backend_tmp)
+        raise
     if process.stdin is None or process.stdout is None:
         # asyncio.create_subprocess_exec populates these whenever PIPE was
         # requested; the guard exists for type checkers. Kill the child on
@@ -2154,6 +2351,12 @@ async def spawn_backend(
     )
     backend._last_ping_response_mono = now  # cold-start: not insta-stale
     backend._stderr_task = stderr_task
+    if backend_tmp is not None:
+        # Liveness anchor for the daemon-boot sweep: a SIGKILL'd daemon can
+        # leave this backend running (start_new_session), and the next boot
+        # must not delete temp storage under a survivor. Off-loop, fail-open
+        # (an unowned dir falls under the sweep's grace-window rule instead).
+        await asyncio.to_thread(record_owner, backend_tmp, process.pid)
     return backend
 
 

@@ -14,6 +14,7 @@ exceptions) keeps working for existing callers and tests.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -26,11 +27,15 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from kiro_crew import platform_compat
+from kiro_crew import agent_scratch, platform_compat
 from kiro_crew.acp._dispatch import (
+    attach_kas_custom_agents,
     build_session_new_params,
     parse_session_modes,
     redact_text,
+)
+from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
+from kiro_crew.acp._dispatch import (
     set_mode_params,
 )
 from kiro_crew.acp.client import (
@@ -40,6 +45,7 @@ from kiro_crew.acp.client import (
     _get_start_time,
     _KiroExecutableTrustError,
     _resolve_kiro_bin_for_spawn,
+    finish_suspended_spawn,
 )
 from kiro_crew.acp.kas_agents import (
     KasAgentTranslationError,
@@ -48,6 +54,8 @@ from kiro_crew.acp.kas_agents import (
 from kiro_crew.acp.kas_assets import (
     KasAssetsMissing,
     build_kas_argv,
+    build_kas_cli_argv,
+    kas_override_active,
     resolve_kas_entry,
 )
 from kiro_crew.acp.kas_auth import (
@@ -55,6 +63,7 @@ from kiro_crew.acp.kas_auth import (
     resolve_kas_access_token,
 )
 from kiro_crew.acp.session_handle import (
+    AcpRequestTimeout,
     AcpRuntimeDead,
     AcpRuntimeError,
     AcpRuntimeProtocol,
@@ -65,6 +74,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_CLIENT_CAPABILITIES,
     KAS_AUTH_CALLBACK_ERROR_CODE,
     KAS_CLIENT_CAPABILITIES,
@@ -89,6 +99,12 @@ from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
+from kiro_crew.metrics.events import (
+    CHILD_PERMISSION_DENIED,
+    CHILD_PERMISSION_ROUTED,
+    DROPPED_FRAMES,
+    emit_counter,
+)
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
@@ -97,6 +113,7 @@ from kiro_crew.sandbox import (
     scrub_agent_denied_env,
     wrap_argv,
 )
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid import (
     _track_pid,
     _track_session_pid,
@@ -113,6 +130,7 @@ __all__ = [
     "AcpRuntime",
     "AcpRuntimeError",
     "AcpRuntimeDead",
+    "AcpRequestTimeout",
     "AcpRuntimeProtocol",
     "AcpSessionHandle",
 ]
@@ -128,6 +146,10 @@ _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
 # _send_and_await timeout — naming what was in flight at the drop makes that
 # timeout attributable instead of a mystery. Capped so the line stays bounded.
 _DROP_IDS_IN_LOG = 8
+# JSON-RPC 2.0 "Method not found" — the reader loop answers an ownerless
+# server→client request with this itself (see _answer_ownerless_request);
+# mirrors the private constant AcpClient keeps for its own dispatch sites.
+_JSONRPC_METHOD_NOT_FOUND = -32601
 _INIT_TIMEOUT = 30.0
 _REQUEST_TIMEOUT = 30.0
 # Session start (session/new, session/load) gets its own budget because kiro-cli
@@ -144,6 +166,60 @@ _REQUEST_TIMEOUT = 30.0
 # raises it for agents whose MCP fleet legitimately needs longer (see
 # _resolve_session_start_timeout below).
 _SESSION_NEW_TIMEOUT = 90.0
+
+# Caps for the MCP progress line attached to a session-start timeout: a
+# 70-server agent must not turn one error into a multi-kilobyte string, and
+# neither a server's own error text nor its NAME is trusted for length. Both are
+# config-derived, and an installed app supplies its own server names.
+_MCP_PROGRESS_NAME_CAP = 8
+_MCP_PROGRESS_ERROR_CAP = 120
+_MCP_PROGRESS_NAME_LEN_CAP = 64
+
+
+def _strip_unprintable(text: str) -> str:
+    """Drop the control characters a whitespace collapse cannot reach.
+
+    ``str.split`` removes whitespace controls (newline, tab, CR), but ESC and
+    the other non-whitespace controls survive it, and a terminal rendering the
+    gateway log interprets them -- an MCP server's failure text could forge or
+    recolor terminal output. Spaces are printable, so a collapsed string keeps
+    its word separation.
+    """
+    return "".join(ch for ch in text if ch.isprintable())
+
+
+def _sanitize_progress_name(name: str) -> str:
+    """Make one MCP server name safe to put in a log line and an exception.
+
+    A name is config-derived, so an installed app chooses it. Four hazards, all
+    closed here rather than at each use: an embedded newline would forge a line
+    in the gateway log, a non-whitespace control (ESC) would inject terminal
+    escapes into it, an unbounded name would defeat the count cap that keeps
+    one error from becoming a wall of text, and a name carrying
+    credential-shaped text would leak it into a sink the error message reaches.
+    Whitespace collapse and the control strip run AFTER redaction so a
+    redaction marker cannot reintroduce a break.
+    """
+    scrubbed, _ = redact_exfiltration_urls(name)
+    scrubbed, _ = redact_credentials(scrubbed)
+    return _strip_unprintable(" ".join(scrubbed.split()))[
+        :_MCP_PROGRESS_NAME_LEN_CAP
+    ]
+
+
+def _capped_names(names: list[str]) -> str:
+    """Join names for an error line, truncating the tail to a countable summary.
+
+    A pure formatter: names arrive already sanitized from the two points that
+    admit them, so a composite like ``name (error)`` keeps its own error cap
+    instead of being re-truncated to a name's length.
+    """
+    head = names[:_MCP_PROGRESS_NAME_CAP]
+    rest = len(names) - len(head)
+    joined = ", ".join(head)
+    return f"{joined} (+{rest} more)" if rest > 0 else joined
+
+
 _INIT_NOTIFICATION_BUFFER_LIMIT = 100
 # Teardown must be snappy: a session is usually terminated on a hot path
 # (background task done, subagent reaped). kiro-cli's terminate handler responds
@@ -240,34 +316,6 @@ _DROP_NO_SESSION = "-"
 # string: an absent `method`, or a value of the wrong JSON type (see
 # _drop_key_part).
 _DROP_KEY_PLACEHOLDER = "?"
-
-
-def _reject_option_id(params: dict) -> str | None:
-    """The least-destructive reject optionId a permission request advertises.
-
-    Used when auto-answering a ``session/request_permission`` for a session
-    this client never registered (a backend-internal subagent). Prefer the
-    request's own ``reject_once``-kind option; fall back to a legacy id that
-    names reject. ``None`` means the caller must answer with the ``cancelled``
-    outcome instead — kiro-cli maps that to cancelling the child's turn, which
-    is strictly worse than a per-tool reject, so this is the last resort.
-    """
-    raw = params.get("options")
-    if not isinstance(raw, list):
-        return None
-    options = [o for o in raw if isinstance(o, dict)]
-    for want_kind in ("reject_once", "reject_always"):
-        for opt in options:
-            opt_id = opt.get("optionId") or opt.get("id")
-            if opt.get("kind") == want_kind and isinstance(opt_id, str) and opt_id:
-                return opt_id
-    # Legacy kiro payloads omit `kind` — match well-known reject ids only, so
-    # an allow option can never be picked by accident.
-    for opt in options:
-        opt_id = opt.get("optionId") or opt.get("id")
-        if isinstance(opt_id, str) and opt_id in ("reject_once", "reject_always", "reject"):
-            return opt_id
-    return None
 
 
 KIRO_CLI_BIN = "kiro-cli"
@@ -607,6 +655,10 @@ class AcpRuntime:
             str(mcp_gateway_settings_mcp_json) if mcp_gateway_settings_mcp_json else None
         )
         self._mcp_gateway_socket = str(mcp_gateway_socket) if mcp_gateway_socket else None
+        # First KAS auth callback per runtime is logged at INFO as a positive
+        # "KAS is actively serving this runtime" signal; later ones drop to
+        # DEBUG so a long-lived runtime does not spam the log on every refresh.
+        self._kas_auth_logged = False
         # Whether sessions on this runtime should hold drain_init() open for
         # slow MCP servers (the no-report ceiling). A runtime whose agent is
         # KNOWN to have zero MCP servers — the kirocrew-lite background runtime,
@@ -680,6 +732,25 @@ class AcpRuntime:
         # In-flight SEL audit tasks for auto-rejected permission requests;
         # held only to keep them alive (see _answer_unroutable_permission).
         self._audit_tasks: set[asyncio.Task] = set()
+        # In-flight ANSWER tasks (the coroutines that write the rejection
+        # response), tracked separately from the SEL audit tasks above: the
+        # flood cap below must count only tasks that can block on stdin
+        # drain() — audit tasks are short-lived thread offloads, and letting
+        # them satisfy the cap would let a burst of ordinary audits trip a
+        # false mark_dead that kills every multiplexed session.
+        self._answer_tasks: set[asyncio.Task] = set()
+        # Volume bound for in-flight auto-answer tasks. Each task can block
+        # on stdin drain() against a backend that floods permission frames
+        # while never reading its stdin — unbounded, that grows the task set
+        # until the gateway OOMs. Awaiting inline on the reader instead
+        # would hand the same hostile backend a demux freeze for every
+        # session, so the bound treats overflow as a dead pipe (see
+        # _spawn_answer_task).
+        self._max_answer_tasks: int = 128
+        # Bounded discrimination wait at the cap (see _spawn_answer_task):
+        # small enough that a wedged pipe is condemned promptly, large enough
+        # that a responsive backend's in-flight answers can complete.
+        self._answer_cap_wait_secs: float = 5.0
         # Backend-internal subagent session ids, snapshotted from each
         # `_kiro.dev/subagent/list_update` frame (a FULL list every time, so
         # replacement — not accumulation — keeps it bounded and current).
@@ -691,6 +762,14 @@ class AcpRuntime:
         # Both are cleared when the owning session unregisters.
         self._subagent_sessions: set[str] = set()
         self._subagent_owner: str | None = None
+        # Sessions with an ACTIVELY CONSUMING prompt dispatch loop, marked by
+        # AcpSessionHandle.prompt() around its dispatch (all exit paths,
+        # including timeout/cancel/synthetic completion, unmark in a finally).
+        # _routed_requests is NOT usable for this: it also holds set_mode /
+        # steer / config request ids, and a timed-out prompt leaves its entry
+        # until the backend response arrives — either would make routing
+        # believe a consumer exists and park a child request unread.
+        self._turn_active_sessions: set[str] = set()
         self._dropped_frames_flushed_at: float = 0.0
 
     @property
@@ -707,6 +786,18 @@ class AcpRuntime:
         provider.
         """
         return self._acp_backend
+
+    @property
+    def uses_kiro_identity_store(self) -> bool:
+        """True when this runtime's process signs in from kiro-cli's own store.
+
+        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
+        H5/H14). ``AcpRuntime`` is not an ``LLMProvider``, but the identity-change
+        sweep reaches shared runtimes as well as session providers, so it
+        declares the same capability under the same name -- letting that sweep
+        ask both families one question instead of probing private attributes.
+        """
+        return self._acp_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
 
     @property
     def supports_image_prompt(self) -> bool:
@@ -780,6 +871,24 @@ class AcpRuntime:
         """
         return bool(self._session_queues)
 
+    def has_active_or_initializing_sessions(self) -> bool:
+        """True if any session is registered OR still being created.
+
+        ``has_active_sessions`` sees only REGISTERED queues, and
+        ``create_session`` registers outside the runtime lock -- so a co-tenant
+        whose ``session/new`` is in flight is momentarily invisible to it. Callers
+        that recycle a stale runtime tolerate that window deliberately (their
+        ``create_session`` raises ``AcpRuntimeDead`` and a respawn loop backstops
+        it, costing one extra respawn).
+
+        A caller with NO such backstop must not: killing the runtime under an
+        initializing task session surfaces as ``AcpRuntimeDead`` on work the user
+        never connected to whatever prompted the kill. Those callers ask this
+        instead, which also counts ``_session_inits_in_flight``.
+        """
+
+        return bool(self._session_queues) or self._session_inits_in_flight > 0
+
     # ── Lifecycle ──
 
     def _discard_sandbox_cleanup(self) -> None:
@@ -821,10 +930,19 @@ class AcpRuntime:
         only kiro-cli needs its agent file materialized first.
         """
         if self._acp_backend == ACP_BACKEND_KAS:
-            node, script = await asyncio.to_thread(resolve_kas_entry)
-            # No --agent: KAS takes custom agents over the wire in session/new
-            # (_meta.kiro.customAgents), not from a CLI flag.
-            return build_kas_argv(node, script)
+            if kas_override_active():
+                # Escape hatch (airgap/debug): launch the operator's pinned
+                # local build directly. No --agent: KAS takes custom agents
+                # over the wire in session/new (_meta.kiro.customAgents).
+                node, script = await asyncio.to_thread(resolve_kas_entry)
+                return build_kas_argv(node, script)
+            # Default: front KAS with kiro-cli's own ACP surface. kiro-cli
+            # extracts the bundle on demand and supervises the Node process;
+            # the auth callback is still forwarded to this client (kas_auth).
+            kas_kiro_bin = await _resolve_kiro_bin_for_spawn()
+            if not kas_kiro_bin:
+                raise AcpRuntimeError(f"{KIRO_CLI_BIN} not found in PATH")
+            return build_kas_cli_argv(kas_kiro_bin)
 
         kiro_bin = await _resolve_kiro_bin_for_spawn()
         if not kiro_bin:
@@ -884,7 +1002,13 @@ class AcpRuntime:
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
-            is_kiro_cli=self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX,
+            # Positive grants only (harness-parity H7): membership grants the
+            # kiro backend directly; every other backend defers to wrap_argv's
+            # own argv-basename detection (None), which is a positive Kiro test
+            # that follows the spawned BINARY — the cli-fronted KAS shape
+            # launches kiro-cli itself (internal sandbox, cannot nest inside
+            # Crew's seatbelt), while the direct Node shape keeps the seatbelt.
+            is_kiro_cli=(True if self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX else None),
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
@@ -939,6 +1063,24 @@ class AcpRuntime:
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
+        # Per-process scratch containment (#5063): the agent's temp AND its
+        # prompt-guided work products land in an owned directory instead of
+        # the shared system temp dir. Allocated off-loop (mkdir + config read)
+        # through the sandbox guard like the env resolution above, and
+        # fail-open -- scratch is hygiene, not a spawn prerequisite. The
+        # owner pid is recorded after spawn; reclamation is liveness-keyed
+        # (agent_scratch.sweep_dead_scratch), never age-keyed.
+        self._scratch_dir = None
+        try:
+            self._scratch_dir = await self._to_thread_guarding_sandbox(
+                agent_scratch.allocate_scratch, "runtime"
+            )
+            env.update(agent_scratch.scratch_env(self._scratch_dir))
+        except OSError:
+            logger.warning(
+                "agent-scratch: could not allocate; spawning with inherited temp",
+                exc_info=True,
+            )
         # Memory-aware cap for pytest-xdist's ``-n auto`` (subagent spawn path —
         # mirrors acp/client.py): xdist sizes auto to the CPU count, ignoring
         # memory; PYTEST_XDIST_AUTO_NUM_WORKERS bounds ONLY auto resolution.
@@ -966,15 +1108,42 @@ class AcpRuntime:
             creationflags=(
                 platform_compat.CREATE_NEW_PROCESS_GROUP
                 | platform_compat._SUBPROCESS_NO_WINDOW
+                | platform_compat.CREATE_SUSPENDED
             ),
             env=env,
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
         self._pid = self._process.pid
+        # Windows resource ceiling, applied while the child is still SUSPENDED,
+        # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). This shared
+        # runtime multiplexes many session handles, so an unbounded fork/memory
+        # blowup here takes down every session on it, not just one. Offloaded for
+        # the same reason as in `AcpClient._spawn`: the Windows path reads config
+        # and walks the process and thread tables, and this runtime's event loop
+        # is serving every other session while it spawns.
+        await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            functools.partial(
+                finish_suspended_spawn, self._process, self._pid, label=f"{KIRO_CLI_BIN} acp"
+            ),
+        )
         self._start_time = _get_start_time(self._pid)
         self._spawn_monotonic = time.monotonic()
         self._last_activity = time.monotonic()
-        logger.info("AcpRuntime spawned kiro-cli acp (PID %d)", self._pid)
+        if self._scratch_dir is not None:
+            # Liveness anchor for the scratch sweeps: a dir whose recorded
+            # owner is dead is reclaimable. Off-loop (file write), fail-open
+            # (an unowned dir falls under the grace-window rule instead).
+            await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(),
+                functools.partial(agent_scratch.record_owner, self._scratch_dir, self._pid),
+            )
+        logger.info(
+            "AcpRuntime spawned backend=%s agent=%s (PID %d)",
+            self._acp_backend,
+            self._agent or "<none>",
+            self._pid,
+        )
 
         # Track the PID for orphan cleanup (mirrors AcpClient._spawn). Without
         # this, a kiro-cli process leaked by a gateway crash/restart is never
@@ -1044,6 +1213,8 @@ class AcpRuntime:
             logger.info("AcpRuntime initialized (PID %d)", self._pid)
         except BaseException:
             try:
+                # This death IS abnormal (failed spawn/handshake): kill()'s
+                # expected=False default keeps its log at WARNING.
                 await self.kill()
             except Exception:
                 logger.debug(
@@ -1056,13 +1227,23 @@ class AcpRuntime:
     _KILL_TERM_TIMEOUT = 5.0
     _KILL_REAP_TIMEOUT = 2.0
 
-    async def kill(self) -> None:
-        """Kill the subprocess and clean up all state."""
+    async def kill(self, *, expected: bool = False) -> None:
+        """Kill the subprocess and clean up all state.
+
+        ``expected`` changes log severity only: a deliberate teardown of a
+        healthy runtime (pool TTL recycle, session shutdown, logout) passes
+        ``expected=True`` to log the death at INFO. The default is False —
+        matching ``_mark_dead`` — so every cleanup kill on a failure path
+        (``initialize()``'s failed-spawn cleanup, a failed session setup) and
+        any future call site stays a WARNING without having to opt in.
+        ``_mark_dead`` additionally refuses to downgrade when the process
+        already exited on its own, so a reap-after-death can never log INFO.
+        """
         # Fail pending futures + poison session queues FIRST. _mark_dead sets
         # self._dead internally; doing it up front (before teardown) ensures any
         # waiters learn the runtime died. Calling it after setting _dead=True
         # would hit its early-return guard and skip all cleanup.
-        self._mark_dead("killed")
+        self._mark_dead("killed", expected=expected)
 
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
@@ -1170,7 +1351,85 @@ class AcpRuntime:
             next(iter(self._session_queues)) if len(self._session_queues) == 1 else None
         )
 
-    async def _answer_unroutable_permission(self, msg: JsonRpcMessage, session_id: str) -> None:
+    async def _spawn_answer_task(
+        self,
+        msg: JsonRpcMessage,
+        session_id: str,
+        *,
+        reason: str = "unregistered_session_auto_reject",
+    ) -> None:
+        """Spawn a bounded off-loop auto-answer for an unroutable permission request.
+
+        Off-loop because the answer's ``send_response`` can block on stdin
+        ``drain()`` against a backend that is not reading — awaiting inline
+        would freeze the shared reader (every session's demux) on one hostile
+        or wedged backend. Bounded because each blocked task is retained in
+        ``_audit_tasks``: a backend that floods permission frames while never
+        reading stdin would otherwise grow that set until the gateway OOMs.
+        Past the cap the frame takes the counted-drop path instead — the
+        flooding backend hangs on its own unanswered request; well-behaved
+        backends (a handful of concurrent in-flight answers at most) never
+        come near the cap.
+        """
+        if self._dead:
+            # Already dead (this cap fired, or any other death path): the
+            # teardown has resolved/poisoned every wait, and no answer can be
+            # written to a dead pipe. Without this gate the still-draining
+            # reader would re-take the cap branch for every remaining flood
+            # frame and enqueue one audit task each — the same unbounded
+            # growth the cap exists to stop, rebuilt out of audits.
+            return
+        if len(self._answer_tasks) >= self._max_answer_tasks:
+            # At the cap, DISCRIMINATE before condemning: a burst of frames
+            # already buffered lets readline() return without suspending, so
+            # a RESPONSIVE backend can hit this branch before its (fast)
+            # answers had any loop time to complete. Give the in-flight set
+            # a bounded chance to make progress — if even one answer
+            # completes, the pipe is alive and this request proceeds; only
+            # when nothing completes (writes genuinely wedged on drain())
+            # is the runtime condemned.
+            done, _pending = await asyncio.wait(
+                set(self._answer_tasks),
+                timeout=self._answer_cap_wait_secs,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                # 128 blocked writes and none completed in 5s = the backend
+                # is provably not reading its stdin. Not a shed-and-forget:
+                # SEL-audit the denial (every permission decision leaves a
+                # record) and mark the runtime dead — teardown resolves
+                # every pending oneshot, so the requester does NOT hang, and
+                # the task set stops growing. Counts ONLY answer tasks
+                # (never SEL audits) so audit bursts cannot trip this.
+                logger.error(
+                    "answer-task cap (%d) reached at permission request id=%s "
+                    "for session %s and no in-flight answer completed in 5s — "
+                    "backend is flooding frames while not reading stdin; "
+                    "marking runtime dead so every pending wait resolves",
+                    self._max_answer_tasks,
+                    msg.id,
+                    session_id,
+                )
+                self._audit_denied_off_loop(
+                    msg, session_id, "answer_task_cap_runtime_dead"
+                )
+                self._mark_dead(
+                    "permission-answer task cap reached (backend not reading)"
+                )
+                return
+        _t = asyncio.ensure_future(
+            self._answer_unroutable_permission(msg, session_id, reason=reason)
+        )
+        self._answer_tasks.add(_t)
+        _t.add_done_callback(self._answer_tasks.discard)
+
+    async def _answer_unroutable_permission(
+        self,
+        msg: JsonRpcMessage,
+        session_id: str,
+        *,
+        reason: str = "unregistered_session_auto_reject",
+    ) -> None:
         """Answer a permission REQUEST for a session with no registered queue.
 
         The ACP contract for a server→client request is that the client always
@@ -1194,44 +1453,123 @@ class AcpRuntime:
         # command line — redact BEFORE truncating (truncation first could clip
         # a secret mid-token so the redaction patterns no longer match, leaking
         # a credential prefix into the logs).
-        title = redact_text(str(raw_title))[:120] if raw_title else "<unknown>"
+        # Bound the redaction input (backend-controlled) BEFORE the regex
+        # passes, generously above the display cap so a clipped secret
+        # cannot straddle the boundary the display truncation makes.
+        title = (
+            redact_text(str(raw_title)[:4096])[:120] if raw_title else "<unknown>"
+        )
         logger.warning(
-            "auto-rejected permission request id=%s for unregistered session %s "
-            "(tool: %s): no surface on this client can answer it; answering with "
-            "%s so the backend subagent gets a tool error instead of hanging",
+            "auto-rejected permission request id=%s for session %s "
+            "(tool: %s, reason: %s): no surface on this client can answer it "
+            "right now; answering with %s so the backend subagent gets a tool "
+            "error instead of hanging",
             msg.id,
             session_id,
             title,
+            reason,
             result["outcome"]["outcome"],
         )
         try:
-            await self.send_response(msg.id, result)
+            # Bounded send: an answer that cannot be written within the
+            # timeout means the backend is not reading its stdin at all —
+            # the pipe is wedged, and every further frame from it would
+            # stack another blocked task (the OOM vector). Marking the
+            # runtime dead resolves EVERY pending wait by teardown, so no
+            # request is left unanswered and nothing accumulates.
+            await asyncio.wait_for(self.send_response(msg.id, result), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.error(
+                "answer for permission request id=%s could not be written in "
+                "30s — backend not reading stdin; marking runtime dead",
+                msg.id,
+            )
+            # Audit BEFORE returning: the denial DECISION was made even
+            # though delivery failed — mandatory SEL coverage applies to
+            # every decision, not just successfully delivered ones.
+            self._audit_denied_off_loop(
+                msg, session_id, f"{reason}:send_stalled_runtime_dead", title=title
+            )
+            self._mark_dead("permission-answer write stalled (backend not reading)")
+            return
         except AcpRuntimeDead:
             # Runtime died mid-answer; the backend's wait dies with it.
+            self._audit_denied_off_loop(
+                msg, session_id, f"{reason}:runtime_dead_mid_answer", title=title
+            )
             return
-        # Every permission decision is SEL-audited (repo convention; the
-        # dashboard deny path does the same). Audited AFTER the response and
-        # OFF the reader task: sel() may do blocking filesystem work on first
-        # use (e.g. Windows ACLs), and this coroutine runs inline in the
-        # single-owner reader — blocking here stalls every multiplexed
-        # session. The decision is already "deny", so an audit failure must
-        # not undo or delay it; the failure is swallowed after logging.
-        # Lazy import: runtime is low-level and a module-level import of
-        # kiro_crew.sel would be circular (same pattern as sandbox.py).
+        except Exception:
+            # This coroutine runs as a RETAINED TASK off the reader loop, so
+            # an unexpected send failure would otherwise be swallowed with
+            # the task — the child never gets an answer and waits on a
+            # stranded oneshot, the exact hang this path exists to prevent.
+            # A response write that fails for any reason other than the
+            # already-handled dead-runtime case means the pipe cannot be
+            # trusted: log and mark the runtime dead so the child's wait
+            # dies with the process instead of hanging invisibly.
+            logger.exception(
+                "failed to answer unroutable permission request id=%s — "
+                "marking runtime dead so the requester cannot hang",
+                msg.id,
+            )
+            self._audit_denied_off_loop(
+                msg, session_id, f"{reason}:send_failed_runtime_dead", title=title
+            )
+            self._mark_dead("unroutable-permission answer failed")
+            return
+        # Every permission decision is SEL-audited (repo convention; see
+        # _audit_denied_off_loop for the off-loop/lazy-import rationale).
+        self._audit_denied_off_loop(msg, session_id, reason, title=title)
+
+    def _audit_denied_off_loop(
+        self,
+        msg: JsonRpcMessage,
+        session_id: str,
+        reason: str,
+        *,
+        title: str | None = None,
+    ) -> None:
+        """SEL-audit a denied permission decision without blocking the caller.
+
+        Every permission decision leaves a SEL record (repo convention; the
+        dashboard deny path does the same). Off the calling task because
+        ``sel()`` may do blocking filesystem work on first use (e.g. Windows
+        ACLs). The decision is already made, so an audit failure must not
+        undo or delay it; the failure is swallowed after logging. Lazy
+        import: a module-level import of ``kiro_crew.sel`` would be circular
+        (same pattern as sandbox.py).
+        """
+        if title is None:
+            _params = msg.params if isinstance(msg.params, dict) else {}
+            _tc = _params.get("toolCall")
+            _raw = _tc.get("title") if isinstance(_tc, dict) else None
+            title = redact_text(str(_raw)[:4096])[:120] if _raw else "<unknown>"
+        # Hang-resilience series: every runtime-side denial funnels through
+        # here, so one emit covers unroutable/between-turns/cap/send-failure
+        # denials. ``reason`` is the closed SEL enum (low-cardinality).
+        emit_counter(
+            CHILD_PERMISSION_DENIED,
+            {"surface": "runtime", "reason": reason},
+        )
         request_id = msg.id if isinstance(msg.id, (str, int)) else ""
+        # SNAPSHOT the attribution key NOW: the audit closure runs later on a
+        # worker thread, and `_subagent_owner` is mutable (unregister/session
+        # swap). Reading it at execution time would write the wrong owner —
+        # or the bare PID — into an immutable SEL row.
+        session_key = f"acp:{self._subagent_owner or self._pid}:{session_id}"
 
         def _audit() -> None:
             try:
                 from kiro_crew.sel import sel
 
                 sel().log_tool_invocation(
-                    session_key=f"acp:{session_id}",
+                    session_key=session_key,
                     agent="kirocrew",
                     source="acp_runtime",
                     tool_name=title,
                     outcome="denied",
                     request_id=request_id,
-                    error="unregistered_session_auto_reject",
+                    error=reason,
                 )
             except Exception:
                 logger.exception("SEL audit for auto-rejected permission failed")
@@ -1256,6 +1594,18 @@ class AcpRuntime:
         that keeps a wrong-typed value from raising in the shared reader.
         """
         key = (_drop_key_part(session_id), _drop_key_part(method))
+        # Hang-resilience series: classify the drop by method so dashboards
+        # can alert on the pre-fix hang signature. ``method_class`` is a
+        # closed 3-value enum — the raw method (backend-controlled) never
+        # becomes an attribute value.
+        _m = method if isinstance(method, str) else ""
+        if _m == METHOD_REQUEST_PERMISSION:
+            _mclass = "permission"
+        elif _m == METHOD_SESSION_UPDATE:
+            _mclass = "update"
+        else:
+            _mclass = "other"
+        emit_counter(DROPPED_FRAMES, {"method_class": _mclass})
         now = time.monotonic()
         if self._dropped_frames_flushed_at == 0.0:
             # First drop of this runtime's life opens the window. __init__ cannot
@@ -1301,7 +1651,9 @@ class AcpRuntime:
           1. Response with id in _pending_requests → resolve Future
           2. Response with id in _routed_requests → put in session queue
           3. Notification with params.sessionId → session queue
-          4. No sessionId → broadcast to all queues
+          4. Request (method + id) with no sessionId → answered ONCE at
+             connection level (-32601), never broadcast
+          5. No sessionId → broadcast to all queues
         """
         assert self._process and self._process.stdout
         stdout = self._process.stdout
@@ -1493,14 +1845,63 @@ class AcpRuntime:
                         # owner; a permission request then falls to the
                         # fail-closed auto-answer below and updates are
                         # counted drops as before.
-                        await next(iter(self._session_queues.values())).put(msg)
+                        #
+                        # A permission REQUEST is routed only while the owner
+                        # has an in-flight prompt (an outstanding routed
+                        # request = the dispatch loop is consuming the queue).
+                        # Between turns nothing reads the queue until the next
+                        # prompt's drain, so a background child's request
+                        # would sit unanswered — the original hang with extra
+                        # steps. Answer it fail-closed NOW instead.
+                        _owner_turn_active = (
+                            self._subagent_owner in self._turn_active_sessions
+                        )
+                        if (
+                            msg.id is not None
+                            and msg.is_method(METHOD_REQUEST_PERMISSION)
+                            and not _owner_turn_active
+                        ):
+                            await self._spawn_answer_task(
+                                msg,
+                                session_id,
+                                # Registered + announced — the owner just
+                                # has no in-flight prompt. A distinct SEL
+                                # tag keeps normal background-child
+                                # behavior distinguishable from a real
+                                # misconfiguration in the audit trail.
+                                reason="owner_no_active_turn",
+                            )
+                            # Yield so spawned answer tasks actually RUN
+                            # between frames: with 129+ frames already
+                            # buffered, readline() returns without
+                            # suspending, and the reader would hit the
+                            # flood cap before any answer task had a chance
+                            # to complete — falsely killing a responsive
+                            # runtime. One loop-tick lets quick answers
+                            # drain; a genuinely wedged backend still
+                            # accumulates blocked tasks and trips the cap.
+                            await asyncio.sleep(0)
+                        else:
+                            # Hang-resilience series: a child permission
+                            # request delivered to the mode-parity pipeline —
+                            # each one is a request that, before #3786, was
+                            # silently dropped and wedged its crew for 2h.
+                            if msg.id is not None and msg.is_method(
+                                METHOD_REQUEST_PERMISSION
+                            ):
+                                emit_counter(
+                                    CHILD_PERMISSION_ROUTED, {"surface": "runtime"}
+                                )
+                            await next(iter(self._session_queues.values())).put(msg)
                     elif msg.id is not None and msg.is_method(METHOD_REQUEST_PERMISSION):
                         # Unannounced or ambiguous: nobody on this client can
                         # see or answer the prompt — answer NOW with the
                         # request's own least-destructive reject option so the
                         # backend subagent gets a tool error instead of
                         # hanging.
-                        await self._answer_unroutable_permission(msg, session_id)
+                        await self._spawn_answer_task(msg, session_id)
+                        # Same yield rationale as the routed-owner branch above.
+                        await asyncio.sleep(0)
                     elif self._session_inits_in_flight and (
                         msg.is_method(METHOD_MCP_OAUTH_REQUEST)
                         or msg.is_method(METHOD_MCP_SERVER_INITIALIZED)
@@ -1522,11 +1923,48 @@ class AcpRuntime:
                         self._note_dropped_frame(session_id, msg.method)
                     continue
 
+                # No sessionId. An id-carrying frame that still has a method is
+                # a server→client REQUEST that names no session — it expects
+                # exactly ONE response, so the runtime answers it at connection
+                # level (same shape as the KAS auth callback above) instead of
+                # broadcasting. Broadcasting would hand it to EVERY registered
+                # session's dispatch loop, each of which replies -32601 on the
+                # shared stdin: one id, N responses — a JSON-RPC protocol
+                # violation that widens with session sharing. Frames with an id
+                # but NO method are responses (e.g. a result of null slips past
+                # the result/error check above); their handling is unchanged.
+                if msg.id is not None and msg.method is not None:
+                    # Same volume bound as the permission auto-answers: each
+                    # reply can block on stdin drain() against a backend that
+                    # floods frames while never reading, so the task must be
+                    # retained (a bare ensure_future can be GC'd mid-flight)
+                    # and counted. Past the cap the frame takes the counted-
+                    # drop path — the flooding backend hangs on its own
+                    # unanswered request instead of growing the task set.
+                    if len(self._answer_tasks) >= self._max_answer_tasks:
+                        self._note_dropped_frame(_DROP_NO_SESSION, msg.method)
+                        continue
+                    _t = asyncio.ensure_future(
+                        self._answer_ownerless_request(msg.id, msg.method)
+                    )
+                    self._answer_tasks.add(_t)
+                    _t.add_done_callback(self._answer_tasks.discard)
+                    continue
+
                 # No sessionId → genuinely global notification; broadcast to all.
                 if self._session_queues:
                     # Snapshot: `await queue.put` yields, and a concurrent
                     # unregister_session() could pop mid-iteration otherwise.
-                    for queue in list(self._session_queues.values()):
+                    _queues = list(self._session_queues.values())
+                    # Fanning one ownerless frame out to SEVERAL sessions means
+                    # at most one recipient produced it and nothing says which,
+                    # so mark it: a consumer that measures its own activity (the
+                    # subagent idle-stall clock) must not count another tenant's
+                    # traffic. A lone session IS the sole owner, so it is left
+                    # unmarked and keeps reading the frame as its own.
+                    if len(_queues) > 1:
+                        msg.fanout_no_owner = True
+                    for queue in _queues:
                         await queue.put(msg)
                 else:
                     # Same unbounded shape as the unknown-session branch: with
@@ -1546,6 +1984,29 @@ class AcpRuntime:
             # crash) so a trickle that never reached the interval is still
             # accounted for instead of vanishing with the task.
             self._flush_dropped_frames()
+
+    async def _answer_ownerless_request(
+        self, request_id: int | str, method: str
+    ) -> None:
+        """Answer a server→client request that names no session with -32601.
+
+        Runs OFF the reader loop (same shape as the KAS auth callback) so a
+        stalled stdin drain cannot block stdout demux for every multiplexed
+        session. The routed case — an unknown request WITH a sessionId — is
+        deliberately not handled here: it is delivered to that session's queue
+        and answered once by its dispatch loop (``server_request_unknown``).
+        """
+        logger.debug(
+            "Ownerless server request answered -32601 — method=%s id=%r",
+            method,
+            request_id,
+        )
+        try:
+            await self.send_error(
+                request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found"
+            )
+        except AcpRuntimeDead:
+            pass
 
     async def _answer_get_access_token(self, request_id: int | str) -> None:
         """Answer KAS's ``_kiro/auth/getAccessToken`` callback (see :mod:`kas_auth`).
@@ -1576,6 +2037,23 @@ class AcpRuntime:
         positive ``== ACP_BACKEND_KAS`` check (harness-parity H5); this body is
         only ever reached on the KAS path.
         """
+        # Positive liveness signal: this callback fires ONLY when a running
+        # KAS process asks Kiro Crew for a token, so reaching here is direct
+        # proof KAS is serving this runtime. No token is logged — only the
+        # fact of the callback, deduped to once-per-runtime at INFO.
+        if not self._kas_auth_logged:
+            self._kas_auth_logged = True
+            logger.info(
+                "KAS auth callback served — backend=kas agent=%s (PID %s)",
+                self._agent or "<none>",
+                self._pid,
+            )
+        else:
+            logger.debug(
+                "KAS auth callback served — agent=%s (PID %s)",
+                self._agent or "<none>",
+                self._pid,
+            )
         try:
             result = await resolve_kas_access_token()
         except KasAuthCallbackError as exc:
@@ -1615,11 +2093,27 @@ class AcpRuntime:
         """
         return any(_NOT_LOGGED_IN_RE.search(line) for line in self._stderr_lines)
 
-    def _mark_dead(self, reason: str) -> None:
-        """Mark runtime dead, fail all pending requests, poison all session queues."""
+    def _mark_dead(self, reason: str, *, expected: bool = False) -> None:
+        """Mark runtime dead, fail all pending requests, poison all session queues.
+
+        ``expected`` selects only the log severity: a deliberate teardown (a
+        warm-pool TTL recycle, a session shutdown) logs at INFO, while every
+        genuine death path (process exit, reader crash, broken pipe, ...) keeps
+        today's WARNING. The default is False so any death path added later is
+        a WARNING without having to opt in. Everything else — the ``_dead``
+        early return, PID unshielding, failing pending futures, poisoning
+        session queues — is identical on both paths.
+        """
         if self._dead:
             return
         self._dead = True
+        # A process that already exited on its own is a genuine death being
+        # reaped, not a teardown this caller initiated — refuse the downgrade
+        # regardless of call site. This closes the race where a replacement
+        # path observes is_alive() == False (returncode set by the child
+        # watcher) and kill()s before the reader loop has marked the death.
+        if expected and self._process is not None and self._process.returncode is not None:
+            expected = False
         # Release the sweep-protection shield on ANY death path (EOF, rc!=0,
         # stdout overrun, reader crash, broken pipe) — not just kill(). Otherwise
         # the dead PID lingers in _PROTECTED_PIDS forever and, after PID reuse,
@@ -1635,7 +2129,8 @@ class AcpRuntime:
         # operators can tell an OOM/crash from a clean exit without DEBUG logs.
         rc = self._process.returncode if self._process else None
         tail = " | ".join(self._stderr_lines[-5:]) if self._stderr_lines else "<none>"
-        logger.warning(
+        log = logger.info if expected else logger.warning
+        log(
             "AcpRuntime dead (PID %s): %s [returncode=%s] stderr_tail: %s",
             self._pid,
             reason,
@@ -1766,10 +2261,24 @@ class AcpRuntime:
         # session on this warm runtime must never inherit a stale child's
         # approvals (the announce set is re-learned from the next
         # subagent/list_update, which re-establishes ownership explicitly).
+        self._turn_active_sessions.discard(session_id)
         if self._subagent_owner == session_id:
             self._subagent_owner = None
             self._subagent_sessions = set()
         logger.debug("Removed session %s", session_id)
+
+    def mark_turn_active(self, session_id: str, active: bool) -> None:
+        """Record whether a session's prompt dispatch loop is consuming.
+
+        Called by ``AcpSessionHandle.prompt()`` on entry and (in a finally)
+        on every exit path. Child permission requests are routed only while
+        the owner is marked active; otherwise they are answered fail-closed
+        immediately, because nothing reads the queue until the next turn.
+        """
+        if active:
+            self._turn_active_sessions.add(session_id)
+        else:
+            self._turn_active_sessions.discard(session_id)
 
     # Alias for backward compat
     remove_session = unregister_session
@@ -1836,6 +2345,110 @@ class AcpRuntime:
         return METHOD_SESSION_TERMINATE
 
     # ── Session Management ──
+
+    def _mcp_init_progress(self, expected: Any) -> str:
+        """Describe MCP registration progress for a session start that stalled.
+
+        Reads the frames the reader loop already staged in
+        ``_pending_init_notifications`` so a session-start timeout can name the
+        servers that never reported, instead of reporting only the elapsed
+        budget. Must run BEFORE ``_finish_session_init``, which drops that
+        buffer once the last in-flight init closes.
+
+        ``expected`` is the ``mcpServers`` array sent with the request. Its
+        entries carry the roster names, and that is what makes the ABSENT
+        servers nameable rather than only the present ones.
+
+        Reports are runtime-wide rather than per-session: a request that never
+        answered has no session id to match its frames against, so a concurrent
+        init is called out in the text instead of being silently folded in.
+        Likewise the staging deque is bounded, so on a very large fleet the
+        reported count is a floor, not an exact tally.
+        """
+        roster = [
+            _sanitize_progress_name(str(e.get("name") or ""))
+            for e in (expected if isinstance(expected, list) else [])
+            if isinstance(e, dict) and e.get("name")
+        ]
+        ready: list[str] = []
+        failed: list[str] = []
+        failure_text: dict[str, str] = {}
+        awaiting_auth: list[str] = []
+        for msg in self._pending_init_notifications:
+            params = msg.params if isinstance(msg.params, dict) else {}
+            name = _sanitize_progress_name(
+                str(params.get("serverName") or params.get("name") or "")
+            )
+            if not name:
+                continue
+            if msg.is_method(METHOD_MCP_SERVER_INITIALIZED):
+                if name not in ready:
+                    ready.append(name)
+            elif msg.is_method(METHOD_MCP_SERVER_INIT_FAILURE):
+                # A failed server's error text can carry connection strings or
+                # tokens from its startup, so it takes the same scrub the
+                # dashboard banner applies before it lands in an exception.
+                err, _ = redact_exfiltration_urls(str(params.get("error") or ""))
+                err, _ = redact_credentials(err)
+                err = _strip_unprintable(" ".join(err.split()))[
+                    :_MCP_PROGRESS_ERROR_CAP
+                ]
+                if name not in failed:
+                    failed.append(name)
+                if err:
+                    failure_text[name] = err
+            elif msg.is_method(METHOD_MCP_OAUTH_REQUEST):
+                if name not in awaiting_auth:
+                    awaiting_auth.append(name)
+
+        reported = set(ready) | set(failed)
+        parts: list[str] = []
+        if roster:
+            # Count only reports that belong to the roster. kiro-cli initializes
+            # the agent spec's own servers as well as the session-injected ones,
+            # so the staged frames are a SUPERSET of the roster and a raw
+            # len(reported) can exceed the denominator -- "2/1 reported". The
+            # out-of-roster servers still appear by name in the failed and
+            # awaiting-authorization buckets, where naming them is the point.
+            parts.append(
+                f"{len(reported & set(roster))}/{len(roster)} MCP server(s) reported"
+            )
+            silent = [n for n in roster if n not in reported]
+            if silent:
+                parts.append(f"no report from {_capped_names(silent)}")
+        else:
+            parts.append(f"{len(reported)} MCP server(s) reported, roster unknown")
+        if failed:
+            parts.append(
+                "failed: "
+                + _capped_names(
+                    [f"{n} ({failure_text[n]})" if n in failure_text else n for n in failed]
+                )
+            )
+        if awaiting_auth:
+            parts.append(f"awaiting authorization: {_capped_names(awaiting_auth)}")
+        if self._session_inits_in_flight > 1:
+            parts.append(
+                f"{self._session_inits_in_flight} session inits in flight, "
+                "so these reports are runtime-wide"
+            )
+        return "; ".join(parts)
+
+    def _session_start_stalled(
+        self, exc: AcpRequestTimeout, method: str, expected: Any
+    ) -> AcpRequestTimeout:
+        """Attach MCP progress to a session-start timeout before it reaches the user.
+
+        Session start is the one request whose cost is dominated by work the
+        runtime can observe, so the bare budget is the least useful half of the
+        answer. Returns a replacement to raise rather than raising here, so the
+        caller keeps the ``from exc`` chain.
+        """
+        progress = self._mcp_init_progress(expected)
+        logger.warning("%s stalled: %s", method, progress or "no MCP reports staged")
+        if not progress:
+            return exc
+        return AcpRequestTimeout(f"{exc} ({progress})")
 
     def _finish_session_init(self, session_id: str) -> list[JsonRpcMessage]:
         """Take staged init frames for one session and close its init scope."""
@@ -1971,6 +2584,9 @@ class AcpRuntime:
             session_id = str(resp.get("sessionId") or "")
             if not session_id:
                 raise AcpRuntimeError(f"session/new did not return sessionId: {resp}")
+        except AcpRequestTimeout as exc:
+            # Read the staged MCP reports before the finally below clears them.
+            raise self._session_start_stalled(exc, METHOD_SESSION_NEW, mcp_servers) from exc
         finally:
             buffered_init = self._finish_session_init(session_id)
 
@@ -2097,8 +2713,9 @@ class AcpRuntime:
         # silently un-pooling the session for the rest of its life. Resolved off
         # the event loop — the overlay lookup stats and reads files. Empty when
         # the shared gateway is disabled, so non-pooled installs still send [].
+        active_agent = agent or self._agent
         mcp_servers = await asyncio.to_thread(
-            pooled_session_servers, self._mcp_gateway_overlay, agent or self._agent
+            pooled_session_servers, self._mcp_gateway_overlay, active_agent
         )
         load_params: dict[str, Any] = {
             "sessionId": resume_sid,
@@ -2110,6 +2727,29 @@ class AcpRuntime:
             # the session itself from sessionId is called with an empty path, and
             # sending the field anyway would advertise a path that does not exist.
             load_params["_meta"] = {"_kiro.dev/session_file": session_file}
+        # Re-inject the agent definition, for the same reason create_session()
+        # does: KAS registers client agents per session and has no --agent flag,
+        # so a resumed session that is not handed them again advertises only the
+        # modes it can find on disk. That set is NOT a superset of what
+        # session/new had — KAS skips an agent profile written for kiro-cli — so
+        # omitting this made the requested mode genuinely absent on resume, and
+        # Guard A below then refused the load rather than run the backend default.
+        #
+        # Guarded on the backend rather than relying on _kas_custom_agents()
+        # answering None, so the kiro resume path reaches a comparison and stops:
+        # no awaited step, nothing to unwind, no shared coroutine that could grow
+        # a failure mode later. create_session() enters the same seam
+        # unconditionally, which is the shape this one deliberately does NOT copy
+        # — reading a backend and stopping is the smallest non-zero delta the kiro
+        # path can take for KAS behaviour to exist here at all, and it is the
+        # positive `== ACP_BACKEND_KAS` dispatch harness-parity H5 asks for (see
+        # _deliver_kas_access_token, and six other call sites in this file).
+        # H13 governs the REGISTRATION seam — ProviderRegistry and
+        # create_provider_factory, per its own row in harness-parity.md — not
+        # per-request dispatch inside the runtime; a reading that reached here
+        # would forbid those seven shipped call sites too.
+        if self._acp_backend == ACP_BACKEND_KAS:
+            attach_kas_custom_agents(load_params, await self._kas_custom_agents(active_agent))
         budget = await self._session_start_budget()
         self._session_inits_in_flight += 1
         loaded_session_id = ""
@@ -2132,6 +2772,9 @@ class AcpRuntime:
                     f"session/load did not resume session {resume_sid}: {resp}"
                 )
             loaded_session_id = resume_sid
+        except AcpRequestTimeout as exc:
+            # Read the staged MCP reports before the finally below clears them.
+            raise self._session_start_stalled(exc, METHOD_SESSION_LOAD, mcp_servers) from exc
         finally:
             buffered_init = self._finish_session_init(loaded_session_id)
 
@@ -2253,7 +2896,7 @@ class AcpRuntime:
             self._pending_requests.pop(req_id, None)
             # Name the budget: a session-start timeout (90s) must be
             # distinguishable from a generic control-plane one (30s).
-            raise AcpRuntimeError(f"Request {method} timed out after {timeout:g}s")
+            raise AcpRequestTimeout(f"Request {method} timed out after {timeout:g}s")
 
     async def _drain_stderr(self) -> None:
         """Drain stderr to prevent subprocess blocking."""

@@ -590,6 +590,147 @@ class TestUpstreamInitializeResolution:
         assert "missing/malformed result" in (backend.dead_reason or "")
 
 
+class TestFirstHandshakeDeadline:
+    """The timer that closes an in-flight window a backend never resolves.
+
+    A backend that stays alive but never answers ``initialize`` is invisible to
+    every death-driven recovery path, so the deadline is the only thing that
+    turns that silence into a terminal state and reclaims the process.
+    """
+
+    @staticmethod
+    def _init(id_: Any = 1) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": id_, "method": "initialize",
+                "params": {"capabilities": {}}}
+
+    @staticmethod
+    async def _expire_now(backend: Backend) -> None:
+        """Close the in-flight window without a wall-clock wait.
+
+        The zero-timeout coroutine is installed AS the stored task, so a disarm
+        reached from inside it sees the timer's own identity -- the property
+        ``test_disarm_from_inside_the_timer_does_not_self_cancel`` pins.
+        """
+        backend._cancel_init_deadline()
+        backend._init_deadline_task = asyncio.create_task(backend._init_deadline(0))
+        await backend._init_deadline_task
+
+    @pytest.mark.asyncio
+    async def test_respawn_priming_shares_the_one_handshake_bound(self) -> None:
+        # Two paths drive the same handshake, so they must expire together. A
+        # literal default here is how they silently came to differ.
+        import inspect
+        default = inspect.signature(Backend.prime_initialize).parameters["timeout"].default
+        assert default == backend_mod._DEFAULT_INITIALIZE_TIMEOUT_SECS
+
+    @pytest.mark.asyncio
+    async def test_first_handshake_arms_the_deadline(self) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", self._init(1))
+        task = backend._init_deadline_task
+        assert task is not None and not task.done()
+        backend._cancel_init_deadline()
+
+    @pytest.mark.asyncio
+    async def test_write_failure_does_not_arm(self) -> None:
+        # No handshake ever started, so there is no window for a timer to close.
+        backend = _make_backend()
+        cast(Any, backend.stdin).write.side_effect = ConnectionResetError("reset")
+        with pytest.raises(BackendGone):
+            await backend.forward_from_stub("s1", self._init(1))
+        assert backend._init_deadline_task is None
+
+    @pytest.mark.asyncio
+    async def test_arming_twice_keeps_one_timer(self) -> None:
+        # A second arm must not replace the task: the displaced one would never
+        # be cancelled and would outlive the window it was meant to close.
+        backend = _make_backend()
+        backend._init_state = "in_flight"
+        backend._arm_init_deadline()
+        first = backend._init_deadline_task
+        backend._arm_init_deadline()
+        assert backend._init_deadline_task is first
+        backend._cancel_init_deadline()
+
+    @pytest.mark.asyncio
+    async def test_queued_stubs_do_not_extend_the_deadline(self) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        await backend.attach_stub("s2")
+        await backend.forward_from_stub("s1", self._init(1))
+        armed = backend._init_deadline_task
+        await backend.forward_from_stub("s2", self._init(2))
+        assert backend._init_deadline_task is armed
+        backend._cancel_init_deadline()
+
+    @pytest.mark.asyncio
+    async def test_expiry_fails_init_errors_waiters_and_reaps(self) -> None:
+        backend = _make_backend()
+        inbox = await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", self._init(7))
+        await self._expire_now(backend)
+        assert backend._init_state == "failed"
+        assert "initialize did not complete within 0s" in cast(str, backend._dead_reason)
+        reply = await _drain(inbox)
+        assert reply["id"] == 7
+        assert "init failed" in reply["error"]["message"]
+        # Reaped rather than left running: closing stdin is shutdown's first act.
+        assert cast(Any, backend.stdin).close.called
+
+    @pytest.mark.asyncio
+    async def test_expiry_after_the_handshake_resolved_touches_nothing(self) -> None:
+        # The timer may be scheduled a tick before the reply lands. A resolved
+        # window is not its to close -- firing anyway would kill a healthy
+        # backend every time a handshake finished near the deadline.
+        backend = _make_backend()
+        backend._init_state = "ready"
+        await backend._init_deadline(0)
+        assert backend._init_state == "ready"
+        assert not cast(Any, backend.stdin).close.called
+        assert backend._dead_reason is None
+
+    @pytest.mark.asyncio
+    async def test_successful_handshake_disarms_the_deadline(self) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", self._init(1))
+        await backend._on_upstream_initialize(
+            {"jsonrpc": "2.0", "id": "gw-4242-1",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}
+        )
+        assert backend._init_state == "ready"
+        assert backend._init_deadline_task is None
+
+    @pytest.mark.asyncio
+    async def test_failed_handshake_disarms_the_deadline(self) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", self._init(1))
+        await backend._fail_init("upstream said no")
+        assert backend._init_deadline_task is None
+
+    @pytest.mark.asyncio
+    async def test_backend_gone_disarms_the_deadline(self) -> None:
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", self._init(1))
+        await backend._broadcast_backend_gone("stdout eof")
+        assert backend._init_deadline_task is None
+
+    @pytest.mark.asyncio
+    async def test_disarm_from_inside_the_timer_does_not_self_cancel(self) -> None:
+        # Teardown runs inside the timer's own coroutine (the deadline calls
+        # shutdown), so cancelling the current task would abort the very
+        # transition being made. The expiry path must still complete.
+        backend = _make_backend()
+        await backend.attach_stub("s1")
+        await backend.forward_from_stub("s1", self._init(1))
+        await self._expire_now(backend)
+        assert backend._init_state == "failed"
+        assert cast(Any, backend.stdin).close.called
+
+
 class TestPrimeInitialize:
     @pytest.mark.asyncio
     async def test_ready_backend_is_a_noop(self) -> None:
@@ -1102,6 +1243,69 @@ class TestRunStdoutPump:
         backend._pending_requests["gw-1"] = _PendingRequest("s1", 1, "tools/call")
         await backend.run_stdout_pump()
         assert (await _drain(inbox))["result"] == "raw"
+
+    @pytest.mark.asyncio
+    async def test_image_bearing_line_goes_through_the_budget_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A line matching the image probe is parse-confirmed, then the
+        REWRITTEN line from the image stage is what gets routed."""
+        monkeypatch.setattr(
+            backend_mod, "parse_image_bearing_frame", lambda line: {"parsed": True},
+        )
+        monkeypatch.setattr(
+            backend_mod, "rewrite_image_frame",
+            lambda msg, line, server: _line({"id": "gw-1", "result": "budgeted"}),
+        )
+        backend = _make_backend()
+        backend.stdout = cast(Any, _reader(_line(
+            {"id": "gw-1", "result": {"content": [{"type": "image", "data": "AA=="}]}},
+        )))
+        inbox = await backend.attach_stub("s1")
+        backend._pending_requests["gw-1"] = _PendingRequest("s1", 1, "tools/call")
+        await backend.run_stdout_pump()
+        assert (await _drain(inbox))["result"] == "budgeted"
+
+    @pytest.mark.asyncio
+    async def test_non_image_frame_matching_probe_skips_the_image_stage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A probe false positive (escaped text, no image blocks) must not
+        occupy the image pool: the parse stage returns None and the original
+        line is routed with no rewrite call."""
+        rewrite_calls = []
+        monkeypatch.setattr(backend_mod, "parse_image_bearing_frame", lambda line: None)
+        monkeypatch.setattr(
+            backend_mod, "rewrite_image_frame",
+            lambda msg, line, server: rewrite_calls.append(1) or line,
+        )
+        backend = _make_backend()
+        backend.stdout = cast(Any, _reader(_line({"id": "gw-1", "result": 'has "image" text'})))
+        inbox = await backend.attach_stub("s1")
+        backend._pending_requests["gw-1"] = _PendingRequest("s1", 1, "tools/call")
+        await backend.run_stdout_pump()
+        assert (await _drain(inbox))["result"] == 'has "image" text'
+        assert rewrite_calls == []
+
+    @pytest.mark.asyncio
+    async def test_image_budget_failure_routes_the_raw_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unexpected hook failure must not take the relay down: the raw
+        line is routed (per-block fail-closed lives INSIDE the hook)."""
+        def _boom(line: bytes) -> dict:
+            raise RuntimeError("pillow exploded")
+
+        monkeypatch.setattr(backend_mod, "parse_image_bearing_frame", _boom)
+        backend = _make_backend()
+        backend.stdout = cast(Any, _reader(_line(
+            {"id": "gw-1", "result": {"content": [{"type": "image", "data": "AA=="}]}},
+        )))
+        inbox = await backend.attach_stub("s1")
+        backend._pending_requests["gw-1"] = _PendingRequest("s1", 1, "tools/call")
+        await backend.run_stdout_pump()
+        routed = await _drain(inbox)
+        assert routed["result"]["content"][0]["type"] == "image"
 
     @pytest.mark.asyncio
     async def test_cancellation_propagates(self) -> None:
@@ -1853,3 +2057,195 @@ class TestCallMetrics:
         await _settle(backend)
         assert backend._metric_tasks == set()
         assert json.loads(path.read_text(encoding="utf-8").strip())["method"] == "ping"
+
+
+class TestBackendTmpContainment:
+    """Issue #5064: spawn injects a contained temp dir; shutdown reclaims it."""
+
+    @pytest.mark.asyncio
+    async def test_spawn_contains_temp_under_managed_root(
+        self, fake_spawn, monkeypatch, tmp_path
+    ) -> None:
+        from pathlib import Path
+
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        await spawn_backend(
+            _pool_key(), "/usr/bin/example-mcp", [], {}, "/nonexistent-work-dir"
+        )
+
+        env = fake_spawn["kwargs"]["env"]
+        root = home / "run" / "mcp-tmp"
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            assert Path(env[key]).parent == root, key
+        assert env["TMPDIR"] == env["TMP"] == env["TEMP"]
+        contained = Path(env["TMPDIR"])
+        assert contained.is_dir()
+        # Liveness anchor for the sweep: allocation + spawn leave an owner
+        # record on disk -- the sweep's ONLY state (no in-memory field).
+        assert (contained / bt.OWNER_FILENAME).is_file()
+
+    @pytest.mark.asyncio
+    async def test_operator_declared_temp_wins(self, fake_spawn, monkeypatch, tmp_path) -> None:
+        # A spec that sets TMPDIR deliberately points a heavy server at
+        # chosen storage; containment must not trade litter for ENOSPC.
+        # Declaration is the CALLER's signal (declared_temp_keys), carried
+        # from the gatewayd closure that knows the declared-env set.
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        await spawn_backend(
+            _pool_key(),
+            "/usr/bin/example-mcp",
+            [],
+            {"TMPDIR": "/mnt/bigdisk/tmp"},
+            "/nonexistent-work-dir",
+            declared_temp_keys=("TMPDIR",),
+        )
+
+        env = fake_spawn["kwargs"]["env"]
+        assert env["TMPDIR"] == "/mnt/bigdisk/tmp"
+        assert not (home / "run" / "mcp-tmp").exists() or not any(
+            (home / "run" / "mcp-tmp").iterdir()
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_declaration_strips_competing_ambient_keys(
+        self, fake_spawn, monkeypatch, tmp_path
+    ) -> None:
+        # A spec declaring only TMP must actually govern the child: tempfile
+        # consults TMPDIR before TMP, so leaving the daemon's ambient TMPDIR
+        # in place would silently defeat the declaration (macOS always
+        # exports one). Yield = declared keys kept, undeclared canonical
+        # keys pruned.
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        await spawn_backend(
+            _pool_key(),
+            "/usr/bin/example-mcp",
+            [],
+            {"TMPDIR": "/var/folders/xy/ambient", "TMP": "/mnt/bigdisk/tmp"},
+            "/nonexistent-work-dir",
+            declared_temp_keys=("TMP",),
+        )
+
+        env = fake_spawn["kwargs"]["env"]
+        assert "TMPDIR" not in env
+        assert env["TMP"] == "/mnt/bigdisk/tmp"
+        assert not (home / "run" / "mcp-tmp").exists() or not any(
+            (home / "run" / "mcp-tmp").iterdir()
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambient_temp_does_not_suppress_containment(
+        self, fake_spawn, monkeypatch, tmp_path
+    ) -> None:
+        # Regression: the resolver folds the daemon's own inherited environ
+        # into the spawn env, and macOS always exports TMPDIR (Windows: TMP /
+        # TEMP). An env-membership gate read that ambient value as an operator
+        # declaration and disabled containment on those platforms entirely.
+        # Ambient keys must be OVERRIDDEN by the managed triple.
+        from pathlib import Path
+
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        await spawn_backend(
+            _pool_key(),
+            "/usr/bin/example-mcp",
+            [],
+            {"TMPDIR": "/var/folders/xy/ambient", "TMP": r"C:\Users\x\tmp"},
+            "/nonexistent-work-dir",
+            declared_temp_keys=(),
+        )
+
+        env = fake_spawn["kwargs"]["env"]
+        root = home / "run" / "mcp-tmp"
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            assert Path(env[key]).parent == root, key
+        assert Path(env["TMPDIR"]).is_dir()
+
+    @pytest.mark.asyncio
+    async def test_spawn_survives_allocation_failure(self, fake_spawn, monkeypatch) -> None:
+        # Fail-open: containment is hygiene, not a spawn prerequisite. The
+        # allocate step raises when the dir or its owner record cannot be
+        # written (ENOSPC / inode exhaustion) -- the spawn proceeds with
+        # inherited temp and nothing is left on disk to reclaim.
+        from kiro_crew.mcp_gateway import backend as backend_mod
+
+        def _boom(_digest: str):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(backend_mod, "allocate_backend_tmp", _boom)
+
+        await spawn_backend(
+            _pool_key(), "/usr/bin/example-mcp", [], {"PATH": "/usr/bin"}, "/nonexistent-work-dir"
+        )
+
+        env = fake_spawn["kwargs"]["env"]
+        assert "TMPDIR" not in env
+
+    @pytest.mark.asyncio
+    async def test_spawn_failure_reclaims_the_fresh_dir(self, monkeypatch, tmp_path) -> None:
+        # Unowned-by-a-live-process dirs are never deleted by the sweeps, so
+        # the spawn-failure path is the ONLY reclamation point for a dir
+        # whose process never existed.
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        async def _boom(*_args, **_kwargs):
+            raise OSError("exec failed")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _boom)
+
+        with pytest.raises(OSError):
+            await spawn_backend(
+                _pool_key(), "/usr/bin/example-mcp", [], {}, "/nonexistent-work-dir"
+            )
+
+        root = home / "run" / "mcp-tmp"
+        assert not root.exists() or list(root.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_shutdown_leaves_the_dir_for_the_sweep(
+        self, fake_spawn, monkeypatch, tmp_path
+    ) -> None:
+        # Deliberately NO deletion on shutdown: the launcher's exit is not
+        # proof its process TREE is gone (a wrapper exits while its server
+        # child lives on). The sweep's dual condition (owner dead AND idle)
+        # is the single deletion authority.
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        from pathlib import Path
+
+        backend = await spawn_backend(
+            _pool_key(), "/usr/bin/example-mcp", [], {}, "/nonexistent-work-dir"
+        )
+        tmp_dir = Path(fake_spawn["kwargs"]["env"]["TMPDIR"])
+        assert tmp_dir.is_dir()
+
+        fake_spawn["process"].returncode = 0
+        await backend.shutdown()
+
+        assert tmp_dir.is_dir(), "shutdown must not delete; the sweep owns deletion"

@@ -17,14 +17,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from kiro_crew import __version__, platform_compat
-from kiro_crew.beacon import is_default_home
+from kiro_crew import __version__, dep_sync, platform_compat
+from kiro_crew.beacon import distribution, is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     _session_work_dir,
     build_provider_factory,
     config_dir,
     config_path,
+    read_local_secret,
 )
 from kiro_crew.constants import DATA_WARNING
 from kiro_crew.context import ContextBuilder
@@ -49,6 +50,11 @@ from kiro_crew.instances import run_marker
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
+from kiro_crew.platform.update_capability import (
+    EXTERNALLY_MANAGED_MESSAGES,
+    MANAGED_BY_GIT,
+    derive_capability,
+)
 
 # Client-side port resolution lives in kiro_crew.port_resolution, a light leaf
 # module the MCP stdio server can import without paying for this module's
@@ -68,6 +74,7 @@ from kiro_crew.port_resolution import (  # noqa: F401
     _marker_port,
     resolve_client_port,
     resolve_client_port_ex,
+    resolve_client_port_src,
 )
 from kiro_crew.preflight import run_preflight_checks
 from kiro_crew.sel import sel
@@ -144,10 +151,8 @@ def _token(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     port = resolve_client_port(args.port)
-    secret_path = config_dir() / ".local_secret"
-    try:
-        secret = secret_path.read_text().strip()
-    except FileNotFoundError:
+    secret = read_local_secret(port)
+    if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway", file=sys.stderr)
         sys.exit(1)
 
@@ -272,10 +277,8 @@ def _emit_session_urls(port: int, token: str) -> None:
 
 def _logout(port: int) -> None:
     """Revoke all dashboard sessions by calling the gateway's /api/logout endpoint."""
-    secret_path = config_dir() / ".local_secret"
-    try:
-        secret = secret_path.read_text().strip()
-    except FileNotFoundError:
+    secret = read_local_secret(port)
+    if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway")
         sys.exit(1)
 
@@ -771,11 +774,13 @@ def _wait_gateway_ready(
 
 def _print_token_url(port: int) -> None:
     """Wait for the gateway to come up, then print a fresh token URL."""
-    secret_path = config_dir() / ".local_secret"
     deadline = time.monotonic() + _RESTART_READY_TIMEOUT
     while time.monotonic() < deadline:
         try:
-            secret = secret_path.read_text().strip()
+            secret = read_local_secret(port)
+            if not secret:
+                time.sleep(_RESTART_READY_POLL_INTERVAL)
+                continue
             url = f"http://{_CLI_LOOPBACK}:{port}/api/token/local?ttl={_RESTART_TOKEN_TTL}"
             req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
             with loopback_urlopen(req, timeout=3) as resp:
@@ -957,30 +962,47 @@ def _update() -> None:
     * **externally managed** (desktop app, Docker) — print guidance on how
       to update via the correct surface instead of failing with an opaque error.
     """
-    from kiro_crew.platform.update_layout import (
-        EXTERNALLY_MANAGED,
-        InstallLayout,
-    )
+    from kiro_crew.platform.update_layout import InstallLayout
 
     print("👻 Updating Kiro Crew…\n")
 
+    # A policy-defined provider OWNS the update on this host. Checked before any
+    # layout dispatch so a manual `kirocrew update` cannot run the built-in
+    # git/CDN mechanism the administrator excluded.
+    from kiro_crew.platform.update_provider import apply_policy_update
+
+    applied = asyncio.run(apply_policy_update())
+    if applied is not None:
+        if applied:
+            print("\n✅ Update applied by the policy-defined update command.")
+            print("\n  Restart the gateway to use the new version:")
+            print("    kirocrew restart")
+        else:
+            print("\n❌ The policy-defined update command failed — see the log above.")
+            print("  Not falling back to the built-in updater: this host's policy")
+            print("  selects its own update mechanism.")
+            sys.exit(1)
+        return
+
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-    proj_path = Path(proj) if proj else None
-    is_git = proj_path is not None and (proj_path / ".git").exists()
+    # Dispatch on the shared derivation, not on the git probe alone. The probe
+    # answers "is this a working tree", which is NOT the same question as "who
+    # owns updating this install": a container or a desktop bundle pointed at a
+    # checkout would otherwise take the git path here and reset a tree its own
+    # updater owns. `derive_capability` puts the externally managed stamp first
+    # for exactly that reason, and this is the surface that has to honour it.
+    capability = derive_capability(install_root=proj)
 
-    if not is_git:
-        # Not a git checkout — check if externally managed or wheel install.
-        from kiro_crew.beacon import distribution
-
-        dist = distribution()
-        if dist in EXTERNALLY_MANAGED:
-            print(f"  ℹ️  This install ({dist}) is managed externally.")
-            print(f"  {EXTERNALLY_MANAGED[dist]}")
+    if capability.managed_by != MANAGED_BY_GIT:
+        if capability.defers:
+            reason = capability.unavailable_reason or ""
+            print(f"  ℹ️  This install ({distribution()}) is managed externally.")
+            print(f"  {EXTERNALLY_MANAGED_MESSAGES.get(reason, '')}")
             return
 
         # Wheel / cli.sh install path.
         layout = InstallLayout(
-            kind=dist or "wheel",
+            kind=distribution() or "wheel",
             proj=proj,
             is_git=False,
             is_externally_managed=False,
@@ -988,14 +1010,6 @@ def _update() -> None:
         )
         _update_wheel(layout)
         return
-
-    # A git worktree or submodule stores ``.git`` as a FILE (a ``gitdir:``
-    # pointer), not a directory, so accept both — otherwise `kirocrew update`
-    # run from a worktree wrongly refuses with "No git repo".
-    assert proj_path is not None  # narrowing: is_git=True implies proj_path was set
-    if not (proj_path / ".git").exists():
-        print(f"❌ No git repo at {proj}")
-        sys.exit(1)
 
     print(f"  📂 {proj}")
 
@@ -1092,17 +1106,21 @@ def _update() -> None:
     _ensure_node(proj)
 
     # Build the dashboard frontend assets (npm), then reinstall the package.
-    build_frontend_sync(proj_path)
+    build_frontend_sync(Path(proj))
 
-    print("  🔨 pip install -e .")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", ".", "--quiet"],
-        cwd=proj,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"  ❌ Install failed:\n{result.stderr.strip()}")
+    # Install the pulled revision into this CLI's own venv. `kirocrew update` is
+    # itself run FROM the console script pip would have to rewrite, so on Windows
+    # the reinstall cannot succeed and dep_sync substitutes a dependency-only sync
+    # (it reports, rather than silently tolerating, a revision that repointed the
+    # script — that is the one case still needing a terminal without kirocrew
+    # running).
+    print("  🔨 Installing the pulled revision…")
+
+    def _emit(message: str, error: bool) -> None:
+        print(f"  {'❌' if error else '•'} {message}")
+
+    rc = dep_sync.sync_or_reinstall(Path(proj), Path(sys.executable), _emit)
+    if rc != 0:
         sys.exit(1)
 
     print("\n✅ Kiro Crew updated!")
@@ -1131,11 +1149,15 @@ def _update_wheel(layout) -> None:
     the standard state for ``curl | sh`` installs where the venv at
     ``~/.kiro/crew-venv`` has no source tree.
     """
-    import re
 
     from kiro_crew import __version__ as local_version
     from kiro_crew.platform.update_governance import update_blocked_reason
-    from kiro_crew.platform.update_layout import cdn_bases, release_channel, wheel_update_command
+    from kiro_crew.platform.update_layout import (
+        cdn_bases,
+        cdn_bases_are_safe,
+        release_channel,
+        wheel_update_command,
+    )
 
     channel = release_channel()
     feed_base, artifact_base = cdn_bases()
@@ -1153,8 +1175,7 @@ def _update_wheel(layout) -> None:
     # Shell safety: cdn_bases() reads KIROCREW_CDN_BASE which is operator-set.
     # Reject metacharacters that could enable command injection when the URL
     # flows through wheel_update_command() into ``sh -c``.
-    _SAFE_URL_RE = re.compile(r"^https://[A-Za-z0-9._/:%@~+\-]+$")
-    if not _SAFE_URL_RE.match(feed_base) or not _SAFE_URL_RE.match(artifact_base):
+    if not cdn_bases_are_safe():
         print("  ❌ CDN base URL contains disallowed characters")
         sys.exit(1)
 
@@ -1290,7 +1311,7 @@ def _status(args: argparse.Namespace) -> None:
 def _should_reconcile_launchd_launcher() -> bool:
     """Whether this gateway may repair the shared launchd launcher.
 
-    Only a non-frozen production instance may.
+    Only a production instance running outside the desktop bundle may.
 
     ``LIVE_PROGRAM`` is a per-user path under Application Support that
     ``KIROCREW_HOME`` does not scope, so a dev, pod, or worktree gateway
@@ -1300,16 +1321,22 @@ def _should_reconcile_launchd_launcher() -> bool:
     ``is_default_home`` is reused rather than re-derived so the two cannot drift
     on what counts as the real home.
 
-    A frozen build is excluded for a different reason: the launchd agent is a
-    ``service install`` artifact belonging to a source or pip install, while a
+    A bundled interpreter is excluded for a different reason: the launchd agent is
+    a ``service install`` artifact belonging to a source or pip install, while a
     packaged app manages its own backend lifecycle and supplies environment its
     interpreter needs — notably ``PYTHONPYCACHEPREFIX``, which keeps bytecode out
     of the signed bundle. A launcher naming the bundled executable would be run by
     launchd WITHOUT that environment, so the interpreter would write
     ``__pycache__`` inside the app and invalidate its signature. The packaged app
-    has no business owning this artifact at all.
+    has no business owning this artifact at all. The bundle is identified by its
+    interpreter's location (:func:`platform_compat.is_bundled_interpreter`), which
+    is the one runtime reading of the packaging layout.
     """
-    return sys.platform == "darwin" and not getattr(sys, "frozen", False) and is_default_home()
+    return (
+        sys.platform == "darwin"
+        and not platform_compat.is_bundled_interpreter()
+        and is_default_home()
+    )
 
 
 async def _gateway(
@@ -1410,6 +1437,7 @@ async def _run_task(args: argparse.Namespace) -> None:
         extra_prefixes=cfg.memory.semantic_keys or None,
         episodic_limit=cfg.memory.episodic_max_results,
         embedding_dim=cfg.memory.embedding_dim,
+        decay_rates=cfg.memory.decay_rates or None,
     )
     vector_memory.init()
     # Embeddings are always-on: wire the factory; bind embed_fn when the model

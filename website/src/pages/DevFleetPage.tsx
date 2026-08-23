@@ -20,6 +20,7 @@ import {
   Ellipsis, RotateCw, FileText, GitCommit, Rocket, Info, AlertTriangle, ShieldAlert,
 } from 'lucide-react'
 import * as api from './devFleetApi'
+import { ApiError } from '../api/client'
 
 import { i18nT } from '../i18n/t'
 import { compareText } from '../i18n/format'
@@ -80,6 +81,54 @@ export function gatewayRecovered(
 ): boolean {
   if (capturedId == null || currentId == null) return false
   return String(currentId) !== String(capturedId)
+}
+
+/* ─── Route-independent restart watcher ─── */
+// The restart alive-poll is decoupled from the DevFleetPage React lifecycle so
+// navigating away during the ~6-min build+restart phase does not silently kill
+// the poll. An AbortController scoped to the active restart (not to the
+// component mount) controls cancellation; the only way to abort is an explicit
+// user cancel or a new restart superseding the current one.
+let _restartAc: AbortController | null = null
+
+// Run IDs with a sync-poll loop currently in flight, tracked at MODULE scope so
+// it survives component unmount/remount. The build poll deliberately outlives
+// the DevFleet page (a ~6-min build must still auto-restart if the user leaves),
+// so a naive remount would start a SECOND poll for the same run — two loops that
+// both see `done` and both fire the restart POST. This registry lets a remount
+// detect the in-flight poll and skip re-starting one. Cleared when the loop ends.
+const _activeSyncPolls = new Set<string>()
+
+
+/**
+ * Poll the gateway's health endpoint until it comes back with a different
+ * start_id, then reload the page. Route-independent: survives React unmount.
+ */
+async function awaitGatewayBackGlobal(capturedId: string | null): Promise<'reloaded' | 'timeout' | 'aborted'> {
+  _restartAc?.abort()
+  const ac = new AbortController()
+  _restartAc = ac
+
+  const deadline = Date.now() + RESTART_TIMEOUT_MS
+  await sleep(3000)
+  while (Date.now() < deadline) {
+    if (ac.signal.aborted) return 'aborted'
+    try {
+      if (capturedId == null) {
+        await fetch('/', { signal: AbortSignal.timeout(3000) })
+        window.location.reload()
+        return 'reloaded'
+      }
+      const res = await fetch('/apps/dev-fleet/api/health', { credentials: 'same-origin', signal: AbortSignal.timeout(3000) })
+      if (res.status === 404) { window.location.reload(); return 'reloaded' }
+      if (res.ok) {
+        const j = (await res.json().catch(() => null)) as { start_id?: string | null } | null
+        if (gatewayRecovered(capturedId, j?.start_id)) { window.location.reload(); return 'reloaded' }
+      }
+    } catch { /* gateway down mid-bounce */ }
+    await sleep(2000)
+  }
+  return 'timeout'
 }
 
 /* ─── Provision progress model ─── */
@@ -341,6 +390,13 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
   const [rect, setRect] = useState<DOMRect | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popRef = useRef<HTMLDivElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  const confirmRef = useRef<HTMLButtonElement>(null)
+
+  const close = useCallback(() => {
+    setOpen(false)
+    triggerRef.current?.focus()
+  }, [])
 
   useEffect(() => {
     if (!open) return
@@ -351,21 +407,33 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
       const t = e.target as Node
       if (!triggerRef.current?.contains(t) && !popRef.current?.contains(t)) setOpen(false)
     }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setOpen(false); triggerRef.current?.focus() } }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        close()
+      } else if (e.key === 'Tab' && e.shiftKey && document.activeElement === cancelRef.current) {
+        e.preventDefault()
+        confirmRef.current?.focus()
+      } else if (e.key === 'Tab' && !e.shiftKey && document.activeElement === confirmRef.current) {
+        e.preventDefault()
+        cancelRef.current?.focus()
+      }
+    }
     // position:fixed desyncs from any scrolling ancestor — close on scroll
     // (capture phase catches nested scrollers) and on resize.
     const onScrollOrResize = () => setOpen(false)
     document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
+    // Keep the focus boundary intact even when an action button handles keys.
+    document.addEventListener('keydown', onKey, true)
     window.addEventListener('scroll', onScrollOrResize, true)
     window.addEventListener('resize', onScrollOrResize)
+    cancelRef.current?.focus()
     return () => {
       document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
+      document.removeEventListener('keydown', onKey, true)
       window.removeEventListener('scroll', onScrollOrResize, true)
       window.removeEventListener('resize', onScrollOrResize)
     }
-  }, [open])
+  }, [close, open])
 
   const toggle = () => {
     if (!open && triggerRef.current) setRect(triggerRef.current.getBoundingClientRect())
@@ -398,6 +466,7 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
         <div
           ref={popRef}
           role="dialog"
+          aria-modal="true"
           aria-label={title}
           data-placement={openUp ? 'up' : 'down'}
           style={{ ...posStyle, zIndex: 4000, overflowY: 'auto', background: 'var(--card, #16161a)', border: '1px solid var(--border)', borderRadius: 10, padding: '10px 12px', width: CONFIRM_W, boxShadow: '0 8px 24px rgba(0,0,0,0.45)', textAlign: 'left' as const } as CSSProperties}
@@ -405,8 +474,8 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
           <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 4 }}>{title}</div>
           <div style={{ fontSize: 11.5, color: 'var(--muted)', lineHeight: 1.5, marginBottom: 9 }}>{desc}</div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' } as CSSProperties}>
-            <Btn onClick={() => setOpen(false)}>{i18nT('pages.devFleetPage.cancel')}</Btn>
-            <Btn primary onClick={() => { setOpen(false); onConfirm() }}>{confirmLabel || i18nT('pages.devFleetPage.start')}</Btn>
+            <Btn ref={cancelRef} onClick={close}>{i18nT('pages.devFleetPage.cancel')}</Btn>
+            <Btn ref={confirmRef} primary onClick={() => { close(); onConfirm() }}>{confirmLabel || i18nT('pages.devFleetPage.start')}</Btn>
           </div>
         </div>,
         document.body,
@@ -759,9 +828,56 @@ export default function DevFleetPage() {
   }, [syncRun?.status, provTicking]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function pollSyncRun(rid: string, startedAt: number) {
+    // A poll for this run is already in flight (it outlived a previous mount of
+    // this page, which is intended — the build's auto-restart must not be lost
+    // to navigation). Starting a second loop here would race it: both would see
+    // `done` and both would fire the restart POST. Skip — but start a
+    // lightweight state relay so this mount's UI stays updated.
+    if (_activeSyncPolls.has(rid)) {
+      _syncStateRelay(rid, startedAt)
+      return
+    }
+    _activeSyncPolls.add(rid)
+    try {
+      await _pollSyncRunLoop(rid, startedAt)
+    } finally {
+      _activeSyncPolls.delete(rid)
+    }
+  }
+
+  // Lightweight relay: polls /run to keep THIS mount's syncRun state in sync
+  // while the primary poll (from a prior mount) handles the auto-restart logic.
+  // Exits when the run finishes, the component unmounts, or the run is dismissed.
+  async function _syncStateRelay(rid: string, startedAt: number) {
     for (let i = 0; i < 900; i++) {
       await sleep(2000)
-      if (!pollAliveRef.current || cancelledRunsRef.current.has(rid)) return
+      if (!pollAliveRef.current) return
+      if (cancelledRunsRef.current.has(rid)) return
+      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string } | null = null
+      try { run = await api.get('/run?id=' + rid) } catch { continue }
+      if (!run) continue
+      const t0 = run.started ? run.started * 1000 : startedAt
+      const out = run.output || []
+      const last = [...out].reverse().find((l: string) => l?.trim() && !STEP_MARKER_RE.test(l)) || ''
+      if (run.status === 'done' || run.status === 'timeout') {
+        const okRun = run.exit_code === 0
+        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last })
+        return
+      }
+      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, stepLabel: run.step_label })
+    }
+  }
+
+  async function _pollSyncRunLoop(rid: string, startedAt: number) {
+    for (let i = 0; i < 900; i++) {
+      await sleep(2000)
+      // Explicit dismissal aborts the poll entirely. Component unmount
+      // (navigate-away) does NOT: the build can take ~6 min, and the whole
+      // point of this loop is to auto-restart the gateway when the build
+      // finishes — a restart the user must not lose by leaving the page. So we
+      // keep polling and still issue the restart after unmount; the React state
+      // setters below are safe no-ops once the component is gone.
+      if (cancelledRunsRef.current.has(rid)) return
       let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string } | null = null
       let gone = false
       try { run = await api.get('/run?id=' + rid) } catch (e) {
@@ -791,8 +907,11 @@ export default function DevFleetPage() {
           // just updated static/dist on the live checkout, so applying it only
           // needs a bounce. Skip the confirm dialog since the user already
           // explicitly started Pull+Build knowing it updates their live code.
+          // The restart POST fires even after unmount (navigate-away during the
+          // build): losing it would strand the user on a stale gateway. The
+          // route-independent awaitGatewayBackGlobal handles the reload.
           if (fleet?.gateway_service_active) {
-            notify(i18nT('pages.devFleetPage.pulls_main_rebuilds_then_restarts_automatically'), { type: 'success' })
+            notify(i18nT('pages.devFleetPage.build_finished_restarting_gateway'), { type: 'success' })
             setRestarting(true)
             setGatewayError(null)
             api.post<{ ok?: boolean; error?: string; start_id?: string | null }>('/restart-gateway', {})
@@ -968,12 +1087,33 @@ export default function DevFleetPage() {
     finally { setFlag(name + ':remove', false) }
   }
 
+  // Normalize a failed POST /sync into the shape the caller below already
+  // handles. The single-flight refusal is an HTTP 409 whose body names the run
+  // already in flight, so it arrives as a thrown error and never as a returned
+  // body — which is what left the `!ok && run_id` branch below unreachable.
+  // Every other status is a real failure carrying its message.
+  function syncPostFailure(e: unknown): { ok: false; run_id?: string; error: string } {
+    let rid: unknown
+    if (e instanceof ApiError && e.status === 409) {
+      try { rid = (JSON.parse(e.body) as { run_id?: unknown })?.run_id } catch { /* not JSON */ }
+    }
+    return {
+      ok: false,
+      run_id: typeof rid === 'string' && rid ? rid : undefined,
+      error: (e as Error)?.message || String(e),
+    }
+  }
+
   async function syncMain() {
     setFlag('__syncmain', true)
     try {
-      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {})
+      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {}).catch(syncPostFailure)
       if (!r?.ok && r?.run_id) {
-        // Sync already running — reattach to the in-flight run instead of erroring
+        // Sync already running — reattach to the in-flight run instead of erroring.
+        // A second press is a user who cannot see the run, so an error toast would
+        // leave them exactly where they started. `startedAt` is provisional: the
+        // poll loop recomputes elapsed from the run's own `started` on its first
+        // tick, and it refuses a second loop for a rid already being polled.
         setSyncRun({ rid: r.run_id, status: 'running', lines: [], startedAt: Date.now() })
         pollSyncRun(r.run_id, Date.now())
         return
@@ -1040,12 +1180,17 @@ export default function DevFleetPage() {
         let st: { running?: boolean; done?: number; items?: Record<string, { status?: string; error?: string | null }> } | null = null
         try { st = await api.get('/prune-status') } catch { continue }
         if (!st) continue
-        // Rebuild the item map in the ORIGINAL selection order; fall back to
-        // the pending seed for any name the backend has not populated yet.
+        // Rebuild the item map in the ORIGINAL selection order over the FULL
+        // regular-plus-forced set: the checklist, denominator, and success
+        // tally must all cover every name the backend tracks, forced worktrees
+        // included. Counting over ``names`` alone drops the forced worktrees
+        // from the denominator and the tally, restoring the ``1/0`` counter and
+        // the false failure toast. Fall back to the pending seed for any name
+        // the backend has not populated yet.
         const raw = st.items || {}
-        const backendTotal = Object.keys(raw).length || names.length
+        const backendTotal = Object.keys(raw).length || allNames.length
         const items: Record<string, { status: string; error?: string | null }> =
-          Object.fromEntries(names.map((n) => [n, {
+          Object.fromEntries(allNames.map((n) => [n, {
             status: raw[n]?.status || 'pending',
             error: raw[n]?.error ?? null,
           }]))
@@ -1054,14 +1199,14 @@ export default function DevFleetPage() {
           // A name the backend never tracked (filtered server-side, e.g. the
           // worktree vanished between preview and execute) must terminate as
           // an explained failure, not sit "Pending" in a finished checklist.
-          for (const n of names) {
+          for (const n of allNames) {
             if (!raw[n]) items[n] = { status: 'failed', error: 'not processed (unknown or no longer a worktree)' }
           }
         }
-        setPruneProgress({ names, items, done: st.done || 0, total: names.length, running })
+        setPruneProgress({ names: allNames, items, done: st.done || 0, total: allNames.length, running })
         if (!running) {
-          const removed = names.filter((n) => items[n]?.status === 'done').length
-          const failed = names.filter((n) => items[n]?.status === 'failed').length
+          const removed = allNames.filter((n) => items[n]?.status === 'done').length
+          const failed = allNames.filter((n) => items[n]?.status === 'failed').length
           notify(removed > 0 ? `Pruned ${removed} worktree(s)` + (failed > 0 ? ` (${failed} failed)` : '') : `Prune: ${failed} failed`, { type: removed > 0 ? 'success' : 'error' })
           invalidateAll()
           setTimeout(() => setPruneProgress(null), 5000)
@@ -1077,45 +1222,15 @@ export default function DevFleetPage() {
 
   // Poll until the gateway reports a start identity DIFFERENT from the one
   // captured before the restart, then hard-reload into the fresh process.
-  // `capturedId == null` means the platform can't report identity (non-Linux /
-  // no systemctl) — degrade to the legacy "reload on first response" so those
-  // hosts don't hang in the overlay forever. Returns only on the timeout path;
-  // the success path reloads the page, and the caller clears its own state.
+  // Delegates to the route-independent global watcher so navigating away during
+  // the build phase does not kill the restart poll. The component still manages
+  // the overlay state; the global promise resolves even if the component unmounts.
   async function awaitGatewayBack(capturedId: string | null): Promise<void> {
-    const deadline = Date.now() + RESTART_TIMEOUT_MS
-    await sleep(3000)  // let the detached systemd-run tear the old listener down
-    while (Date.now() < deadline) {
-      if (!pollAliveRef.current) return  // component unmounted — stop the loop
-      try {
-        if (capturedId == null) {
-          // Legacy degrade: no identity to compare, so any answer means "back".
-          await fetch('/', { signal: AbortSignal.timeout(3000) })
-          window.location.reload()
-          return
-        }
-        const res = await fetch('/apps/dev-fleet/api/health', { credentials: 'same-origin', signal: AbortSignal.timeout(3000) })
-        if (res.status === 404) {
-          // The route answered 404, which means a gateway IS serving us — just
-          // one whose dev-fleet backend predates /api/health. That is the normal
-          // outcome of a cutover to an older worktree, and its identity can never
-          // appear, so waiting for one would burn the full timeout. A reachable
-          // 404 during the handshake is therefore recovery: reload into it.
-          window.location.reload()
-          return
-        }
-        if (res.ok) {
-          const j = (await res.json().catch(() => null)) as { start_id?: string | null } | null
-          if (gatewayRecovered(capturedId, j?.start_id)) { window.location.reload(); return }
-          // A reachable health with the SAME id is the OLD process still winding
-          // down (or identity unavailable) — keep waiting, never reload here.
-        }
-      } catch { /* gateway is down mid-bounce — keep polling */ }
-      await sleep(2000)
-    }
+    const result = await awaitGatewayBackGlobal(capturedId)
+    if (result === 'reloaded') return
+    if (result === 'aborted') return
+    // timeout
     setRestarting(false)
-    // Same treatment as a failed restart: the user may have walked away during
-    // the 60s overlay, and a self-dismissing toast leaves a stale page with no
-    // explanation for why it never came back.
     const timedOut = i18nT('pages.devFleetPage.gateway_did_not_come_back_within_60s_reload_the')
     notify(timedOut, { type: 'error' })
     setGatewayError(timedOut)
@@ -1331,7 +1446,7 @@ export default function DevFleetPage() {
   function rowButtons(w: Worktree): ReactNode[] {
     if (w.is_main) {
       const out: ReactNode[] = [
-        <ConfirmBtn key="sync" title={i18nT('pages.devFleetPage.pull_build_main')} desc={fleet?.gateway_service_active ? i18nT('pages.devFleetPage.pulls_main_rebuilds_then_restarts_automatically') : i18nT('pages.devFleetPage.pulls_main_and_rebuilds_6_min_does_not_restart')} confirmLabel={i18nT('pages.devFleetPage.start')} onConfirm={() => syncMain()} btn={{ disabled: !!busy['__syncmain'] || syncRun?.status === 'running' || gatewayMutating }}>
+        <ConfirmBtn key="sync" title={i18nT('pages.devFleetPage.pull_build_main')} desc={fleet?.gateway_service_active ? i18nT('pages.devFleetPage.pulls_main_rebuilds_then_restarts_keep_page_open') : i18nT('pages.devFleetPage.pulls_main_and_rebuilds_6_min_does_not_restart')} confirmLabel={i18nT('pages.devFleetPage.start')} onConfirm={() => syncMain()} btn={{ disabled: !!busy['__syncmain'] || syncRun?.status === 'running' || gatewayMutating }}>
           {iconLabel(<RefreshCw size={13} className="lucide-inline" />, busy['__syncmain'] || syncRun?.status === 'running' ? i18nT('pages.devFleetPage.building') : i18nT('pages.devFleetPage.pull_build_2'))}
         </ConfirmBtn>,
       ]
@@ -1744,11 +1859,11 @@ export default function DevFleetPage() {
       <div className="flex flex-1 min-h-0 overflow-hidden">
         <div className="flex-1 min-w-0 flex flex-col min-h-0">
           <PageHeader title={i18nT('pages.devFleetPage.dev_fleet')} subtitle={i18nT('pages.devFleetPage.manage_the_git_worktrees_of_your_main_checkout_s')} />
-          <div className="flex-1 overflow-y-auto px-6 pb-8 min-h-0">
+          <div className="flex-1 overflow-y-auto px-4 md:px-6 pb-8 min-h-0">
             {/* The how-to describes row actions; with no readable fleet there are
                 no rows, and instructions for absent controls read as a broken page. */}
             {!noFleet && (
-            <p className="text-[12.5px] text-muted leading-relaxed mt-3 mb-1 max-w-[860px]">
+            <p className="text-[12.5px] text-muted leading-relaxed mt-3 mb-1">
               {i18nT('pages.devFleetPage.each_row_below_is_a_git_worktree_discovered_from')}{' '}
               <span className="text-text-strong">{i18nT('pages.devFleetPage.pull_build')}</span> {i18nT('pages.devFleetPage.on_the_main_row_to_fast_forward_it_from_origin_a')} <span className="text-text-strong">{i18nT('pages.devFleetPage.pod_2')}</span> {i18nT('pages.devFleetPage.boots_any_worktree_as_an_isolated_throwaway_gate')}{' '}
               <span className="text-text-strong">{i18nT('pages.devFleetPage.rebase')}</span> {i18nT('pages.devFleetPage.moves_a_feature_branch_onto_the_latest_main_and')}{' '}
@@ -1759,7 +1874,7 @@ export default function DevFleetPage() {
               <div
                 role="note"
                 data-testid="inferred-main-checkout"
-                className="flex items-center gap-2 mt-2 max-w-[860px] text-[12px] leading-relaxed text-text-strong"
+                className="flex items-center gap-2 mt-2 text-[12px] leading-relaxed text-text-strong"
               >
                 <Info size={13} className="lucide-inline shrink-0" />
                 <span>{i18nT('pages.devFleetPage.the_primary_checkout_this_fleet_is_discovered_fr')}:</span>
@@ -1770,7 +1885,7 @@ export default function DevFleetPage() {
               <div
                 role="alert"
                 data-testid="gateway-restart-error"
-                className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger-subtle px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed text-danger"
+                className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger-subtle px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed text-danger"
               >
                 <AlertTriangle size={14} className="lucide-inline shrink-0 mt-0.5" />
                 {/* select-text + break-words: the message can be a pair of
@@ -1790,7 +1905,7 @@ export default function DevFleetPage() {
               <div
                 role="alert"
                 data-testid="serving-install-warning"
-                className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn-subtle px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed text-warn"
+                className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn-subtle px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed text-warn"
               >
                 <AlertTriangle size={14} className="lucide-inline shrink-0 mt-0.5" />
                 <div className="min-w-0">
@@ -1803,7 +1918,7 @@ export default function DevFleetPage() {
             {!podsAvailable && (
               <div
                 role="note"
-                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed"
+                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed"
               >
                 <Info size={14} className="lucide-inline shrink-0 mt-0.5 text-muted" />
                 <div className="min-w-0">
@@ -1816,7 +1931,7 @@ export default function DevFleetPage() {
             {gatewayReason && (
               <div
                 role="note"
-                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed"
+                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed"
               >
                 <Info size={14} className="lucide-inline shrink-0 mt-0.5 text-muted" />
                 <div className="min-w-0">

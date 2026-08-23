@@ -1,7 +1,8 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
 import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
 import type { AudioSample } from '../hooks/mic'
@@ -26,6 +27,7 @@ import TrustDropdown from './TrustDropdown'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { consumeComposerRelease } from '../pages/chat/composerFocus'
 import BusySendButton, { useBusySendMode } from './BusySendButton'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
 import { useImeGuard } from '../hooks/useImeGuard'
@@ -123,6 +125,10 @@ const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
 const INPUT_DRAG_MIN_H = 93
 const FILE_PREVIEW_H = 81 // h-16 (64px) + py-2 (16px) + border-t (1px)
+/** Same strip once any staged image carries a resize pill: the pill sits in flow
+ *  under its thumbnail, so the tallest chip grows by gap-0.5 (2px) + the pill's
+ *  own 18px. Keep in sync with ResizeBadge and FilePreviewStrip. */
+const FILE_PREVIEW_H_RESIZED = 101
 /** Height of the staged-session-reference strip: one chip row (py-1 + 12px text
  *  ≈ 26px) + py-2 (16px) + border-t (1px). Keep in sync with SessionRefStrip. */
 const SESSION_REF_STRIP_H = 43
@@ -274,8 +280,6 @@ interface ChatInputProps {
   isMac?: boolean
   /** Drag-and-drop handler for the entire input bar */
   onDrop?: (e: React.DragEvent) => void
-  /** Whether drag-over styling is active */
-  dragOver?: boolean
   /** Drag-over event handler */
   onDragOver?: (e: React.DragEvent) => void
   /** Drag-leave event handler */
@@ -396,6 +400,9 @@ interface ChatInputProps {
   /** Optional knowledge chip rendered above the input */
   knowledgeChip?: React.ReactNode
   /** When this key changes, focus the textarea (e.g. on chat session switch). */
+  /** Focus-on-switch key. Any new consumer of this prop must honor the
+   *  composerFocus one-shot (consumeComposerRelease) or macOS keyboard
+   *  switches will autofocus through the release — see composerFocus.ts. */
   autoFocusKey?: string | null
   /** Gateway WebSocket connection state. When false, send is blocked and a
    *  warning banner appears above the input. Defaults to true so callers that
@@ -410,7 +417,7 @@ interface ChatInputProps {
   onOptimizeResult?: (slotId: string | null, optimized: string) => void
 }
 
-/** Accent pill on a downscaled attachment chip. Hover (or focus) shows a
+/** Accent pill under a downscaled attachment chip. Hover (or focus) shows a
  *  styled tooltip with the resize details, portal-rendered above the chip so
  *  the strip's overflow-x-auto can't clip it. */
 function ResizeBadge({ resize }: { resize: ResizeInfo }) {
@@ -423,11 +430,21 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   const hide = () => setTip(null)
   return (
     <>
+      {/* In flow under the thumbnail, not overlaid on it. The chip's width comes
+          from the image's aspect ratio, so an overlaid pill has no width to fit
+          into: a phone screenshot gives it a 48px chip, while the widest catalog
+          values need 105px (bn) and 104px (de). Overlaid, that ends as one of
+          two defects — an unbreakable Latin word spilling sideways onto the
+          neighbouring chip, or a per-character-breaking script stacking down and
+          covering the thumbnail. In flow, the chip is simply as wide as the
+          wider of image and pill, so each locale pays only its own width and the
+          thumbnail is never covered in any of them. `whitespace-nowrap` is what
+          makes the chip grow instead of the pill wrapping. */}
       <span
         ref={ref}
         tabIndex={0}
         aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
-        className="absolute bottom-1 left-1 z-10 px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default"
+        className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
         onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}
       >{i18nT('components.chatInput.resized')}</span>
       {tip && createPortal(
@@ -445,18 +462,42 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   )
 }
 
-function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
+/** Stable default so an omitted `dirs` prop does not re-run the remeasure
+ *  effect on every render (a fresh [] literal changes deps each time). */
+const NO_DIRS: string[] = []
+
+function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
+  const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+  // Chips are added and removed while the strip stays mounted (a paste, a
+  // remove), and the scroller keeps its own box through those changes, so the
+  // ResizeObserver never fires and no scroll event lands. Without this the cue
+  // goes stale: dark over a row that now fits, or absent over one that clips.
+  useEffect(() => { remeasure() }, [files, dirs, remeasure])
   const imgs = files.filter(p => IMG_EXT.test(p))
   const nonImgs = files.filter(p => !IMG_EXT.test(p))
   if (!imgs.length && !nonImgs.length && !dirs.length) return null
   return (
-    // NOTE: rendered height must match FILE_PREVIEW_H constant, update both together
-    <div className="flex gap-2 px-5 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-end" data-image-scope="">
+    // The wrapper exists for the edge cues: absolutely-positioned children of
+    // the scroller itself would travel with the scrolled content, so the fades
+    // anchor to a non-scrolling parent, same shape as the sibling strips.
+    <div className="relative">
+      {/* NOTE: rendered height must match FILE_PREVIEW_H / FILE_PREVIEW_H_RESIZED,
+          update them together.
+          items-start, not items-end: a chip carrying a resize pill is taller than a
+          plain one, and bottom-alignment would spend that difference staggering the
+          THUMBNAILS (the thing being compared) instead of letting the pills hang. */}
+      <div ref={attachScroller} data-testid="preview-strip" className="flex gap-2 px-4 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-start" data-image-scope="">
       {imgs.map((path, i) => {
         const src = `/api/file-raw?path=${encodeURIComponent(path)}`
         const resize = resizedInfo?.[path]
         return (
-          <div key={path} className="relative group/preview shrink-0" title={path}>
+          <div key={path} className="group/preview shrink-0 flex flex-col items-start gap-0.5" title={path}>
+            {/* The corner controls anchor to the IMAGE, not to the chip: the chip
+                is as wide as the wider of image and resize pill, so a locale
+                whose pill is wider than the thumbnail (de: 104px pill, 48px
+                image) would otherwise strand the remove button 52px out in the
+                empty space beside the thumbnail it removes. */}
+            <div className="relative">
             <span className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-accent text-accent-fg text-[10px] font-bold flex items-center justify-center z-10">{i + 1}</span>
             <button
               type="button"
@@ -464,10 +505,24 @@ function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir
               className="block cursor-pointer"
               onClick={(e) => { const img = e.currentTarget.querySelector('img'); if (img) dispatchLightbox(img) }}
             >
-              <img src={src} alt={path} className="h-16 rounded border border-border object-contain hover:opacity-80 transition-opacity"
-                data-lightbox-image="" />
+              {/* min-w: the chip's height is fixed and its width follows the
+                  aspect ratio, so a 1170x2532 phone screenshot renders 31px
+                  wide — too narrow to tell one screenshot from another. This is
+                  a floor on recognisability, not part of the overlap fix: with
+                  the pill in flow the overlap is 0 at any width. bg-bg-hover
+                  backs the letterbox bands the floor creates, so the border
+                  reads as a tile rather than a partly-empty frame; it applies to
+                  every image chip, including transparent PNGs. No ceiling: a
+                  panorama makes a wide chip and scrolls its siblings out of view
+                  in this overflow-x-auto strip, but nobody has reported that. */}
+              <img src={src} alt={path} className="h-16 min-w-12 rounded border border-border object-contain bg-bg-hover hover:opacity-80 transition-opacity"
+                data-lightbox-image=""
+                // A thumbnail widens when its bytes arrive (h-16 + intrinsic
+                // ratio), which grows scrollWidth without resizing the
+                // scroller's own box — no ResizeObserver fires and no scroll
+                // lands, so only this load signal can refresh the cue.
+                onLoad={remeasure} />
             </button>
-            {resize && <ResizeBadge resize={resize} />}
             {onRemove && (
               <button
                 aria-label={i18nT('components.chatInput.remove')}
@@ -475,6 +530,8 @@ function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir
                 onClick={() => onRemove(path)} title={i18nT('components.chatInput.remove')}
               ><X className="lucide-inline" /></button>
             )}
+            </div>
+            {resize && <ResizeBadge resize={resize} />}
           </div>
         )
       })}
@@ -511,6 +568,19 @@ function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir
         </div>
         ))
       })()}
+      </div>
+      {/* Edge cues, same treatment as the sibling strips (SidePanelLayout's
+          tab strip, FollowUpBar's scroll row): a gradient says content
+          continues past the clipped edge, because the overlay scrollbar on
+          macOS/iOS leaves no visible sign while idle. from-bg-elevated matches
+          the composer surface the strip sits on. z-10 keeps the fade above the
+          chips' own z-10 badges; pointer-events-none keeps those interactive. */}
+      {edges.left && (
+        <div aria-hidden="true" data-testid="preview-strip-cue-left" className="pointer-events-none absolute left-0 top-px bottom-0 w-6 z-10 bg-gradient-to-r from-bg-elevated to-transparent" />
+      )}
+      {edges.right && (
+        <div aria-hidden="true" data-testid="preview-strip-cue-right" className="pointer-events-none absolute right-0 top-px bottom-0 w-6 z-10 bg-gradient-to-l from-bg-elevated to-transparent" />
+      )}
     </div>
   )
 }
@@ -541,7 +611,6 @@ function ChatInput({
   onRemoveSessionRef,
   isMac = false,
   onDrop,
-  dragOver = false,
   onDragOver,
   onDragLeave,
   voiceRecording = false,
@@ -844,7 +913,12 @@ function ChatInput({
   // Hover detection layer that shows paste previews on mouseover; scroll-synced
   // identically to the backdrop mirror.
   const hoverRef = useRef<PasteHoverHandle>(null)
+  // Id of the open paste-preview tooltip (or null). Wired to the textarea's
+  // aria-describedby so keyboard/screen-reader users get the preview announced
+  // when the caret enters a token — the AT half of the paste-preview a11y fix.
+  const [pastePreviewPanelId, setPastePreviewPanelId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const fileInputId = useId()
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
@@ -994,6 +1068,16 @@ function ChatInput({
   }, [disabled, onFollowUpSend])
   const { botName } = useBranding()
   const isMobile = useIsMobile()
+  const directFilePicker = isMobile || isTouchDevice()
+  const [attachControlRow, controlRowEdges, remeasureControlRow] = useScrollEdges<HTMLDivElement>()
+  // The control row's chips are prop-driven (the auto-nudge loop chip, the
+  // approval-mode picker) and appear or change label while the row keeps its
+  // own box, so neither the ResizeObserver nor a scroll event reports the new
+  // content width — only this remeasure can refresh the cue. Boolean presence,
+  // not the callback itself: the handler's identity may change every render
+  // and would re-run the effect for nothing.
+  const hasAutoNudge = !!onAutoNudgeClick
+  useEffect(() => { remeasureControlRow() }, [hasAutoNudge, autoNudgeLoop, approvalMode, isMobile, remeasureControlRow])
   const ime = useImeGuard()
   const resolvedPlaceholder = placeholder || i18nT('components.chatInput.message_placeholder', { bot: botName })
   // An icon swap alone announces nothing, so the empty-state placeholder carries
@@ -1160,6 +1244,14 @@ function ChatInput({
   const prevAutoFocusKeyRef = useRef<typeof autoFocusKey>(undefined)
   useEffect(() => {
     if (autoFocusKey == null || autoFocusKey === prevAutoFocusKeyRef.current) {
+      prevAutoFocusKeyRef.current = autoFocusKey
+      return
+    }
+    // A keyboard-driven switch released the composer (macOS chord chaining —
+    // see releaseComposerForKeyboardSwitch): consume the one-shot and skip
+    // this transition's autofocus entirely. The ref advances so the
+    // disabled-retry path cannot resurrect the skipped focus later.
+    if (consumeComposerRelease()) {
       prevAutoFocusKeyRef.current = autoFocusKey
       return
     }
@@ -1739,14 +1831,18 @@ function ChatInput({
     const sendKey = sendOnEnter === 'ctrl-enter'
       ? (e.key === 'Enter' && (e.metaKey || e.ctrlKey))
       : (e.key === 'Enter' && !e.shiftKey)
-    if (sendKey && !e.defaultPrevented && !ime.isComposing(e) && !optimizingRef.current) {
-      // preventDefault always fires when sendKey matches so the textarea's
-      // default Enter behavior (newline insert into draft) doesn't leak
-      // through when the gateway is offline. The action itself is gated on
-      // `connected` to match the disabled-state on the Send button.
+    if (sendKey && !e.defaultPrevented) {
+      // The key is ours as soon as it matches the send binding, so claim it before
+      // deciding what to do with it — `claimEnter` suppresses the default and returns
+      // false for an Enter the IME is committing. Every early return below therefore
+      // leaves the draft untouched instead of gaining a newline, which is what the
+      // browser does with an Enter nobody consumed.
+      // The send itself is gated on `connected` to match the Send button's disabled
+      // state, and skipped while a prompt optimization owns the draft.
       // While the composer is busy, Enter follows the split-button mode:
       // steer (default) acts on the text now; queue defers it.
-      e.preventDefault()
+      if (!ime.claimEnter(e)) return
+      if (optimizingRef.current) return
       if (connected) fireComposer()
       return
     }
@@ -1963,6 +2059,9 @@ function ChatInput({
     if (!ta) return
     const ss = ta.selectionStart ?? 0
     const se = ta.selectionEnd ?? 0
+    // Keyboard/AT peek: a collapsed caret landing inside a token opens the
+    // preview (the handle no-ops for a non-collapsed selection).
+    hoverRef.current?.handleCaret(ss, se)
     // Collapsed caret inside a token is handled by the click expander — skip.
     if (ss === se) return
     const ranges = findTokenRanges(ta.value, pasteBlocks)
@@ -2051,12 +2150,16 @@ function ChatInput({
   // compensation must key off both staged families — otherwise a dirs-only
   // strip appears with no wrapper expansion and eats into the textarea.
   const hasFiles = pendingFiles.length > 0 || pendingDirs.length > 0
+  // A resize pill makes the strip taller, so the compensation has to know about
+  // it — otherwise the extra row eats into the textarea.
+  const hasResizedFile = pendingFiles.some(p => IMG_EXT.test(p) && !!resizedInfo?.[p])
   const hasSessionRefs = pendingSessions.length > 0
   /** Combined height of every strip currently stacked above the textarea. The
    *  manual-resize floor and the transient height adjustment below both work off
    *  this total, so adding a strip can never leave one of them counting only
    *  attachments. */
-  const stripH = (hasFiles ? FILE_PREVIEW_H : 0) + (hasSessionRefs ? SESSION_REF_STRIP_H : 0)
+  const stripH = (hasFiles ? (hasResizedFile ? FILE_PREVIEW_H_RESIZED : FILE_PREVIEW_H) : 0)
+    + (hasSessionRefs ? SESSION_REF_STRIP_H : 0)
   const prevStripH = useRef(stripH)
   const dragMinH = INPUT_DRAG_MIN_H + stripH
   const dragMinHRef = useRef(dragMinH)
@@ -2074,7 +2177,7 @@ function ChatInput({
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
-    <div className={`input-area px-5 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
+    <div className={`input-area px-4 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
       style={{ maxWidth: 'var(--mc-input-width, 900px)', ...(manualHeight !== null ? { minHeight: (INPUT_DRAG_MIN_H + stripH) + 'px' } : {}) }}>
 
       {/* Knowledge context chip */}
@@ -2315,9 +2418,9 @@ function ChatInput({
         </div>
       )}
 
-      <input ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="hidden" onChange={handleFileInputChange} />
+      <input id={fileInputId} ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="sr-only" onChange={handleFileInputChange} />
 
-      <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />
+      <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />
 
       {onFileSelect && (
         <FilePickerMenu
@@ -2325,6 +2428,7 @@ function ChatInput({
           anchorRef={inputRef as React.RefObject<HTMLElement>}
           open={filePickerOpen}
           project={project}
+          sendOnEnter={sendOnEnter}
           onFileOpen={onFileOpen}
           onSelect={({ path, relativePath, kind }) => {
             // relativePath already carries a trailing slash for directories
@@ -2342,6 +2446,7 @@ function ChatInput({
         query={skillQuery}
         anchorRef={inputRef as React.RefObject<HTMLElement>}
         open={skillPickerOpen}
+        sendOnEnter={sendOnEnter}
         onSelect={({ leaf }) => {
           // Token left literal — backend appends the skill body; the user still
           // sees their $token marker. Caret-relative replace via shared helper.
@@ -2378,7 +2483,7 @@ function ChatInput({
       <div
         data-testid="input-wrapper"
         ref={wrapperRef}
-        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(cleanMode || memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${dragOver ? 'border-accent bg-accent/10' : cleanMode ? 'border-accent bg-bg-elevated' : memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(cleanMode || memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${cleanMode ? 'border-accent bg-bg-elevated' : memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
 
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -2399,6 +2504,8 @@ function ChatInput({
         <textarea
           ref={inputRef}
           aria-label={i18nT('components.chatInput.message_input')}
+          data-composer-input=""
+          aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
           className={`relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
@@ -2428,7 +2535,11 @@ function ChatInput({
             recordCaret()
           }}
           onKeyDown={handleKeyDown}
-          {...ime.composition}
+          {...ime.bindComposition<HTMLTextAreaElement>({
+            // The paste-hover preview dismisses on blur; the guard's latch reset rides
+            // in the binding itself, so this handler only carries what is local here.
+            onBlur: () => { if (hoverRef.current) hoverRef.current.handleMouseLeave() },
+          })}
           onPaste={handlePaste}
           onCopy={handleCopy}
           onCut={handleCut}
@@ -2441,7 +2552,7 @@ function ChatInput({
           onMouseMove={e => { if (pasteBlocks.length && hoverRef.current) hoverRef.current.handleMouseMove(e) }}
           onMouseLeave={() => { if (hoverRef.current) hoverRef.current.handleMouseLeave() }}
         />
-        {pasteBlocks.length > 0 && <PasteHoverLayer ref={hoverRef} value={value} blocks={pasteBlocks} mirrorRef={mirrorRef} />}
+        {pasteBlocks.length > 0 && <PasteHoverLayer ref={hoverRef} value={value} blocks={pasteBlocks} mirrorRef={mirrorRef} onActivePanelChange={setPastePreviewPanelId} />}
         </div>
 
         {/* Bottom icon row */}
@@ -2449,19 +2560,31 @@ function ChatInput({
           <div className="flex items-center gap-0.5 min-w-0">
             {onUploadFiles && (
               <div className="relative shrink-0" ref={plusWrapRef}>
-                <button
-                  ref={plusBtnRef}
-                  className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
-                  onClick={togglePlus}
-                  disabled={uploading}
-                  aria-haspopup="menu"
-                  aria-expanded={plusOpen}
-                  aria-label={i18nT('components.chatInput.add_files_options')}
-                  title={i18nT('components.chatInput.add_files_options')}
-                >
-                  {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
-                </button>
-                {plusOpen && plusRect && createPortal(
+                {directFilePicker ? (
+                  <label
+                    htmlFor={uploading ? undefined : fileInputId}
+                    aria-disabled={uploading || undefined}
+                    className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? 'opacity-30 cursor-default' : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'}`}
+                    aria-label={i18nT('components.chatInput.attach_files')}
+                    title={i18nT('components.chatInput.attach_files')}
+                  >
+                    {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
+                  </label>
+                ) : (
+                  <button
+                    ref={plusBtnRef}
+                    className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
+                    onClick={togglePlus}
+                    disabled={uploading}
+                    aria-haspopup="menu"
+                    aria-expanded={plusOpen}
+                    aria-label={i18nT('components.chatInput.add_files_options')}
+                    title={i18nT('components.chatInput.add_files_options')}
+                  >
+                    {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
+                  </button>
+                )}
+                {!directFilePicker && plusOpen && plusRect && createPortal(
                   <div
                     ref={plusMenuRef}
                     className="fixed w-[260px] rounded-xl bg-bg-elevated border border-border shadow-xl p-2 animate-slide-up z-[60]"
@@ -2534,7 +2657,13 @@ function ChatInput({
                 )}
               </div>
             )}
-            <div className="flex items-center gap-0.5 min-w-0 overflow-x-auto flex-1">
+            {/* The wrapper exists for the edge cues: absolutely-positioned
+                children of the scroller itself would travel with the scrolled
+                content, so the fades anchor to this non-scrolling parent. It
+                also owns the flex sizing so the scroller keeps filling the
+                row. */}
+            <div className="relative min-w-0 flex-1">
+              <div ref={attachControlRow} data-testid="composer-control-row" className="flex items-center gap-0.5 overflow-x-auto">
 
               {onAutoNudgeClick && (
                 <AutoNudgePopover
@@ -2551,6 +2680,23 @@ function ChatInput({
               )}
               {!isMobile && approvalMode && (
                 <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} />
+              )}
+              </div>
+              {/* Edge cues, same treatment as the sibling strips that already
+                  ship it (FollowUpBar's scroll row, SidePanelLayout's tab
+                  strip): at narrow widths the loop chip and approval picker
+                  clip silently, and the overlay scrollbar on macOS/iOS leaves
+                  no idle trace. from-bg-elevated matches the composer surface.
+                  Deliberately NO z-index: positioned elements already paint
+                  above the row's in-flow buttons, and an explicit z-10 would
+                  win the tree-order tiebreak against the optimizing dim
+                  overlay (also z-10, earlier in the tree), punching an
+                  undimmed wedge through it. */}
+              {controlRowEdges.left && (
+                <div aria-hidden="true" data-testid="control-row-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-bg-elevated to-transparent" />
+              )}
+              {controlRowEdges.right && (
+                <div aria-hidden="true" data-testid="control-row-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-bg-elevated to-transparent" />
               )}
             </div>
             {isMobile && approvalMode && (

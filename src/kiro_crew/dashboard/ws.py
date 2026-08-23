@@ -13,8 +13,9 @@ from aiohttp import WSCloseCode, WSMsgType, web
 from kiro_crew import __version__ as _local_version
 from kiro_crew import shutdown_event
 from kiro_crew.dashboard.chat_utils import effective_session_key, subagent_event_slot
+from kiro_crew.dashboard.handlers.updates import status_update_fields
 from kiro_crew.dashboard.origin import check_origin
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import DashboardState, _safe_folder_tree
 from kiro_crew.dashboard.ws_event_scope import (
     _audit_allow,
     _audit_deny,
@@ -266,7 +267,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
     """GET /api/ws — single multiplexed WebSocket for all real-time events."""
     _check_ws_origin(request)
 
-    from kiro_crew.dashboard.handlers import _log_ring, _update_info
+    from kiro_crew.dashboard.handlers import _log_ring
 
     state: DashboardState = request.app["state"]
     from kiro_crew.dashboard.handlers.source_providers import (
@@ -367,6 +368,18 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             if ws.get("_is_dashboard_user", False)
             else dict(slots_envelope_extras(allowed_events, yolo=state._yolo))
         )
+        # Seed the folder tree on the CONNECT-TIME push (dashboard users only) —
+        # this is the frame that populates the sidebar on a cold page load, so it
+        # is where the client must receive `folders` to group sessions on the
+        # first paint (issue #4127). The broadcast path (_do_slots_broadcast) also
+        # carries it for live folder create/rename/move, but on an idle-gateway
+        # load no broadcast fires before GET /api/chat/folders resolves, so
+        # without this the ungrouped→regrouped flicker survives. App tokens are
+        # excluded (they do not render the chat folder tree), matching the
+        # broadcast decision. `_safe_folder_tree` drops history_count and any
+        # malformed entry (see its docstring).
+        if ws.get("_is_dashboard_user", False):
+            envelope_extras["folders"] = _safe_folder_tree(getattr(state, "_folders", None))
         if not ws.get("_is_dashboard_user", False) and "yolo" in envelope_extras:
             # Handing an app token the live blanket-approval override is a
             # grant of operator security posture, not slot data, and this
@@ -413,11 +426,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     **state.status_snapshot(
                         cron_jobs=_cached_crons,
                         lessons=_cached_lessons,
-                        update_available=bool(_update_info.get("available")),
-                        update_self_updatable=bool(_update_info.get("self_updatable")),
-                        update_checked=bool(_update_info.get("checked")),
-                        update_command=str(_update_info.get("update_command") or ""),
-                        update_channel=str(_update_info.get("channel") or ""),
+                        **status_update_fields(),  # type: ignore[arg-type]
                     ),
                     "version": _local_version,
                     "platform": sys.platform,
