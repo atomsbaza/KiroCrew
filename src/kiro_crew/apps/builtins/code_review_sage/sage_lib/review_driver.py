@@ -347,6 +347,24 @@ def _accepts_activity(dispatch: Callable[..., Any]) -> bool:
     return _accepts_kwarg(dispatch, "on_activity")
 
 
+def _dispatch_with_model(dispatch: Callable[..., Any], task: str, timeout: float,
+                         model: str | None = None, **kwargs: Any) -> dict:
+    """Dispatch one task, refusing to drop an explicit model override.
+
+    Older standalone/test dispatchers remain valid for Auto (``model is None``),
+    but a concrete picker choice must reach the worker or fail closed.
+    """
+    if model is not None:
+        if not _accepts_kwarg(dispatch, "model"):
+            return {
+                "ok": False,
+                "output": "",
+                "error": "review dispatch does not support explicit model overrides",
+            }
+        kwargs["model"] = model
+    return dispatch(task, timeout, **kwargs)
+
+
 def build_review_task(change_link: str) -> str:
     """Single-pass review prompt: ONE isolated session does the WHOLE review —
     design reasoning AND every code-level dimension — in a single turn, and writes
@@ -608,7 +626,8 @@ def _unconfigured_dispatch(task: str, timeout: int = DEFAULT_TASK_TIMEOUT) -> di
 def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = None,
                   run_id: str | None = None,
                   timeout: float = DEFAULT_TASK_TIMEOUT,
-                  keys: list[str] | None = None, confirm=None) -> dict:
+                  keys: list[str] | None = None, confirm=None,
+                  model: str | None = None) -> dict:
     """Publish an ALREADY-RECORDED review to its pull request.
 
     Builds the draft comment bodies from the recorded findings plus the always-on
@@ -629,6 +648,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
     on GitHub, so re-sending one would duplicate it on the pull request. Omitting
     ``keys`` posts everything not yet posted.
     """
+    model = None if not model or model == "auto" else model
     cur = results.read_result(change_id, root, run_id)
     if not cur:
         # No record means no review to publish. Without this the always-on
@@ -740,7 +760,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
         return {"post_ok": False, "post_error": refused, "posted_comments": 0,
                 "design_comment_posted": False, "pending": len(pending),
                 "expected_units": 0, "posted_keys": list(already)}
-    spawn = dispatch(post_prompt, timeout)
+    spawn = _dispatch_with_model(dispatch, post_prompt, timeout, model=model)
     results.adopt_from_shared(change_id, root, run_id)
     after = results.read_result(change_id, root, run_id) or {}
     ok = bool(spawn.get("ok", False))
@@ -937,7 +957,8 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                concurrency: int = 0, timeout: int = DEFAULT_TASK_TIMEOUT,
                generate_report: bool = True, root: Path | None = None,
                progress=None, run_id: str | None = None, cancelled=None,
-               post: bool | None = None, confirm=None) -> dict:
+               post: bool | None = None, confirm=None,
+               model: str | None = None) -> dict:
     """Two-stage per change (bounded concurrency): a Phase-1 gate task, then a
     Phase-2 deep-review task for every usable verdict (PASS / CONCERNS / BLOCK).
     Each task is dispatched to the reusable worker pool (``dispatch``) and the
@@ -973,6 +994,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     if not changes:
         return {"ok": False, "error": "no changes to review", "spawned": 0}
     dispatch = dispatch or _unconfigured_dispatch
+    model = None if not model or model == "auto" else model
     progress = progress or (lambda *a, **k: None)   # (change_id, phase, extra) sink
     is_cancelled = cancelled or (lambda: False)
 
@@ -1016,7 +1038,8 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
 
     def _post_pending(change_id: str, link: str) -> dict:
         return post_recorded(change_id, link, dispatch=dispatch, root=root,
-                             run_id=run_id, timeout=timeout, confirm=confirm)
+                             run_id=run_id, timeout=timeout, confirm=confirm,
+                             model=model)
 
     def _one(link: str) -> dict:
         change_id = _cid(link)
@@ -1095,7 +1118,8 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         if _accepts_kwarg(dispatch, "keep_session_key"):
             review_kwargs["keep_session_key"] = chat_session.chat_key(
                 run_id or "", change_id)
-        review_spawn = dispatch(review_prompt, timeout, **review_kwargs)
+        review_spawn = _dispatch_with_model(
+            dispatch, review_prompt, timeout, model=model, **review_kwargs)
         # The worker writes the shared data/results/<id>.json its prompt names;
         # move it into this run's private dir before reading. Without this the
         # run's dir stays empty and a completed review reports no findings.
@@ -1151,7 +1175,8 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                 followup_prompt: str | None = build_review_followup_task(link)
             except pipeline.adapters.AdapterError:
                 followup_prompt = None
-            followup = (dispatch(followup_prompt, timeout)
+            followup = (_dispatch_with_model(
+                            dispatch, followup_prompt, timeout, model=model)
                         if followup_prompt and (published or not run_id)
                         else {"ok": False})
             if followup.get("ok", False):

@@ -37,7 +37,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 # The app root holds ``sage_lib/``; put it on sys.path so ``from sage_lib import store``
 # resolves on import (mirrors the sys.path setup in sibling ``review_driver.py``).
@@ -46,6 +46,11 @@ if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
 
 try:
+    from kiro_crew.acp.client import (
+        AcpModelUnavailable,
+        advertised_model_ids,
+        model_is_unusable,
+    )
     from kiro_crew.acp.runtime import AcpRuntime
     from kiro_crew.acp.types import (
         EVENT_COMPLETE,
@@ -57,6 +62,16 @@ try:
     )
 except ImportError:  # pragma: no cover - standalone / test fallback
     AcpRuntime = None  # type: ignore[assignment,misc]
+
+    class AcpModelUnavailable(RuntimeError):  # type: ignore[no-redef]
+        """Fallback error for standalone execution without Kiro Crew imports."""
+
+    def advertised_model_ids(entries: object) -> list[str]:
+        return []
+
+    def model_is_unusable(model_id: str, advertised: Sequence[str] | None) -> bool:
+        return False
+
     EVENT_TEXT_CHUNK = "text_chunk"  # type: ignore[assignment]
     EVENT_TOOL_CALL = "tool_call"  # type: ignore[assignment]
     EVENT_PERMISSION_REQUEST = "permission_request"  # type: ignore[assignment]
@@ -308,17 +323,18 @@ class _BatchRuntimeHolder:
         self._agent = agent
         self._work_dir = work_dir
         self._runtime: Optional["AcpRuntime"] = None
+        self._runtime_model: str | None = None
         self._batches = 0
         self._lock = asyncio.Lock()
 
-    async def begin_batch(self) -> None:
+    async def begin_batch(self, model: str | None = None) -> None:
         async with self._lock:
             # Ensure the runtime FIRST, then count the batch. If the spawn raises
             # (unimportable AcpRuntime / transient kiro-cli launch failure), we must
             # NOT leave _batches incremented — otherwise it can never drain back to
             # 0 and the shared subprocess would never be killed (RSS leak that
             # defeats the batch-scoped lifecycle).
-            await self._ensure_runtime_locked()
+            await self._ensure_runtime_locked(model=model)
             self._batches += 1
 
     async def end_batch(self) -> None:
@@ -327,23 +343,26 @@ class _BatchRuntimeHolder:
             rt = None
             if self._batches == 0:
                 rt, self._runtime = self._runtime, None
+                self._runtime_model = None
         if rt is not None:          # kill outside the lock (SIGTERM->SIGKILL can block)
             await self._kill(rt)
 
-    async def acquire(self) -> "AcpRuntime":
+    async def acquire(self, model: str | None = None) -> "AcpRuntime":
         """Return the live shared runtime, spawning/self-healing if needed."""
         async with self._lock:
-            return await self._ensure_runtime_locked()
+            return await self._ensure_runtime_locked(model=model)
 
     async def force_shutdown(self) -> None:
         """Tear the runtime down regardless of batch count (app disable / standalone)."""
         async with self._lock:
             self._batches = 0
             rt, self._runtime = self._runtime, None
+            self._runtime_model = None
         if rt is not None:
             await self._kill(rt)
 
-    async def _ensure_runtime_locked(self) -> "AcpRuntime":
+    async def _ensure_runtime_locked(self, model: str | None = None) -> "AcpRuntime":
+        selected_model = model or None
         rt = self._runtime
         if rt is not None and rt.is_alive():
             return rt
@@ -352,12 +371,13 @@ class _BatchRuntimeHolder:
         if AcpRuntime is None:
             raise RuntimeError("AcpRuntime unavailable (kiro_crew.acp.runtime not importable)")
         # Effort overlay is read by kiro-cli at each session/new, so it must be on
-        # disk before spawn. Keyed on the resolved model (config override -> agent
-        # default). Best-effort — a bad overlay never blocks the review.
+        # disk before spawn. An explicit per-review model owns this overlay key;
+        # Auto keeps the existing agent/config-resolved key.
+        overlay_model = selected_model or _reviewer_model(self._agent)
         if self._work_dir:
             try:
                 _write_effort_overlay(
-                    self._work_dir, _reviewer_model(self._agent),
+                    self._work_dir, overlay_model,
                     _get_review_settings().get("effort", _DEFAULT_EFFORT))
             except Exception:
                 logger.debug("could not write review effort overlay", exc_info=True)
@@ -365,11 +385,15 @@ class _BatchRuntimeHolder:
         # OS sandbox scrubs credential paths/env for this LLM-directed subprocess
         # (GitHub fetch/post run via the `gh` CLI's own auth; the worker only
         # writes data/results and runs `python3 sage_lib/pipeline.py`).
-        rt = AcpRuntime(agent=self._agent, work_dir=self._work_dir, sandbox_mode="auto")
+        rt = AcpRuntime(
+            agent=self._agent, work_dir=self._work_dir, sandbox_mode="auto",
+            model=selected_model,
+        )
         await rt.spawn()
         self._runtime = rt
-        logger.info("code-review-sage runtime spawned (agent=%s, cwd=%s)",
-                    self._agent, self._work_dir)
+        self._runtime_model = selected_model
+        logger.info("code-review-sage runtime spawned (agent=%s, model=%s, cwd=%s)",
+                    self._agent, selected_model or "auto", self._work_dir)
         return rt
 
     async def _kill(self, rt: "AcpRuntime") -> None:
@@ -451,7 +475,7 @@ class ReviewPool:
         await self._audit_tool(handle, ev, request_id=request_id,
                               outcome=outcome)
 
-    async def begin_batch(self) -> None:
+    async def begin_batch(self, model: str | None = None) -> None:
         """Open a review batch — lazily spawns the shared runtime (0->1 runs)."""
         if self._closed:
             raise RuntimeError("ReviewPool is shut down")
@@ -464,7 +488,7 @@ class ReviewPool:
             if eff != self._max:
                 self._max = eff
                 self._sema = asyncio.Semaphore(eff)
-        await self._holder.begin_batch()
+        await self._holder.begin_batch(model=model)
 
     async def end_batch(self) -> None:
         """Close a review batch — kills the runtime once the last batch drains."""
@@ -472,7 +496,8 @@ class ReviewPool:
 
     async def send(self, task: str, timeout: float = DEFAULT_TASK_TIMEOUT,
                    on_activity: Callable[[str, int], None] | None = None,
-                   keep_session_key: str | None = None) -> str:
+                   keep_session_key: str | None = None,
+                   model: str | None = None) -> str:
         """Run one review task on its own session of the shared runtime and return
         the final assistant text. Auto-approves every tool permission (the reviewer
         runs the `gh` CLI + shell) and emits a per-tool SEL audit.
@@ -485,16 +510,34 @@ class ReviewPool:
         adoption is not a review failure: the handle falls through to the normal
         destroy and the review result is returned unchanged.
         """
+        model = None if not model or model == "auto" else model
         if self._closed:
             raise RuntimeError("ReviewPool is shut down")
         async with self._sema:
-            runtime = await self._holder.acquire()
+            if model is None:
+                runtime = await self._holder.acquire()
+            else:
+                runtime = await self._holder.acquire(model=model)
             handle = None
             adopted = False
             try:
-                # agent=None -> inherit the runtime's agent (spawned with --agent);
-                # cwd=app root so relative prompt paths + the effort overlay resolve.
+                # Explicit picks are checked against this session's live ACP
+                # entitlement before any prompt is sent. A missing advertised set
+                # means entitlement is unknown and the shared predicate allows the
+                # wire request; a known set rejects before set_model can substitute.
                 handle = await runtime.create_session(cwd=self._work_dir, agent=None)
+                if model:
+                    advertised = advertised_model_ids(
+                        getattr(handle, "available_models", [])
+                    )
+                    if model_is_unusable(model, advertised):
+                        raise AcpModelUnavailable(model, advertised)
+                    set_model = getattr(handle, "set_model", None)
+                    if not callable(set_model):
+                        raise RuntimeError(
+                            "review session cannot apply an explicit model override"
+                        )
+                    await set_model(model)
                 gen = handle.prompt(task, timeout=timeout)
                 parts: list[str] = []
                 stop_reason = ""
@@ -685,14 +728,15 @@ def make_sync_dispatch(
 
     def dispatch(task: str, timeout: float = default_timeout,
                  on_activity: Callable[[str, int], None] | None = None,
-                 keep_session_key: str | None = None) -> dict:
+                 keep_session_key: str | None = None,
+                 model: str | None = None) -> dict:
         try:
             # The callback fires on the gateway loop's thread while the driver's
             # worker thread blocks here; the progress writer it feeds is lock-
             # guarded and copy-on-write, so that crossing is safe.
             fut = asyncio.run_coroutine_threadsafe(
                 pool.send(task, timeout=timeout, on_activity=on_activity,
-                          keep_session_key=keep_session_key), loop)
+                          keep_session_key=keep_session_key, model=model), loop)
             # Give the bridge a little headroom past the task timeout so the
             # pool's own timeout fires first with a cleaner error.
             out = fut.result(timeout=timeout + 60)

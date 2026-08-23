@@ -9,6 +9,7 @@ import DagView from './aidlc/DagView';
 import PhasedView from './aidlc/PhasedView';
 import TaskDetailPanel from './aidlc/TaskDetailPanel';
 import { api } from '../api/client';
+import ReviewFixTaskPanel, { type ReviewFixTaskTransport } from '../components/ReviewFixTaskPanel';
 import { AlertTriangle, Download, Hourglass } from 'lucide-react';
 
 import { i18nT } from '../i18n/t'
@@ -28,6 +29,11 @@ interface Props {
   onRetry?: (index: number) => void;
   onRefresh?: () => void;
 }
+
+const reviewFixTransport: ReviewFixTaskTransport = {
+  status: (taskId) => api.reviewFixStatus(taskId),
+  action: (taskId, input) => api.reviewFixAction(taskId, input),
+};
 
 const tabCls = (active: boolean) =>
   `px-4 py-1.5 text-[13px] rounded cursor-pointer border transition-all ${active ? 'bg-accent text-accent-fg border-accent' : 'bg-transparent text-muted border-border hover:text-text hover:border-border-strong'}`;
@@ -159,6 +165,10 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
     }
   }, [run.task_details, run.task_id, run.status, updateSingleTask]);
 
+  if (run.review_fix) {
+    return <ReviewFixDetail taskId={run.task_id} />;
+  }
+
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
       <div className="flex-1 min-w-0 flex flex-col min-h-0">
@@ -246,6 +256,21 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
           </motion.div>
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+function ReviewFixDetail({ taskId }: { taskId: string }) {
+  const navigate = useNavigate();
+  return (
+    <div className="flex-1 min-h-0 overflow-auto p-4">
+      <ReviewFixTaskPanel
+        taskId={taskId}
+        transport={reviewFixTransport}
+        onOpenChat={(link) => {
+          if (link.slot_id) navigate(`/chat?slot=${encodeURIComponent(link.slot_id)}`);
+        }}
+      />
     </div>
   );
 }

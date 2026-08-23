@@ -10,7 +10,7 @@
 // to be, under the repo picker that scopes them. Folding them into the rail
 // leaves the whole rest of the window to the report, which is the widest thing
 // the app renders.
-import { Brain, ScanSearch, Settings } from 'lucide-react'
+import { Brain, GitBranch, ScanSearch, Settings } from 'lucide-react'
 
 import { useSage } from '../context'
 import MiddleColumn from './MiddleColumn'
@@ -54,11 +54,33 @@ function NavRow({
   )
 }
 
-export default function LeftRail() {
+export default function LeftRail({
+  collapsed = false,
+  onExpand,
+}: {
+  collapsed?: boolean
+  onExpand?: () => void
+}) {
   const { mainView, setMainView } = useSage()
   // Resolved once so the visible text and the `title` that reveals it when it
   // truncates cannot drift apart.
   const appName = i18nT('apps.codeReviewSage.components.leftRail.code_review_sage')
+
+  if (collapsed) {
+    return (
+      <aside className="flex-1 min-w-0 flex flex-col items-center min-h-0 py-2">
+        <button
+          type="button"
+          aria-label={i18nT('app.expand_sidebar')}
+          title={i18nT('app.expand_sidebar')}
+          onClick={() => onExpand?.()}
+          className="inline-flex items-center justify-center rounded-md p-1.5 cursor-pointer transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent/40 bg-transparent text-muted hover:text-text hover:bg-bg-hover"
+        >
+          <ScanSearch size={16} className="text-accent" aria-hidden="true" />
+        </button>
+      </aside>
+    )
+  }
 
   return (
     <aside className="flex-1 min-w-0 flex flex-col min-h-0 py-2 gap-2">
@@ -88,6 +110,12 @@ export default function LeftRail() {
           onClick={() => setMainView('reviews')}
         />
         <NavRow
+          label={i18nT('apps.codeReviewSage.components.localReview.local')}
+          icon={GitBranch}
+          active={mainView === 'local'}
+          onClick={() => setMainView('local')}
+        />
+        <NavRow
           label={i18nT('apps.codeReviewSage.components.leftRail.learning')}
           icon={Brain}
           active={mainView === 'learning'}
@@ -112,7 +140,7 @@ export default function LeftRail() {
         <div className="flex-1 min-h-0 mx-2 overflow-hidden rounded-xl border border-border bg-bg-elevated shadow-sm flex flex-col">
           <LearningRail />
         </div>
-      ) : mainView === 'settings' ? (
+      ) : mainView === 'settings' || mainView === 'local' ? (
         <div className="flex-1 min-h-0" />
       ) : (
         <>

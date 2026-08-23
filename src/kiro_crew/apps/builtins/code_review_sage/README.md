@@ -1,12 +1,18 @@
 # Code Review Sage
 
-A self-evolving deep code reviewer packaged as a built-in KiroCrew app. Reviews
-**GitHub pull requests**, learns per-repository from shipped fixes + review
+A self-evolving code reviewer packaged as a built-in Kiro Crew app. Reviews
+**local Git working trees first**, learns per-repository from shipped fixes + review
 comments + design discussions, and produces a prioritized **Focus Report** so
 you know which changes actually deserve scrutiny. Findings are read **in the
 app**, next to the pull request they came from — nothing is written to the pull
 request unless you turn on `review.auto_post`, which publishes them as a PENDING
 (draft) review for you to submit.
+
+The Local view is the review → feedback → fix loop for uncommitted changes. It
+fingerprints the reviewed working tree, validates every inline finding against an
+added line, persists dispositions and human guidance, and refuses a fix when the
+working tree has moved since the review. The fix agent receives only the selected
+findings and never commits or pushes on the user's behalf.
 
 ## Ask the reviewer
 

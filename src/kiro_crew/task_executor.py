@@ -55,6 +55,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _uses_generic_git_commit(run: Project) -> bool:
+    """Keep per-task Git commits enabled only for ordinary Task Runner runs."""
+    return bool(
+        run.branch_name
+        and run.execution_mode != "review_fix"
+        and run.commit_policy != "manual_group"
+    )
+
+
+async def _pin_review_fix_model(run: Project, client) -> None:
+    """Pin every review-fix turn to the concrete model captured at creation."""
+    if run.execution_mode != "review_fix" or not run.review_fix:
+        return
+    model_id = run.review_fix.model.resolved_model_id
+    if not model_id:
+        raise RuntimeError("review-fix model resolution is incomplete")
+    setter = getattr(client, "set_model", None)
+    if not callable(setter):
+        raise RuntimeError("review-fix provider cannot pin a model")
+    await setter(model_id)
+
+
 async def _check_error_loop(
     task: "Task",
     consecutive: int,
@@ -202,7 +224,7 @@ async def execute_single_task(
 
     if success:
         committed = False
-        if run.branch_name:
+        if _uses_generic_git_commit(run):
             try:
                 sha = await git_coord.commit_step(run, task)
                 committed = bool(sha)
@@ -212,7 +234,7 @@ async def execute_single_task(
         task.status = TaskStatus.REVIEWING
         review_ok = await self_review(run, task, sessions, agent, session_key)
         if not review_ok:
-            if committed and run.branch_name:
+            if committed and _uses_generic_git_commit(run):
                 try:
                     await git_coord.revert_step(run)
                 except Exception:
@@ -325,6 +347,7 @@ async def execute_task(
                 cwd=str(work_dir) if work_dir else None,
             )
             _acquired = True
+            await _pin_review_fix_model(run, client)
 
             task_prompt = await build_task_prompt(run, task, attempt, work_dir)
             if ctx:
@@ -827,7 +850,13 @@ async def self_review(
         diff = ""
         if run.branch_name:
             try:
-                diff = await git_coord.get_step_diff(run)
+                if run.execution_mode == "review_fix" and run.review_fix:
+                    from kiro_crew.review_fix_git import candidate_patch
+
+                    base_sha = run.review_fix.target.head_sha or run.review_fix.source_head_sha
+                    diff = (await candidate_patch(run.work_dir, base_sha)).patch_text
+                else:
+                    diff = await git_coord.get_step_diff(run)
             except Exception:
                 pass
 
@@ -862,6 +891,7 @@ async def self_review(
             agent=agent or None,
             cwd=str(run.work_dir) if run.work_dir else None,
         )
+        await _pin_review_fix_model(run, client)
         # Wall clock for the review turn (see execute_task): the acp provider
         # reports no duration, so this local measurement is the fallback. Bracket
         # ONLY the model stream, not open_task_session / diff fetch / prompt build.
@@ -990,6 +1020,7 @@ async def run_tests(test_cmd: list[str], work_dir: Path) -> tuple[bool, str]:
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
         )
+        assert proc is not None
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TEST_TIMEOUT)
         output = stdout.decode(errors="replace") if stdout else ""
         success = proc.returncode == 0

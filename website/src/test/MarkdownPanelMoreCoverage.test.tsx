@@ -57,6 +57,7 @@ interface ModifiedStub {
   revealLineInCenter: (line: number) => void
 }
 interface EditorStub {
+  layout: (dimension?: { width: number; height: number }) => void
   onDidUpdateDiff: (cb: () => void) => { dispose: () => void }
   getLineChanges: () => { modifiedStartLineNumber: number }[]
   getModifiedEditor: () => ModifiedStub
@@ -64,6 +65,7 @@ interface EditorStub {
 
 const monaco = {
   defineTheme: vi.fn(),
+  layout: vi.fn(),
   revealLineInCenter: vi.fn(),
   /** Value the modified editor reports — what an edit forwards to the owner. */
   modifiedValue: 'edited inside monaco',
@@ -89,6 +91,7 @@ function makeEditorStub(): EditorStub {
     revealLineInCenter: monaco.revealLineInCenter,
   }
   return {
+    layout: monaco.layout,
     onDidUpdateDiff: (cb) => { monaco.updateDiff = cb; return { dispose: () => {} } },
     getLineChanges: () => [{ modifiedStartLineNumber: 4 }],
     getModifiedEditor: () => modified,
@@ -97,10 +100,11 @@ function makeEditorStub(): EditorStub {
 
 vi.mock('@monaco-editor/react', () => ({
   default: ({ value }: { value?: string }) => <div data-testid="monaco" data-value={value} />,
-  DiffEditor: ({ beforeMount, onMount, modified }: {
+  DiffEditor: ({ beforeMount, onMount, modified, options }: {
     beforeMount?: (m: { editor: { defineTheme: (n: string, t: unknown) => void } }) => void
     onMount?: (e: EditorStub) => void
     modified?: string
+    options?: { automaticLayout?: boolean }
   }) => {
     useEffect(() => {
       beforeMount?.({ editor: { defineTheme: monaco.defineTheme } })
@@ -109,7 +113,7 @@ vi.mock('@monaco-editor/react', () => ({
       // change would re-register listeners the component never disposes.
       // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only, mirrors Monaco's own contract
     }, [])
-    return <div data-testid="monaco-diff" data-modified={modified} />
+    return <div data-testid="monaco-diff" data-modified={modified} data-automatic-layout={String(options?.automaticLayout)} />
   },
   loader: { config: () => {} },
 }))
@@ -186,6 +190,7 @@ beforeEach(() => {
   localStorage.clear()
   document.getElementById('mc-comment-hl-style')?.remove()
   monaco.modifiedValue = 'edited inside monaco'
+  monaco.layout.mockClear()
   monaco.selectionText = null
   monaco.updateDiff = undefined
   monaco.contentChange = undefined
@@ -465,7 +470,8 @@ describe('MarkdownPanel — comment highlight pointer handling', () => {
 describe('MarkdownPanel — Monaco diff wiring', () => {
   it('registers both editor themes exactly once and jumps to the first change', async () => {
     mountPanel({ initialDiffMode: true })
-    await screen.findByTestId('monaco-diff')
+    const editor = await screen.findByTestId('monaco-diff')
+    expect(editor).toHaveAttribute('data-automatic-layout', 'false')
     const themes = monaco.defineTheme.mock.calls.map(([name]) => name)
     expect(themes).toEqual(['kirocrew-dark', 'kirocrew-light'])
 

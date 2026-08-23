@@ -8,21 +8,35 @@
 //
 // Reports are the widest content in the app (finding bodies, diffs, check
 // tables), so the space belongs to them.
+import { useEffect } from 'react'
 import { ScanSearch } from 'lucide-react'
 
-import { useColumnResize } from '../../hooks/useColumnResize'
+import { useColumnResize, type CollapseConfig } from '../../hooks/useColumnResize'
+import { useIsMobile } from '../../hooks/useIsMobile'
 import EmptyState from './components/EmptyState'
 import LeftRail from './components/LeftRail'
 import PrReviewDetail from './components/PrReviewDetail'
 import RunDetail from './components/RunDetail'
 import { useSage } from './context'
 import {
-  MAX_RAIL_WIDTH, MIN_RAIL_WIDTH, RAIL_WIDTH_KEY, loadRailWidth,
+  COLLAPSED_RAIL_WIDTH, MAX_RAIL_WIDTH, MIN_RAIL_WIDTH, RAIL_COLLAPSED_KEY,
+  RAIL_WIDTH_KEY, loadRailCollapsed, loadRailWidth,
 } from './lib/layout'
 import LearningView from './views/LearningView'
 import SettingsView from './views/SettingsView'
+import LocalReviewView from './views/LocalReviewView'
 
 import { i18nT } from '../../i18n/t'
+
+// Module-level so the hook's memoised resolver is not recreated on every render.
+const RAIL_COLLAPSE: CollapseConfig = {
+  width: COLLAPSED_RAIL_WIDTH,
+  storageKey: RAIL_COLLAPSED_KEY,
+  // A phone needs a drill-down: the expanded rail owns the viewport and the
+  // detail pane returns when a review is selected.
+  whenNarrow: true,
+}
+
 /** The 6px vertical drag handle between two columns. */
 function Splitter({ handleProps, label }: {
   handleProps: ReturnType<typeof useColumnResize>['handleProps']
@@ -43,18 +57,35 @@ function Splitter({ handleProps, label }: {
 
 export default function Workspace() {
   const { mainView, activeRun, selectedPr } = useSage()
+  const isMobile = useIsMobile()
+  const rail = useColumnResize(
+    RAIL_WIDTH_KEY, loadRailWidth, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH,
+    RAIL_COLLAPSE, loadRailCollapsed,
+  )
+  const mobileRailOpen = isMobile && !rail.collapsed
+  const collapseRail = rail.collapse
+  const mainClassName = `flex-1 min-w-0 min-h-0 flex-col ${mobileRailOpen ? 'hidden' : 'flex'}`
 
-  const rail = useColumnResize(RAIL_WIDTH_KEY, loadRailWidth, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH)
+  // A selected review belongs in the detail pane. Collapse the expanded mobile
+  // rail after selection so the report is not left in a 48px-wide sliver.
+  useEffect(() => {
+    if (isMobile && (selectedPr || activeRun)) collapseRail()
+  }, [activeRun, collapseRail, isMobile, selectedPr])
 
   return (
     // overflow-hidden so a mis-sized child can never grow the shell past the
     // viewport and push the rail's identity footer below the fold — each column
     // owns its own scrolling.
     <div className="flex h-full overflow-hidden bg-bg text-text">
-      <div style={{ width: rail.width }} className="flex-shrink-0 min-h-0 flex">
-        <LeftRail />
+      <div
+        style={{ width: mobileRailOpen ? '100%' : rail.width }}
+        className="flex-shrink-0 min-h-0 flex"
+      >
+        <LeftRail collapsed={rail.collapsed} onExpand={rail.expand} />
       </div>
-      <Splitter handleProps={rail.handleProps} label={i18nT('apps.codeReviewSage.workspace.resize_sidebar')} />
+      {!isMobile && (
+        <Splitter handleProps={rail.handleProps} label={i18nT('apps.codeReviewSage.workspace.resize_sidebar')} />
+      )}
 
       {mainView === 'reviews' ? (
         <>
@@ -63,7 +94,7 @@ export default function Workspace() {
               child) sizes itself with flex-1, which is inert unless this element
               is itself a flex container — that bug left the empty state
               collapsed to content height and pinned to the top of the pane. */}
-          <main className="flex-1 min-w-0 min-h-0 flex flex-col">
+          <main className={mainClassName}>
             {selectedPr ? (
               <PrReviewDetail pr={selectedPr} />
             ) : activeRun ? (
@@ -77,10 +108,12 @@ export default function Workspace() {
             )}
           </main>
         </>
+      ) : mainView === 'local' ? (
+        <main className={mainClassName}><LocalReviewView /></main>
       ) : mainView === 'learning' ? (
-        <main className="flex-1 min-w-0 min-h-0 flex flex-col"><LearningView /></main>
+        <main className={mainClassName}><LearningView /></main>
       ) : (
-        <main className="flex-1 min-w-0 min-h-0 flex flex-col"><SettingsView /></main>
+        <main className={mainClassName}><SettingsView /></main>
       )}
     </div>
   )

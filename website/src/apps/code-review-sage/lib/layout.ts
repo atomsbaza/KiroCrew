@@ -5,6 +5,7 @@
 // Issue Radar's column width leak into Sage's).
 
 export const RAIL_WIDTH_KEY = 'kc:code-review-sage:rail-width'
+export const RAIL_COLLAPSED_KEY = 'kc:code-review-sage:rail-collapsed'
 export const LIST_WIDTH_KEY = 'kc:code-review-sage:list-width'
 
 /** Wider than Issue Radar's rail (`w-72`), because this one carries the pull
@@ -13,6 +14,8 @@ export const LIST_WIDTH_KEY = 'kc:code-review-sage:list-width'
 export const DEFAULT_RAIL_WIDTH = 360
 export const MIN_RAIL_WIDTH = 280
 export const MAX_RAIL_WIDTH = 560
+/** The narrow strip keeps navigation reachable while the detail pane owns the viewport. */
+export const COLLAPSED_RAIL_WIDTH = 48
 
 export const DEFAULT_LIST_WIDTH = 330
 export const MIN_LIST_WIDTH = 260
@@ -33,6 +36,14 @@ function loadWidth(key: string, min: number, max: number, fallback: number): num
 
 export function loadRailWidth(): number {
   return loadWidth(RAIL_WIDTH_KEY, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, DEFAULT_RAIL_WIDTH)
+}
+
+export function loadRailCollapsed(): boolean {
+  try {
+    return localStorage.getItem(RAIL_COLLAPSED_KEY) === '1'
+  } catch {
+    return false
+  }
 }
 
 export function loadListWidth(): number {

@@ -9,7 +9,7 @@ interface MockDiffEditorProps {
   modified?: string
   language?: string
   theme?: string
-  options?: { renderSideBySide?: boolean; lineNumbers?: string; useInlineViewWhenSpaceIsLimited?: boolean }
+  options?: { renderSideBySide?: boolean; lineNumbers?: string; useInlineViewWhenSpaceIsLimited?: boolean; automaticLayout?: boolean }
 }
 
 vi.mock('@monaco-editor/react', () => ({
@@ -23,6 +23,7 @@ vi.mock('@monaco-editor/react', () => ({
       data-side-by-side={String(options?.renderSideBySide)}
       data-inline-when-narrow={String(options?.useInlineViewWhenSpaceIsLimited)}
       data-line-numbers={String(options?.lineNumbers)}
+      data-automatic-layout={String(options?.automaticLayout)}
     />
   ),
   loader: { config: () => {} },
@@ -128,6 +129,12 @@ describe('DiffPanel', () => {
     render(<DiffPanel filePath="/x/a.ts" original="" modified="" lineNumbers />)
     const editor = await screen.findByTestId('monaco-diff')
     expect(editor.getAttribute('data-line-numbers')).toBe('on')
+  })
+
+  it('uses explicit host-driven layout instead of Monaco automatic layout', async () => {
+    render(<DiffPanel filePath="/x/a.ts" original="a" modified="b" />)
+    const editor = await screen.findByTestId('monaco-diff')
+    expect(editor.getAttribute('data-automatic-layout')).toBe('false')
   })
 
   it('uses light theme by default (useIsDark stubbed to false)', async () => {
