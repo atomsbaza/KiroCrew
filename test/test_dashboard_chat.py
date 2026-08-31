@@ -226,11 +226,14 @@ class TestChatSlot:
         carries a ready ``label`` because PROJ-123 is the whole identifier --
         the number alone is meaningless outside its project.
 
-        ``repo`` is still sent, and that overlap is deliberate rather than
-        leftover: the renderer that shipped before ``label`` assembles the Jira
-        chip name from it, and an already-open tab is not reloaded on an upgrade
-        that does not change ``kiro_crew.__version__``. Asserted so the field
-        cannot be dropped by accident before a release has passed.
+        ``repo`` is NOT sent. It carried Jira's project key only so that a
+        renderer predating ``label`` -- which assembles the Jira chip name as
+        ``{repo}-{number}`` -- would not print ``undefined-123`` in an
+        already-open tab, since a restart without a ``kiro_crew.__version__``
+        bump never trips the reload-on-upgrade guard. Releases have shipped past
+        the change that introduced ``label``, so no such bundle can still be
+        live. Absence is asserted rather than left unpinned so the field cannot
+        drift back in and grow a second naming rule.
         """
         slot = _ChatSlot("s1")
         slot.append("user", "Please look at https://acme.atlassian.net/browse/PROJ-123", ts="t1")
@@ -241,7 +244,7 @@ class TestChatSlot:
         assert link["provider"] == "jira"
         assert link["kind"] == "issue"
         assert link["label"] == "PROJ-123"
-        assert link["repo"] == "PROJ"
+        assert "repo" not in link
         assert link["number"] == 123
         assert link["url"] == "https://acme.atlassian.net/browse/PROJ-123"
 
@@ -6301,6 +6304,59 @@ class TestTokenUsageSurface:
         assert persist.await_args.kwargs["surface"] == "slack"
 
 
+class TestCostOnlyTurnPersistGate:
+    """The chat_runner turn-end persist gate must fire on ``cost_usd`` alone.
+
+    A claude-seam turn ending via a synthetic EVENT_COMPLETE (timeout,
+    tool-stall, cancel-unacked) can carry cost with zero tokens and zero
+    credits; the footer already reads ``_u.cost_usd`` off the same event, so
+    only the gate stood between the cost and the usage store (#6758).
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_cost_only_turn_persists_its_row(self, tmp_path, monkeypatch):
+        """Mutation guard: dropping the gate's ``cost_usd`` conjunct makes the
+        persist call disappear and this fail."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        events = [LLMEvent(kind=EVENT_COMPLETE, usage=TurnUsage(cost_usd=0.42))]
+        state = TestTokenPersistenceBackfill._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = TestTokenPersistenceBackfill._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        persist = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.persist_token_record_async", persist)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        assert persist.await_count == 1
+        assert persist.await_args.args[2].usage.cost_usd == pytest.approx(0.42)
+
+    @pytest.mark.asyncio
+    async def test_an_all_zero_turn_still_writes_no_row(self, tmp_path, monkeypatch):
+        """The widened gate must not have become unconditional: a turn whose
+        usage carries no billing dimension at all stays out of the store."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        events = [LLMEvent(kind=EVENT_COMPLETE, usage=TurnUsage())]
+        state = TestTokenPersistenceBackfill._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = TestTokenPersistenceBackfill._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        persist = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.persist_token_record_async", persist)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        persist.assert_not_awaited()
+
+
 class TestKiroBackfillProfileGuard:
     """Regression tests for the kiro/acp backfill must NOT store a
     resolved Bedrock inference-profile id into slot.model.
@@ -9283,6 +9339,11 @@ class TestOrchestratorPlanGateArming:
     def _make_mock_client(events):
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
+        client.context_window_tokens = MagicMock(return_value=0)
+        client.context_used_tokens = MagicMock(return_value=0)
+        client.available_models = MagicMock(return_value=[])
+        client.client = MagicMock()
+        client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
 
         async def _stream(msg):
             for ev in events:
@@ -11721,6 +11782,222 @@ class TestFolderCRUD:
             resp = await client.get("/api/chat/slots")
             slots = await resp.json()
             assert any(s["folder_id"] == "f-abc" for s in slots)
+
+
+class TestFolderTags:
+    """Folder `tags` — vocabulary-constrained list persisted on create/update,
+    and stripped from folders when a tag is deleted (issue #5419)."""
+
+    @staticmethod
+    def _seed_vocabulary(state, tag_ids):
+        state._tags = [
+            {"id": tid, "name": tid, "color": "#6b7280", "order": i}
+            for i, tid in enumerate(tag_ids)
+        ]
+        # A directly-seeded vocabulary is authoritative by definition — the
+        # constructor fails closed (False) until load_tags() runs.
+        state._tags_authoritative = True
+
+    @staticmethod
+    def _app_with_tag_delete(state):
+        """Folder endpoints plus the tag-delete route, on one app."""
+        from kiro_crew.dashboard.chat_tags import api_chat_tag_delete
+
+        app = _make_folder_app(state)
+        app.router.add_delete("/api/chat/tags/{id}", api_chat_tag_delete)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_create_and_update_with_valid_tags_persists(self, tmp_path, monkeypatch):
+        """(a) Create with valid tags persists them; PATCH replaces the set."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1", "t2", "t3"])
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/folders", json={"name": "Payments", "tags": ["t1", "t2"]}
+            )
+            assert resp.status == 201
+            data = await resp.json()
+            assert data["tags"] == ["t1", "t2"]
+            fid = data["id"]
+            # Reloaded from the store reflects the persisted list.
+            assert state._folders[0]["tags"] == ["t1", "t2"]
+
+            # PATCH replaces the tag set.
+            resp = await client.patch(f"/api/chat/folders/{fid}", json={"tags": ["t3"]})
+            assert resp.status == 200
+            assert state._folders[0]["tags"] == ["t3"]
+
+            # An empty list clears the key entirely (absent means no tags).
+            resp = await client.patch(f"/api/chat/folders/{fid}", json={"tags": []})
+            assert resp.status == 200
+            assert "tags" not in state._folders[0]
+
+    @pytest.mark.asyncio
+    async def test_create_dedupes_tags(self, tmp_path, monkeypatch):
+        """Duplicates collapse (order preserved) and a valid set persists."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1", "t2"])
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/folders", json={"name": "Dupes", "tags": ["t1", "t1", "t2"]}
+            )
+            assert resp.status == 201
+            assert (await resp.json())["tags"] == ["t1", "t2"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_vocabulary_id_does_not_crash_validation(self, tmp_path, monkeypatch):
+        """A malformed persisted vocabulary entry (non-string ``id`` — e.g. a
+        hand-edited tags.json carrying a list) must degrade to "unknown id"
+        rather than crash the validator's set build with an unhashable type
+        (which would 500 every folder-tag operation)."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1"])
+        # Corrupt entries alongside the valid one: unhashable id, missing id.
+        state._tags.append({"id": ["not", "a", "string"], "name": "bad"})
+        state._tags.append({"name": "no-id"})
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/folders", json={"name": "Robust", "tags": ["t1", "t9"]}
+            )
+            assert resp.status == 201
+            # The valid id survives; the unknown one is filtered; no crash.
+            assert (await resp.json())["tags"] == ["t1"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_vocab_does_not_wipe_folder_tags(self, tmp_path, monkeypatch):
+        """FAIL-OPEN parity with ``validate_folder_tag_ids``: when tags.json
+        was unreadable at boot (vocabulary UNKNOWN, ``_tags_authoritative``
+        False), a folder PATCH carrying ``tags`` must keep the ids rather than
+        intersecting them against the unknown (empty) vocabulary — that
+        intersection would silently wipe the folder's tags and the PATCH would
+        persist the loss."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1", "t2"])
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/folders", json={"name": "Payments", "tags": ["t1", "t2"]}
+            )
+            assert resp.status == 201
+            fid = (await resp.json())["id"]
+
+            # Simulate a later boot where tags.json failed to load.
+            state._tags = []
+            state._tags_authoritative = False
+
+            # A PATCH that echoes the stored tags back (any rename flow does
+            # this) must not wipe them; shape guards and dedupe still apply.
+            resp = await client.patch(
+                f"/api/chat/folders/{fid}",
+                json={"name": "Renamed", "tags": ["t1", "t1", "t2", 7]},
+            )
+            assert resp.status == 200
+            assert state._folders[0]["tags"] == ["t1", "t2"]  # preserved, not wiped
+
+    @pytest.mark.asyncio
+    async def test_folder_tag_writes_hold_the_tags_write_lock(self, tmp_path, monkeypatch):
+        """The point-of-application intersection and the folders write are ONE
+        critical section under ``tags_write_lock`` (the invariant every tag
+        consumer follows): a tag deletion committing between them would slip a
+        just-deleted id past the strip pass and back onto the folder."""
+        from kiro_crew.dashboard.chat_tags import tags_write_lock
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1"])
+        held: list[bool] = []
+        orig_mutate = state.mutate_folders
+
+        async def _spy(fn):
+            held.append(tags_write_lock(state).locked())
+            return await orig_mutate(fn)
+
+        monkeypatch.setattr(state, "mutate_folders", _spy)
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/folders", json={"name": "Locked", "tags": ["t1"]})
+            assert resp.status == 201
+            fid = (await resp.json())["id"]
+            resp = await client.patch(f"/api/chat/folders/{fid}", json={"tags": ["t1"]})
+            assert resp.status == 200
+        assert held[:2] == [True, True], (
+            "a folder tags write ran outside tags_write_lock; a concurrent tag "
+            "deletion could resurrect a deleted id onto the folder"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_tag_id_is_filtered_not_400(self, tmp_path, monkeypatch):
+        """(b) An unknown tag id is silently dropped on create and update.
+
+        Mirrors ``api_chat_slot_tags`` exactly: a dangling id can legitimately
+        exist (the tag delete's best-effort folder strip can fail), and a
+        strict 400 here would make every subsequent save of that folder fail —
+        the "permanently uneditable folder" class. Filtering at the write
+        sheds the stale reference instead.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1"])
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/folders", json={"name": "Mixed", "tags": ["nope", "t1"]}
+            )
+            assert resp.status == 201
+            fid = (await resp.json())["id"]
+            # Unknown id dropped, known id kept.
+            assert state._folders[0].get("tags") == ["t1"]
+
+            bad_patch = await client.patch(f"/api/chat/folders/{fid}", json={"tags": ["ghost"]})
+            assert bad_patch.status == 200
+            # An all-unknown list filters down to empty — tags cleared, not 400.
+            assert not state._folders[0].get("tags")
+
+    @pytest.mark.asyncio
+    async def test_non_array_tags_rejected_400(self, tmp_path, monkeypatch):
+        """A non-array `tags` payload is a 400, not a 500."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1"])
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/folders", json={"name": "Bad", "tags": "t1"})
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "tags_invalid"
+
+    @pytest.mark.asyncio
+    async def test_deleting_a_tag_strips_it_from_folders(self, tmp_path, monkeypatch):
+        """(f) Deleting a tag from the vocabulary removes its id from every folder."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        self._seed_vocabulary(state, ["t1", "t2"])
+        app = self._app_with_tag_delete(state)
+        async with TestClient(TestServer(app)) as client:
+            # Two folders carrying t1; one also carries t2.
+            a = await (
+                await client.post("/api/chat/folders", json={"name": "A", "tags": ["t1", "t2"]})
+            ).json()
+            b = await (
+                await client.post("/api/chat/folders", json={"name": "B", "tags": ["t1"]})
+            ).json()
+
+            resp = await client.delete("/api/chat/tags/t1")
+            assert resp.status == 200
+
+        fa = next(f for f in state._folders if f["id"] == a["id"])
+        fb = next(f for f in state._folders if f["id"] == b["id"])
+        # t1 stripped everywhere; t2 untouched; a folder left with no tags loses
+        # the key entirely.
+        assert fa["tags"] == ["t2"]
+        assert "tags" not in fb
 
 
 class TestFolderPersistence:

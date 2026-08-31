@@ -169,7 +169,7 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
         checks here would be a second, weaker copy of a reader that already
         exists.
         """
-        data = _read_agent_spec(path)
+        data = _read_agent_spec(path, operation="doctor", source="cli")
         if data is None:
             # An ABSENT spec is not a fault -- a clean install has none, and the
             # resolver simply falls through to the bundled default. Only a file
@@ -444,7 +444,7 @@ def _agent_spec_model_problems(
             *((path, False) for path in global_specs),
             *((path, True) for path in project_specs),
         ):
-            data = _read_agent_spec(path)
+            data = _read_agent_spec(path, operation="doctor", source="cli")
             if data is None:
                 return None
             model = normalize_agent_model(data.get("model"))
@@ -825,11 +825,14 @@ def _doctor_mcp_governance(
         logger.debug("config load failed in governance check", exc_info=True)
         declared = False
 
-    try:
-        spec = json.loads(agent_path.read_text(encoding="utf-8"))
-        servers = spec.get("mcpServers") or {}
-    except Exception:
-        servers = {}
+    # Same hardened reader as this file's other spec reads: the agents dir is
+    # user-writable, so an oversized or sensitively-symlinked spec is refused
+    # (and audited) rather than parsed. No try/except: the reader's contract is
+    # return-``None``-never-raise, which the five sibling sites migrated
+    # alongside this one also rely on bare. ``None`` degrades to no declared
+    # servers, exactly as the blanket ``except`` here used to.
+    spec = _read_agent_spec(agent_path, operation="doctor", source="cli")
+    servers = (spec or {}).get("mcpServers") or {}
     if not isinstance(servers, dict):
         # `or {}` only replaces a FALSY value, so a string or list here survives
         # and the membership walk below would raise, aborting the whole doctor
@@ -981,6 +984,20 @@ def _doctor_data_home() -> None:
         f"  legacy:      ⏹ {legacy} present but not the data home — safe to "
         f"delete once you have confirmed it holds nothing you need"
     )
+
+
+def _doctor_managed_service_policy(issues: list[str]) -> None:
+    """Surface installed service definitions that predate launch-class policy."""
+    state = service_controller.installed_service_has_managed_marker()
+    if state is None:
+        return
+    print("\nManaged Service")
+    if state:
+        print("  watchdog:    ✅ managed-service policy marker installed")
+        return
+    print("  watchdog:    ⚠️  installed definition predates managed-service defaults")
+    print("               Fix: run `kirocrew service install` once, then restart the service")
+    issues.append("managed service definition is outdated")
 
 
 def _doctor_path_launcher() -> None:
@@ -2603,6 +2620,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Stored defaults a release has since changed (#5244) ──
     render_doctor_section(issues)
 
+    # ── Installed services must carry the launch-class marker (#6651) ──
+    _doctor_managed_service_policy(issues)
+
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
     _doctor_path_launcher()
@@ -2813,12 +2833,10 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     else:
         print(f"  provider:    ✅ {cfg.stt.provider}")
 
-    # STT ships enabled-by-default, but ffmpeg is absent from a stock Windows box
-    # and is not a Kiro Crew dependency there. Reporting it as a hard issue makes
-    # `kirocrew doctor` exit 1 on a healthy first install, so the guide's
-    # `kirocrew doctor && kirocrew gateway` never launches the gateway. On Windows
-    # treat these as non-fatal notes; POSIX keeps failing so a real STT setup gap
-    # is still surfaced.
+    # Source installs may omit the optional voice extra. Preserve Windows's
+    # historical non-fatal report for that case so an enabled-by-default feature
+    # cannot block gateway startup; desktop releases gate both native components
+    # at build time and should never reach the missing branches.
     stt_fatal = not platform_compat.IS_WINDOWS
     stt_mark = "❌" if stt_fatal else "⚠️ "
 
@@ -2848,21 +2866,26 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # `_find_ffmpeg` would decline, which is the more misleading of the two failures.
     ffmpeg_bin = _find_ffmpeg()
     if ffmpeg_bin:
-        print(f"  ffmpeg:      ✅ {ffmpeg_bin}")
+        # The resolved path can contain a username or a credential-bearing mount
+        # name. Doctor only needs to confirm the exact resolver found a decoder.
+        print("  ffmpeg:      ✅ available")
     elif stt_active:
         # A prerequisite of every provider, not of one of them: a Slack voice memo
         # arrives as ogg/Opus and the dashboard records webm, so the only input
         # that reaches a recogniser without ffmpeg is a 16 kHz mono WAV.
         print(f"  ffmpeg:      {stt_mark} not found")
-        print(
-            "               Fix: "
-            + _os_fix_hint(
-                "brew install ffmpeg",
-                "drop a static ffmpeg build into ~/.local/bin "
-                "(not in AL2023 repos; KiroCrew auto-detects it)",
-                windows="winget install Gyan.FFmpeg",
+        if platform_compat.is_bundled_interpreter():
+            print("               Fix: reinstall Kiro Crew (the bundled audio decoder is missing)")
+        else:
+            print(
+                "               Fix: "
+                + _os_fix_hint(
+                    "brew install ffmpeg",
+                    "drop a static ffmpeg build into ~/.local/bin "
+                    "(not in AL2023 repos; Kiro Crew auto-detects it)",
+                    windows="winget install Gyan.FFmpeg",
+                )
             )
-        )
         if stt_fatal:
             issues.append("ffmpeg")
     else:

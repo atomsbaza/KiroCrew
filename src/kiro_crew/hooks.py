@@ -25,12 +25,36 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from kiro_crew import platform_compat, security, webhooks
+
+# The xattr ACL-carry policy is shared with atomic_write.atomic_write: both
+# install a fresh inode and must reproduce the source's access controls or
+# refuse. atomic_write is a leaf module (imported here transitively already via
+# platform_compat), so importing these from there keeps one spelling of the
+# policy without a cycle.
+from kiro_crew.atomic_write import (
+    _XATTR_UNSUPPORTED_ERRNOS,
+    _is_access_control_xattr,
+    _should_carry_xattr,
+)
 from kiro_crew.config import paths as _config_paths
 from kiro_crew.platform import current_context, redact_via_context
 from kiro_crew.platform.governance import (
     CU_CLASS_OBSERVE,
     computer_use_action_classes,
     computer_use_action_from_title,
+)
+
+# The bounded, depth-aware target-path walk lives one layer below both this
+# module and governance (see the re-export note where the keystone consumers
+# are defined). Imported here so ``hooks.TARGET_PATH_KEYS`` / ``hooks.TargetPaths``
+# / ``hooks.target_paths`` (and the work caps) stay importable at their historic
+# names; hooks keeps its HARD-DENY reading of ``TargetPaths.truncated``.
+from kiro_crew.platform.tool_paths import (  # noqa: F401  (re-exported for callers)
+    _TARGET_PATH_MAX_NODES,
+    _TARGET_PATH_MAX_PATHS,
+    TARGET_PATH_KEYS,
+    TargetPaths,
+    target_paths,
 )
 from kiro_crew.security import (
     audit_bash_exfiltration,
@@ -39,6 +63,7 @@ from kiro_crew.security import (
     is_sensitive_write_path,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session_directive import CORE_MCP_SERVER
 from kiro_crew.validation import _bounded_pattern_search
 
 logger = logging.getLogger(__name__)
@@ -379,6 +404,48 @@ class HooksConfig:
             "disable_all": self.denied_commands_disable_all,
             "user_added": [p.to_dict() for p in self.denied_commands_user_added],
         }
+
+
+# ── Spawn auto-approve identity ──
+
+
+def event_is_spawn_run(event: object) -> bool:
+    """True when a permission event is genuinely the ``spawn_run`` MCP tool.
+
+    The ``auto_approve_subagent_spawn`` rung must key on canonical,
+    NON-model-authored identity: ``event.title`` is LLM-authored prose (for
+    shell tools ``select_tool_title`` even prefers the model's description),
+    so ANY event whose title is forged to ``spawn_run`` — a shell command, a
+    re-titled ``send_file``, anything — must never satisfy this rung.
+
+    Canonical identity only, deny-by-default: ``event.tool_name`` (from
+    ``_meta.kiro``, never model-authored) must be ``spawn_run``, carry the
+    ``mcp_identity_trusted`` provenance flag (non-emptiness alone is not
+    proof of provenance; a future inline population path must fail closed),
+    and be served by the crew's own MCP server (``CORE_MCP_SERVER``), so a
+    foreign server or a built-in that merely NAMES a tool ``spawn_run``
+    cannot ride the rung.
+
+    The title must ALSO read ``spawn_run``. Not as identity — the title is
+    forgeable and never sufficient — but because the channel PreToolUse gate
+    (``build_tool_gate``) keys deny rules on the title: a genuine spawn whose
+    display title was rephrased must fall to the approval ladder rather than
+    let this rung approve past a title-keyed deny that would otherwise have
+    fired. This exactly preserves the rung's pre-fix approval surface (title
+    ``spawn_run``), minus the forgeries.
+
+    There is deliberately NO title fallback: on a backend that does not emit
+    ``_meta.kiro`` (or on the correlated provenance-cache miss) the rung
+    simply does not fire and the request falls to the channel's normal
+    approval ladder (session trust / YOLO / interactive) — a downgrade,
+    never a hard block.
+    """
+    return (
+        (getattr(event, "title", "") or "") == "spawn_run"
+        and (getattr(event, "tool_name", "") or "") == "spawn_run"
+        and bool(getattr(event, "mcp_identity_trusted", False))
+        and (getattr(event, "mcp_server_name", "") or "") == CORE_MCP_SERVER
+    )
 
 
 # ── HookManager ──
@@ -1473,124 +1540,18 @@ _RECURSIVE_SEARCH_OPERATIONS: frozenset[str] = frozenset(
 # number and needs no such treatment.
 _SEARCH_PATH_FIELD = "path"
 
-#: EVERY argument name a tool may carry its target file path under. Public because
-#: it is shared with the consent prompt in ``cli_chat``: a prompt that disclosed a
-#: path the gate did not inspect would let the two disagree about what the target
-#: is, and the surface asking a human would be reading the weaker field. One tuple
-#: is what makes that parity structural instead of a comment claiming it.
-#:
-#: The camel-case spelling is not hypothetical -- ``_SEARCH_DENY_ARG_KEYS`` has
-#: accepted it for the search plane all along, while the sensitive-path keystone
-#: below read only the two snake_case forms.
-TARGET_PATH_KEYS: tuple[str, ...] = ("path", "file_path", "filePath")
-
-
-#: Cap on the number of DISTINCT candidate paths collected below. The extractor
-#: runs synchronously on the gateway event loop for every tool call, and each
-#: collected path costs the keystone an ``is_sensitive_path`` resolution (two
-#: symlink-following syscall chains) — so an attacker-shaped batch carrying tens
-#: of thousands of paths could stall the loop. The cap does NOT fail open: hitting
-#: it sets ``TargetPaths.truncated`` and the gate DENIES an unverifiable call
-#: (same deny-by-default shape as the unrecoverable-shell-command branch).
-#: Generous on purpose: no legitimate tool schema names hundreds of files in one
-#: call, and a denied call merely falls to the human with a clear reason.
-_TARGET_PATH_MAX_PATHS = 256
-
-#: Budget of container nodes (dicts/lists) the walk will visit, bounding total
-#: traversal work independently of how the paths are arranged. Exceeding it also
-#: sets ``TargetPaths.truncated`` → deny. High enough that any real tool call is
-#: orders of magnitude below it.
-_TARGET_PATH_MAX_NODES = 10_000
-
-
-class TargetPaths(list):
-    """The collected paths, plus whether collection had to stop early.
-
-    A ``list`` subclass so every existing consumer (iteration in the gate loops,
-    ``found[0]`` in the consent prompt, truthiness, equality in tests) works
-    unchanged. ``truncated`` is True when the walk hit ``_TARGET_PATH_MAX_PATHS``
-    or ``_TARGET_PATH_MAX_NODES``, meaning the returned list may be INCOMPLETE —
-    a security consumer must treat that as "the call could not be verified" and
-    deny, never as "everything present was checked".
-    """
-
-    truncated: bool = False
-
-
-def target_paths(raw_params: Mapping | None) -> TargetPaths:
-    """Every non-empty string path in *raw_params*, under any accepted spelling,
-    at ANY nesting depth.
-
-    Returns ALL of them rather than the first match, and callers deny if ANY is
-    forbidden. That is deliberately different from "normalize the aliases onto one
-    key and reject conflicts": a conflict rule has to decide which spelling wins,
-    and picking wrong is how a sensitive path slips past. Checking every value
-    present cannot be gamed by adding a second, innocent-looking alias, and needs
-    no adjudication.
-
-    Nesting is walked for the same ground-truth reason: a batch-shaped tool
-    carries its real targets inside an array argument (e.g.
-    ``{"operations": [{"mode": "Line", "path": …}]}``), so an extraction that
-    read only the top-level keys never surfaced those paths to the
-    sensitive-path keystone — the call was then evaluated as having no target
-    at all and could auto-approve a read the flat spelling of the same path
-    would have denied. The walk is ITERATIVE and EXHAUSTIVE — there is no depth
-    bound that a sufficiently nested path could hide beyond, and no
-    ``RecursionError`` can escape into the gate — visits every dict/list value,
-    collects strings under ``TARGET_PATH_KEYS`` wherever they appear (including
-    a list of strings directly under such a key), and stays extract-only: no
-    sensitivity decision is made here, order of first appearance is preserved,
-    and duplicates collapse (set-backed, so collection is linear). The only
-    limits are the ``_TARGET_PATH_MAX_PATHS`` / ``_TARGET_PATH_MAX_NODES``
-    work caps, and those fail CLOSED: the result is marked ``truncated`` and
-    the gate denies the call as unverifiable rather than trusting a partial
-    scan. Over-extraction is the safe direction, since callers deny on ANY hit
-    and the consent prompt merely discloses more.
-    """
-    found = TargetPaths()
-    if not isinstance(raw_params, Mapping):
-        return found
-    seen: set[str] = set()
-    nodes = 0
-    # Explicit LIFO stack, entries pushed in reverse so traversal matches
-    # document order: at each mapping the accepted spellings are collected in
-    # ``TARGET_PATH_KEYS`` order first (preserving the flat extraction's
-    # historical ordering), then every value is walked in insertion order.
-    stack: list[object] = [raw_params]
-    while stack:
-        if len(found) >= _TARGET_PATH_MAX_PATHS or nodes >= _TARGET_PATH_MAX_NODES:
-            found.truncated = True
-            return found
-        node = stack.pop()
-        nodes += 1
-        if isinstance(node, Mapping):
-            for key in TARGET_PATH_KEYS:
-                _collect_path_strings(node.get(key), found, seen)
-            stack.extend(reversed(list(node.values())))
-        elif isinstance(node, (list, tuple)):
-            stack.extend(reversed(node))
-    return found
-
-
-def _collect_path_strings(value: object, found: TargetPaths, seen: set[str]) -> None:
-    """Collect *value* (or its items, for a sequence) as candidate paths.
-
-    Handles a string or an arbitrarily nested list/tuple of strings directly
-    under an accepted key, iteratively. Non-string leaves are ignored — the
-    generic walk in ``target_paths`` still descends into any mappings inside.
-    """
-    pending: list[object] = [value]
-    while pending:
-        item = pending.pop()
-        if isinstance(item, str):
-            if item.strip() and item not in seen:
-                if len(found) >= _TARGET_PATH_MAX_PATHS:
-                    found.truncated = True
-                    return
-                seen.add(item)
-                found.append(item)
-        elif isinstance(item, (list, tuple)):
-            pending.extend(reversed(item))
+# The sensitive-path keystone's target extraction — ``TARGET_PATH_KEYS``, the
+# ``_TARGET_PATH_MAX_PATHS`` / ``_TARGET_PATH_MAX_NODES`` work caps, the
+# ``TargetPaths`` list-subclass carrying ``truncated``, and the bounded,
+# depth-aware ``target_paths`` walk — now live in
+# ``kiro_crew.platform.tool_paths`` (imported at module top) so the governance
+# intersection plane can share the SAME traversal. governance cannot import
+# hooks — hooks imports governance — so the walk moved DOWN a layer that both
+# import. The names are re-exported from ``hooks`` (see the top-level import)
+# unchanged so the keystone consumers below and any caller that imports them
+# from ``hooks`` keep working. hooks still applies HARD-DENY semantics to
+# ``truncated`` (deny an unverifiable scan); governance applies its own
+# permit-by-default policy to the same flag.
 
 
 # The SCOPE-bearing arguments of a file search as ``(canonical, accepted spellings)``,
@@ -1897,6 +1858,62 @@ def is_unc_shape(raw: str) -> bool:
     return len(raw) >= 2 and raw[0] in "\\/" and raw[1] in "\\/"
 
 
+_unc_agents_root_cache: tuple[tuple[object, ...], Path | None] | None = None
+
+
+def _unc_agents_root() -> Path | None:
+    """The kiro agents dir as a UNC-gate trusted root, memoized per configuration.
+
+    ``kiro_agents_dir()`` resolves ``KIRO_HOME`` (``Path.resolve()`` --
+    filesystem I/O, and on a UNC-shaped override an SMB touch), so consulting
+    it per gate check would put blocking I/O -- and exactly the network access
+    this gate promises not to make -- on every validation, including async
+    callers (review finding on #6728). Memoized on the RAW ``KIRO_HOME`` env
+    value plus the accessor and override-hook identities, so the resolution
+    runs once per configuration and a monkeypatched or hot-swapped accessor
+    invalidates naturally. Mirrors how ``data_home()`` keeps its own hot path
+    cheap.
+
+    A computation failure memoizes ``None`` (root absent, gate stays total):
+    deterministic-per-configuration beats self-healing here, because the
+    failure mode being avoided is a per-call resolve that can block on an SMB
+    timeout, and the degraded state -- UNC agent specs refused -- is exactly
+    the pre-#6721 status quo. Recovery is an env change or process restart.
+    Benign write race under threads: last-writer-wins on an idempotent value.
+    """
+    global _unc_agents_root_cache
+    key: tuple[object, ...] = (
+        os.environ.get("KIRO_HOME"),
+        _config_paths.kiro_agents_dir,
+        getattr(_config_paths, "_agents_dir_override", None),
+    )
+    cached = _unc_agents_root_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        # Same admission basis as data_home(): the gateway itself writes the
+        # managed agent specs here. The PROJECT-level agents dir is
+        # deliberately NOT admitted -- an arbitrary project directory is not
+        # gateway-written, so admitting it would widen the trust boundary.
+        root: Path | None = _config_paths.kiro_agents_dir()
+    except (ValueError, OSError, RuntimeError):
+        # A broken home resolution must not take the gate down with it: the
+        # two always-computable roots still apply and the function stays
+        # total (True/False, never a propagated error).
+        root = None
+    _unc_agents_root_cache = (key, root)
+    return root
+
+
+# Prime the memo at import time (review finding, #6728 round 3): without this
+# the FIRST gate check after process start -- or after a ``KIRO_HOME`` change --
+# still pays the resolving accessor on whatever thread asked, which on an async
+# validation path is the event loop. Import of this module happens at process
+# start, off the loop, so the one resolution per configuration lands there.
+# Best-effort: a failure here memoizes root-absent exactly as a lazy miss would.
+_unc_agents_root()
+
+
 def unc_probe_allowed(raw: str) -> bool:
     """Whether a UNC-shaped path may touch the filesystem on Windows.
 
@@ -1904,18 +1921,27 @@ def unc_probe_allowed(raw: str) -> bool:
     (``\\\\evil\\share\\x.png`` or ``//evil/share/x.png`` echoed in any message
     or query) makes Windows open an SMB connection to that host -- an outbound
     credential probe the attacker controls. Filesystem access is therefore
-    restricted to UNC paths under directories this gateway itself writes
-    attachments to: the data home (on a roaming profile the home directory is
-    itself a UNC share, the one legitimate source of UNC attachment paths) and
-    the temp directory (channel-side image staging). The comparison is purely
-    lexical (``normpath``/``normcase``), so this check never touches the
-    network itself.
+    restricted to UNC paths under directories this gateway itself writes to:
+    the data home (on a roaming profile the home directory is itself a UNC
+    share, the one legitimate source of UNC attachment paths), the temp
+    directory (channel-side image staging), and the kiro agents directory
+    (``apps.bridges._register_agents`` and ``agent.rebuild_agent_config``
+    write the managed specs there -- see ``kiro_agents_dir()``'s docstring;
+    on a roaming profile it sits on the same UNC share as the data home, and
+    without it every user-level agent spec read was silently refused, #6721).
+    The comparison is purely lexical (``normpath``/``normcase``) and the
+    agents root is memoized per configuration (see ``_unc_agents_root``), so
+    this check never touches the network itself.
     """
     try:
         cand = os.path.normcase(os.path.normpath(raw))
     except (ValueError, OSError):
         return False
-    for root in (_config_paths.data_home(), Path(tempfile.gettempdir())):
+    roots: tuple[Path, ...] = (_config_paths.data_home(), Path(tempfile.gettempdir()))
+    agents_root = _unc_agents_root()
+    if agents_root is not None:
+        roots += (agents_root,)
+    for root in roots:
         rootn = os.path.normcase(os.path.normpath(str(root)))
         if not is_unc_shape(rootn):
             continue
@@ -2215,28 +2241,6 @@ def safe_read_file_bytes_nolink(
                 pass
 
 
-# errnos meaning "this filesystem has no extended attributes", as opposed to "the
-# lookup failed". Only the former is safe to treat as "nothing to carry".
-_XATTR_UNSUPPORTED_ERRNOS = frozenset(
-    e for e in (getattr(errno, n, None) for n in ("ENOTSUP", "EOPNOTSUPP", "ENOSYS"))
-    if e is not None
-)
-
-_ACCESS_CONTROL_XATTR_PREFIXES = (
-    "system.posix_acl_",  # POSIX ACLs: the actual permission set
-    "security.",          # SELinux/SMACK/capabilities labels
-)
-
-
-def _is_access_control_xattr(attr: str) -> bool:
-    """True when losing *attr* would leave the file less protected.
-
-    Only these justify refusing a write. `user.*` is application metadata: worth
-    carrying, not worth failing a save over on a filesystem that cannot store it.
-    """
-    return attr.startswith(_ACCESS_CONTROL_XATTR_PREFIXES)
-
-
 def safe_write_file_nolink(
     raw: str,
     content: str,
@@ -2387,10 +2391,18 @@ def safe_write_file_nolink(
     # A filesystem that does not support xattrs at all is NOT an error: there is
     # nothing on the source to lose. Any OTHER failure means we cannot know what
     # we would be dropping, so it refuses.
+    #
+    # `_should_carry_xattr` narrows this to the attributes an inode-replacing
+    # write may reproduce, and it is applied HERE, at the read, so a
+    # privilege-bearing `security.capability` or an integrity signature over the
+    # OLD bytes (`security.ima`/`security.evm`) is never captured to be replayed
+    # onto content the caller supplied. See its allowlist in atomic_write.py.
     src_xattrs: list[tuple[str, bytes]] = []
     if all(hasattr(os, a) for a in ("listxattr", "getxattr", "setxattr")):
         try:
             for _attr in os.listxattr(fd):
+                if not _should_carry_xattr(_attr):
+                    continue
                 src_xattrs.append((_attr, os.getxattr(fd, _attr)))
         except OSError as exc:
             if exc.errno not in _XATTR_UNSUPPORTED_ERRNOS:
@@ -2494,7 +2506,9 @@ def safe_write_file_nolink(
             # a fresh inode starts with none, which silently drops POSIX ACLs
             # (stored as system.posix_acl_access) and any user.* metadata.
             #
-            # Split by what the attribute DOES, rather than one policy for all:
+            # Split by what the attribute DOES, rather than one policy for all.
+            # `src_xattrs` is already narrowed to the carriable allowlist at the
+            # read above, so the split below is only over POSIX ACLs and `user.*`:
             #
             #  * an ACCESS-CONTROL attribute that fails to copy is a security
             #    regression -- the rename would install an inode the owner has
@@ -3507,7 +3521,11 @@ async def run_script_hook(
 
     try:
         # circular import: sandbox → registry → apps → hooks, so import at call time
-        from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
+        from kiro_crew.sandbox import (
+            create_subprocess_limited,
+            sandboxed_spawn_argv,
+            sandboxed_spawn_argv_async,
+        )
 
         # A script hook inherits only the minimum env its shell + command need
         # (``_HOOK_BASE_ENV_KEYS``) plus the two hook-metadata variables — NOT a
@@ -3529,7 +3547,9 @@ async def run_script_hook(
         # Calling wrap_argv + cgroup_scope_argv directly would give the wrapper
         # the child-safe allowlist and make it fail before a PreToolUse policy
         # hook could run.
-        wrapped_argv, env, cleanup_path = sandboxed_spawn_argv(argv, env=env)
+        wrapped_argv, env, cleanup_path = await sandboxed_spawn_argv_async(
+            argv, env=env, _prepare=sandboxed_spawn_argv
+        )
         # Process-group isolation for clean tree-kill on timeout. Pass both flags
         # explicitly (NOT **dict unpack — breaks mypy's Popen overload resolution
         # on the build fleet): start_new_session=True is a no-op on Windows,

@@ -3133,6 +3133,33 @@ async def kill_process_tree_async(pid: int, sig: int = SIGTERM) -> bool:
 REAP_TIMEOUT_SECS: float = 10
 
 
+def _shares_own_process_group(pid: int) -> bool:
+    """True when *pid* runs in the gateway's OWN process group.
+
+    Such a child was spawned without ``start_new_session``, so it has no tree
+    of its own to signal — see :func:`kill_and_reap`, whose group kill this
+    gates. Fail-closed (``False``) on every probe failure: the pid may be gone
+    or unreadable, and the tree kill it guards is itself best-effort and
+    protected by :func:`kill_process_tree`'s own broadcast/self-group guard.
+
+    This is a named seam on purpose. The probe reads the LIVE process table,
+    so a test handing :func:`kill_and_reap` a synthetic pid was at the mercy
+    of whichever real process happened to own that pid: when it landed inside
+    the runner's own group the skip fired and the expected tree kill never
+    happened. The rootdir ``conftest`` pins this one function instead of the
+    shared ``_OWN_PGID`` — pinning that would also disarm
+    :func:`kill_process_tree`'s self-group refusal, the guard that keeps a
+    test from broadcasting a signal to the whole pytest run.
+    """
+
+    if not IS_POSIX:
+        return False
+    try:
+        return os.getpgid(pid) == _OWN_PGID
+    except Exception:
+        return False
+
+
 async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | None = None) -> None:
     """Kill *proc* AND its descendants, then wait for it under a bound.
 
@@ -3167,11 +3194,9 @@ async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | No
     """
 
     async def _cleanup() -> None:
-        same_group = False
-        if IS_POSIX:
-            with contextlib.suppress(Exception):
-                same_group = os.getpgid(proc.pid) == _OWN_PGID
-        if not same_group:
+        # Bare-name lookup so a test can pin the probe (see
+        # ``_shares_own_process_group``) without reaching into ``os``.
+        if not _shares_own_process_group(proc.pid):
             # Bare-name lookup resolves through this module's namespace at
             # call time, so tests patching ``kiro_crew.platform_compat.
             # kill_process_tree_async`` still intercept the tree kill.
@@ -3282,15 +3307,23 @@ def rmtree_force(path: str | os.PathLike) -> bool:
     # `onexc` replaced `onerror` in 3.12 and the old name warns; this project
     # still supports 3.9+, so pick by capability rather than by version number.
     kwarg = "onexc" if sys.version_info >= (3, 12) else "onerror"
-    if kwarg == "onerror":  # pragma: no cover - exercised on Python < 3.12
+    try:
+        if kwarg == "onerror":  # pragma: no cover - exercised on Python < 3.12
 
-        def _legacy(func: Any, target: str, exc_info: Any) -> None:
-            _clear_readonly_and_retry(func, target, exc_info[1])
+            def _legacy(func: Any, target: str, exc_info: Any) -> None:
+                _clear_readonly_and_retry(func, target, exc_info[1])
 
-        shutil.rmtree(path, onerror=_legacy)
-    else:
-        shutil.rmtree(path, onexc=_clear_readonly_and_retry)  # type: ignore[call-arg]
-    return not os.path.exists(path)
+            shutil.rmtree(path, onerror=_legacy)
+        else:
+            shutil.rmtree(path, onexc=_clear_readonly_and_retry)  # type: ignore[call-arg]
+    except FileNotFoundError:
+        # A missing ROOT is success. A nested entry can disappear during rmtree while
+        # the root survives, especially through the Python <3.12 onerror path.
+        return not os.path.lexists(path)
+    except OSError:
+        logger.warning("Cannot remove %s", path)
+        return False
+    return not os.path.lexists(path)
 
 
 def symlink_or_junction(target: str | os.PathLike, link: str | os.PathLike) -> None:
@@ -4363,6 +4396,111 @@ def proc_rss_bytes() -> int:
     return 0 if counters is None else int(counters.WorkingSetSize)
 
 
+HEAP_TRIM_INTERVAL_SECONDS = 10 * 60.0
+HEAP_TRIM_RSS_THRESHOLD_BYTES = 1536 * 1024 * 1024
+HEAP_TRIM_LOG_THRESHOLD_BYTES = 16 * 1024 * 1024
+# Must remain below the heartbeat interval.  A queued or wedged default-executor
+# worker forfeits this maintenance pass instead of starving the liveness beat.
+HEAP_TRIM_TIMEOUT_SECONDS = 2.0
+
+
+def _malloc_trim() -> bool:
+    """Ask glibc to return wholly-free heap pages, or no-op elsewhere."""
+    try:
+        libc = ctypes.CDLL(None)
+        getattr(libc, "gnu_get_libc_version")
+        trim = libc.malloc_trim
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        return bool(trim(0))
+    except (AttributeError, OSError):
+        return False
+
+
+def trim_heap_if_needed(
+    *,
+    rss_reader: Callable[[], int | None] | None = None,
+    trimmer: Callable[[], bool] | None = None,
+) -> int:
+    """Return bytes released from a large Linux gateway heap.
+
+    A high threshold avoids allocator-wide work on healthy gateways. This must
+    use Linux's current RSS directly: :func:`proc_rss_bytes` deliberately falls
+    back to peak RSS when procfs is unavailable, which would turn one historic
+    spike into repeated trim attempts. Unsupported libc and probe failures are
+    harmless because reclamation is optional.
+    """
+    if not IS_LINUX:
+        return 0
+    try:
+        read_rss = rss_reader or _linux_current_rss_bytes
+        before = read_rss()
+        if before is None:
+            return 0
+        if before < HEAP_TRIM_RSS_THRESHOLD_BYTES:
+            return 0
+        if not (trimmer or _malloc_trim)():
+            return 0
+        after = read_rss()
+        if after is None:
+            return 0
+    except Exception:  # noqa: BLE001 - optional maintenance must not stop the heartbeat
+        return 0
+    return max(0, before - after)
+
+
+class HeapTrimMaintainer:
+    """Self-gate bounded, best-effort heap reclamation for the gateway.
+
+    The heartbeat calls :meth:`maybe_trim` on every tick. Cadence and in-flight
+    ownership live here so the heartbeat stays cadence-free. A timed-out worker
+    may continue running because Python cannot cancel native work already in a
+    thread; ``_inflight`` prevents another from being submitted until that
+    worker returns. If cancellation wins before the worker starts, maintenance
+    remains disabled for this object, which is the safe failure mode.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        trim: Callable[[], int] = trim_heap_if_needed,
+    ) -> None:
+        self._clock = clock
+        self._trim = trim
+        self._next_trim = clock() + HEAP_TRIM_INTERVAL_SECONDS
+        self._inflight = False
+
+    async def maybe_trim(self) -> int:
+        """Return bytes released, or zero when skipped, timed out, or failed."""
+        try:
+            if not IS_LINUX:
+                return 0
+            now = self._clock()
+            if now < self._next_trim or self._inflight:
+                return 0
+            self._next_trim = now + HEAP_TRIM_INTERVAL_SECONDS
+            self._inflight = True
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self._run_trim),
+                    timeout=HEAP_TRIM_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("gateway heap trim timed out; maintenance pass skipped")
+                return 0
+        except Exception:  # noqa: BLE001 - maintenance must not stop the heartbeat
+            logger.debug("gateway heap trim failed", exc_info=True)
+            return 0
+
+    def _run_trim(self) -> int:
+        """Worker-thread wrapper that releases the single in-flight slot."""
+        try:
+            return self._trim()
+        finally:
+            self._inflight = False
+
+
 def proc_peak_rss_bytes() -> int:
     """Return this process's PEAK resident set size in bytes, or 0 on failure.
 
@@ -4472,6 +4610,203 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
             kernel32.CloseHandle(handle)
     except Exception:
         return None
+
+
+# --- /proc process-subtree sampling ----------------------------------------
+#
+# ONE walk for the two callers that used to carry their own copy of it:
+# ``mcp_gateway.pool`` and ``subagent`` each had a line-for-line BFS over
+# ``/proc/<pid>/task/<tid>/children`` and its own ``256`` ceiling, so a fix to
+# either policy reached only one surface. :func:`proc_subtree_sample` is now the
+# single entry point for BOTH, and the helpers below are the per-process reads it
+# is built from -- module-private, because no caller outside this module wants a
+# single read on its own. Pure stdlib: on a host without ``/proc`` every access
+# raises ``OSError`` and each reading degrades to its own sentinel.
+#
+# NOT the only way this repository walks a process tree, and deliberately so.
+# ``session_pid._build_child_map`` sums a session's tree from a full ``/proc``
+# scan of every process's ``stat`` ``PPid`` field, precisely because the
+# ``children`` file this walk reads needs ``CONFIG_PROC_CHILDREN`` and is
+# documented as reliable only for frozen tasks -- for a live task it can return
+# an incomplete child set and silently drop a descendant subtree from the sum.
+# That trade is the right one there (an under-counted tree would make the RSS
+# watchdog no-op) and the wrong one here: these two callers sample per backend
+# and per live agent on a timer, where a whole-machine scan per sample is the
+# larger cost, and an under-count degrades a displayed number rather than
+# disabling a protection. Reconsidering the method for these two surfaces is a
+# behaviour change to figures users already read, not part of this
+# consolidation -- but it is now ONE place to reconsider instead of two.
+
+#: Upper bound on processes walked in one subtree sample. A real tree is tiny
+#: (a launcher plus a handful of workers); the cap only guards against a
+#: pathological or looping ``/proc`` graph.
+_SUBTREE_MAX_PROCS = 256
+
+
+def _proc_status_rss_kb(pid: int) -> int:
+    """RSS (KiB) of a single *pid* from ``/proc/<pid>/status``, or -1.
+
+    Reads ``VmRSS``, so the figure matches ``ps -o rss=`` for that one process.
+    Distinct from :func:`proc_rss_bytes_for_pid`, which reads ``statm`` pages and
+    has a Windows path: this one is the Linux subtree walk's per-process read and
+    keeps ``-1`` as its "unreadable" sentinel rather than ``None``.
+    """
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
+
+
+def _proc_children(pid: int) -> list[int]:
+    """Direct child PIDs of *pid* via ``/proc/<pid>/task/<tid>/children``.
+
+    Uses the kernel-provided children list (``CONFIG_PROC_CHILDREN``), so no
+    ``pgrep``/full-table scan. Returns ``[]`` if the file is unavailable.
+    """
+    kids: list[int] = []
+    task_dir = f"/proc/{pid}/task"
+    try:
+        tids = os.listdir(task_dir)
+    except OSError:
+        return kids
+    for tid in tids:
+        try:
+            with open(f"{task_dir}/{tid}/children", encoding="ascii") as fh:
+                kids.extend(int(tok) for tok in fh.read().split())
+        except (OSError, ValueError):
+            continue
+    return kids
+
+
+def _parse_cpu_jiffies(stat: bytes) -> int:
+    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
+
+    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
+    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
+    post-comm tokens. Returns 0 on any parse error.
+    """
+    try:
+        rparen = stat.rindex(b")")
+        fields = stat[rparen + 2 :].split()
+        return int(fields[11]) + int(fields[12])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _proc_cpu_jiffies(pid: int) -> int:
+    """utime+stime (clock ticks) for a single pid, 0 on error."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return _parse_cpu_jiffies(fh.read())
+    except OSError:
+        return 0
+
+
+class SubtreeSample(NamedTuple):
+    """Every reading one subtree walk can produce, from ONE frontier.
+
+    Each field keeps its own sentinel, because the readings are unmeasurable in
+    different ways and collapsing any of them into zero is a bug class in its own
+    right:
+
+    * ``rss_kb`` — summed KiB, or ``-1`` when the root pid's own status is
+      unreadable (it is gone, or the host has no ``/proc``).
+    * ``jiffies`` — summed utime+stime clock ticks; an unreadable pid contributes
+      0, since a *delta* of jiffies is what a caller consumes.
+    * ``procs`` / ``matched`` — how many processes the subtree carries, and how
+      many of their command lines contain one of the caller's ``needles``.
+      ``None`` means UNMEASURABLE, never zero: rendering "0 processes" for a live
+      tree would be a lie, so a surface renders ``None`` as an em dash instead.
+    """
+
+    rss_kb: int
+    jiffies: int
+    procs: Optional[int]
+    matched: Optional[int]
+
+
+def proc_subtree_sample(
+    pid: Optional[int],
+    *,
+    rss: bool = True,
+    jiffies: bool = True,
+    counts: bool = False,
+    needles: tuple[str, ...] = (),
+) -> SubtreeSample:
+    """Walk *pid*'s process subtree ONCE and return every requested reading.
+
+    A tracked process is frequently a thin launcher whose real memory lives in a
+    child, so every reading describes the whole subtree rather than the root pid
+    alone.
+
+    The point of one pass is not only the fewer ``/proc`` reads: separate readers
+    run at separate instants, so a process that exits between them is counted by
+    one and missed by another. Reading every metric off a single frontier is what
+    makes "the same set of processes" true of the *result* and not merely of the
+    walk rules.
+
+    ``rss`` / ``jiffies`` / ``counts`` let a caller skip the per-process reads it
+    does not want, so sharing this walk costs each caller what its own walk cost:
+    a CPU-only caller pays no ``status`` read, and an RSS-only caller pays no
+    ``stat`` read. A skipped reading comes back as its own sentinel. When nothing
+    remains to accumulate — RSS unreadable at the root, no jiffies, nothing
+    countable — the descendants are not walked at all.
+
+    ``counts`` is Linux-only (it matches command lines via
+    :func:`process_matches`) and yields ``(None, None)`` elsewhere.
+
+    Coverage caveat for a new caller: the walk reads
+    ``/proc/<pid>/task/<tid>/children``, which needs ``CONFIG_PROC_CHILDREN`` and
+    is documented as reliable only for frozen tasks, so a live tree can come back
+    short. That is acceptable for the periodic per-process figures the two
+    callers display; a reading that must not under-count (the RSS watchdog's
+    recycle decision) uses ``session_pid._build_child_map`` instead, which pays a
+    full ``/proc`` scan for completeness.
+
+    Blocking: reads a handful of ``/proc`` entries per process in the subtree, so
+    it belongs on an executor thread, never on the event loop.
+    """
+    if not pid:
+        return SubtreeSample(-1, 0, None, None)
+    # The counts share RSS's liveness probe: a root pid whose own status cannot
+    # be read has nothing to attribute, so there is nothing to count either.
+    own_rss = _proc_status_rss_kb(pid) if (rss or counts) else -1
+    countable = counts and IS_LINUX and own_rss >= 0
+    rss_total = own_rss if (rss and own_rss >= 0) else -1
+    total_jiffies = _proc_cpu_jiffies(pid) if jiffies else 0
+    procs = 1
+    matched = 1 if countable and process_matches(pid, needles) else 0
+    if rss_total < 0 and not jiffies and not countable:
+        # Nothing a descendant could add — do not pay for the walk.
+        return SubtreeSample(-1, total_jiffies, None, None)
+    seen = {pid}
+    frontier = [pid]
+    while frontier and len(seen) < _SUBTREE_MAX_PROCS:
+        nxt: list[int] = []
+        for parent in frontier:
+            for child in _proc_children(parent):
+                if child in seen:
+                    continue
+                seen.add(child)
+                if rss_total >= 0:
+                    kb = _proc_status_rss_kb(child)
+                    if kb > 0:
+                        rss_total += kb
+                if jiffies:
+                    total_jiffies += _proc_cpu_jiffies(child)
+                if countable:
+                    procs += 1
+                    if process_matches(child, needles):
+                        matched += 1
+                nxt.append(child)
+        frontier = nxt
+    if not countable:
+        return SubtreeSample(rss_total, total_jiffies, None, None)
+    return SubtreeSample(rss_total, total_jiffies, procs, matched)
 
 
 def proc_rss_tree_mb_for_pid(pid: int) -> float | None:

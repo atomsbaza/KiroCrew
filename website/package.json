@@ -46,6 +46,7 @@
     "verify:registry-pinned-row": "node scripts/capture-registry-pinned-row.mjs",
     "verify:reveal-fade": "node scripts/probe-reveal-fade.mjs",
     "verify:tool-row-narrow-stack": "node scripts/capture-tool-row-narrow-stack.mjs",
+    "verify:tool-blocked-cause": "node scripts/capture-tool-blocked-cause.mjs",
     "verify:topbar-badge-overhang": "node scripts/capture-topbar-badge-overhang.mjs",
     "verify:user-bubble-mobile-overflow": "node scripts/capture-user-bubble-mobile-overflow.mjs",
     "pretest": "npm run jscpd"
@@ -110,7 +111,8 @@
     "unified": "^11.0.5",
     "vis-data": "^8.0.3",
     "vis-network": "^10.0.2",
-    "vscode-jsonrpc": "8.2.0"
+    "vscode-jsonrpc": "8.2.0",
+    "yaml": "2.9.0"
   },
   "devDependencies": {
     "@axe-core/react": "^4.10.1",

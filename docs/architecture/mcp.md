@@ -633,7 +633,7 @@ answers `tools/list` from):
     call rather than guessing.
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
   `ask_question`, `suggest_followup`, `monitor_start`, `monitor_update`,
-  `autonudge_stop`, `set_project`
+  `autonudge_stop`, `set_project`, `reset_conversation`
 - **Crew routing:** `select_crew`
 - **Sessions and history:** `list_sessions`, `get_chat_session`,
   `search_chat_history`
@@ -910,11 +910,14 @@ parent's tree. `mcp_core.py` offers two resolvers:
 - `_resolve_session_key()` (lenient, still walks ancestors) is only for read-only
   and telemetry callers where misattribution is harmless.
 
-An unresolved key is not automatically a refusal. `mcp_computer.py` forwards an
-empty key and lets the call proceed, because neither strict source exists for a
+An unresolved key is not automatically a refusal. `mcp_computer.py` forwards a
+namespace-only key (`unresolved:<shim pid>`, plus the gateway's per-connection
+nonce when there is one) and lets the call proceed, because neither strict source
+exists for a
 GUI-launched kiro-cli on macOS, so gating on identity would make the feature
 unusable on its only supported platform. What is lost there is audit
-*attribution*, not a control: the trail records an empty key, which is honest,
+*attribution*, not a control: the trail records a key the prefix marks as
+unresolved, which is honest,
 where the lenient walk would have recorded a forgeable one.
 
 **2. State belongs in the gateway.** The tool should be a thin forwarder: resolve
@@ -940,8 +943,9 @@ and let a sub-agent's card land in its parent's slot.
 
 **Return a session directive and let the session-aware consumer apply it.** This
 is what the `ask_question` MCP tool itself now does, along with `monitor_start`,
-`monitor_update`, `autonudge_stop`, `set_project` and `suggest_followup`
-(`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
+`monitor_update`, `autonudge_stop`, `set_project`, `suggest_followup` and
+`reset_conversation` (`session_directive.DIRECTIVE_TOOLS`). The tool validates
+its arguments and
 returns a human-readable confirmation plus a marker line carrying the validated
 payload and **no session key**. `dashboard/chat_runner`'s tool-result handler
 decodes the marker, applies the effect against **its own** `slot.key`, then

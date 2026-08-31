@@ -1,4 +1,4 @@
-const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen, crashReporter } = require("electron");
+const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen, crashReporter, contentTracing } = require("electron");
 const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
@@ -17,7 +17,7 @@ const {
   SPAWN_MARKER,
 } = require("./bundle-integrity");
 const { findConfiguredDashboardPort } = require("./data-home");
-const { createTokenRetryHandler } = require("./token-retry");
+const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
 const { createRendererRecovery } = require("./renderer-recovery");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
 const { exitImmersiveModes } = require("./blocking-prompt");
@@ -83,8 +83,8 @@ const {
 } = require("./gateway-recovery");
 const { capturePySpyDump } = require("./pyspy-dump");
 const { createMetricsRecorder, profilingEnabled } = require("./perf-metrics");
-const { createPierrePerfLog } = require("./pierre-perf-log");
-const { createBigAllocLog } = require("./big-alloc-log");
+const { createMemoryWatchLog } = require("./memory-watch-log");
+const { createCageTrace } = require("./cage-trace");
 const { identityFamily, decideGatewayAction, classifyGatewayReadiness, FAMILY_META, HEALTH_IDENTITY_PATH, READY_PATH } = require("./instance-guard");
 const { initMochi, shutdownMochi } = require("./mochi/index");
 const { borrowSessionToken } = require("./mochi-session-token");
@@ -148,6 +148,7 @@ const {
 } = require("./wsl-detection");
 
 const { initNativeLogging } = require("./native-logging");
+const { initGpuPolicy } = require("./disable-gpu");
 
 // Carry settings across the npm `name` rename, by writing the new store's file
 // BEFORE electron-store opens it. Order is load-bearing: construction writes the
@@ -319,6 +320,22 @@ if (!app.requestSingleInstanceLock()) {
     log: (m) => glog(m),
   });
 
+  // Opt-in GPU-disable, applied through the SAME pre-app-ready appendSwitch
+  // seam as native logging above (Chromium reads switches during init, so a
+  // later append is ignored). OFF by default; enabled by KIROCREW_DISABLE_GPU
+  // or the --disable-gpu flag. This is the supported fix for hosts with no
+  // usable GPU — VM guests, Windows RDP sessions, headless/X11-forwarded Linux
+  // — where the renderer otherwise dies with launch-failed / exitCode 18 and
+  // renderer-recovery.js loops. Reading it here (not from forwarded argv on a
+  // second launch, which the single-instance lock drops) is what makes it take
+  // effect on the launch that actually renders.
+  initGpuPolicy({
+    appendSwitch: (name) => app.commandLine.appendSwitch(name),
+    env: process.env,
+    argv: process.argv,
+    log: (m) => glog(m),
+  });
+
   app.on("second-instance", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       // Relaunching the app is a request for the window back; it must win over
@@ -420,19 +437,37 @@ function glog(line) {
   console.log(`[gateway-launch] ${line}`);
 }
 
-// Highlight-churn history for the renderer-crash post-mortem. Module scope
-// because the reports arrive on an ipcMain channel while the flush happens in
-// the window's render-process-gone handler. Holds only plain numbers, bounded to
-// its capacity, and writes nothing until a crash.
-const pierrePerfLog = createPierrePerfLog();
+// Renderer memory trajectory for the crash post-mortem. Module scope because the
+// samples arrive on an ipcMain channel while the flush happens in the window's
+// render-process-gone handler. Holds only plain numbers, bounded to its capacity,
+// and writes nothing until a crash.
+//
+// This one buffer replaces the two identical ones that preceded it
+// (pierre-perf-log + big-alloc-log). They measured allocation PATHS in committed
+// bytes; the renderer dies on the V8 cage's ADDRESS SPACE at 0.5% object-heap
+// occupancy, so both were reading a quantity that can stay flat through the
+// failure. See memory-watch-log.js for the full reasoning.
+const memoryWatchLog = createMemoryWatchLog();
 
-// Sibling of pierrePerfLog for large binary allocations (src/lib/allocWatch.ts):
-// the native log shows the renderer OOMs on the V8 cage with a near-empty JS
-// heap, i.e. on a big ArrayBuffer/TypedArray backing store whose stack V8 could
-// not capture. This buffers the allocation sites reported before each large
-// allocation and flushes them on render-process-gone. Bounded, writes nothing
-// until a crash.
-const bigAllocLog = createBigAllocLog();
+// The authoritative cage figure, armed by the trajectory above rather than run
+// continuously. `external` growth is committed bytes and can miss a cage
+// exhausted purely by RESERVATION (a wasm guard region, a resizable
+// ArrayBuffer's maxByteLength), so when growth appears this records
+// memory-infra's `partition_alloc/partitions/array_buffer` virtual_size — the one
+// figure that is reserved address space. Bounded, cooled down, and capped per
+// run; see cage-trace.js.
+//
+// The path is keyed by the capture's ordinal, NOT by a timestamp: a timestamped
+// name is unique per launch, so repeated capture-triggering runs would pile up
+// multi-MB traces in the logs directory forever. Reusing a fixed set of slots
+// caps the traces on disk at `maxCaptures` files for the lifetime of the install,
+// and the `[cage-trace] capture N written` line in gateway-launch.log carries the
+// timestamp that correlates a slot back to the crash it belongs to.
+const cageTrace = createCageTrace({
+  contentTracing,
+  tracePath: (slot) => path.join(app.getPath("logs"), `cage-trace-${slot}.json`),
+  log: (msg) => glog(msg),
+});
 
 // ── Cross-app gateway ownership (shared ~/.kiro/crew, shared port) ─────────
 // The nightly app and the production app are different bundles sharing one
@@ -2372,22 +2407,27 @@ function createWindow() {
     },
   });
   mainWindow.webContents.on("render-process-gone", (_e, details) => {
-    // Flush the highlight history FIRST so the log reads in causal order: what
-    // the highlighter was doing, then the death and what the processes had grown
-    // to. Unconditional -- this is the moment the buffer was kept for, and it is
-    // also the one moment the write cost is justified. An empty flush is itself
-    // informative: no highlighting in the last two minutes points away from the
-    // Pierre worker pool as the cause.
-    for (const line of pierrePerfLog.flush()) glog(line);
-    // Then the large-allocation history: on a cage OOM the last entries name the
-    // binary buffer that pierre-perf's near-empty heap numbers cannot. Also
-    // unconditional. An empty flush rules out only LARGE JS-CONSTRUCTED buffers
-    // IN THE MAIN FRAME: the watcher sees JS constructor calls at or above its
-    // threshold in the top-level document, so a cage exhausted by host-API
-    // backing stores, cumulative sub-threshold buffers, a grown resizable
-    // ArrayBuffer, or allocations made off the main frame (workers, subframes,
-    // WASM memory) flushes empty too.
-    for (const line of bigAllocLog.flush()) glog(line);
+    // Flush the memory trajectory FIRST so the log reads in causal order: how
+    // memory was moving, then the death and what the processes had grown to.
+    // Unconditional -- this is the moment the buffer was kept for, and it is also
+    // the one moment the write cost is justified.
+    //
+    // How to read the summary. `externalDelta` climbing into the hundreds of MB
+    // while `peakJsHeap` stays flat is backing-store growth, and the culprit is a
+    // cage resident: the trace file (if one armed) names the partition.
+    // `externalDelta` near zero does NOT exonerate buffers on its own -- external
+    // memory is COMMITTED bytes, and a cage can be exhausted by RESERVATION alone
+    // (a wasm32 guard region, a resizable ArrayBuffer's maxByteLength), which only
+    // the cage trace's virtual_size can see. And `externalMoved=NO-FROZEN-VALUE`
+    // means the instrument itself is not measuring: performance.memory is
+    // bucketized and cached for 20 minutes unless precise memory info is on, so
+    // treat that verdict as a broken probe, not as a flat trend.
+    for (const line of memoryWatchLog.flush()) glog(line);
+    // Then land any capture that was in flight. A renderer dying mid-capture is
+    // the most valuable trace there is, and an unstopped recording is never
+    // written to disk at all -- so this must run even though the process is
+    // already gone.
+    void cageTrace.stopForCrash();
     rendererRecovery.handleGone(details || {});
   });
 
@@ -3089,7 +3129,17 @@ async function showUnrecoverableGatewayError(win, port, options = {}) {
   if (win === mainWindow) { isQuitting = true; app.quit(); } else { win.destroy(); }
 }
 
-async function showLoadingThenConnect(win, backendUrl = BACKEND_URL, { reconnect = false } = {}) {
+function dashboardEntryUrl(backendUrl, initialPath = "", token = "") {
+  const target = initialPath ? new URL(initialPath, backendUrl) : new URL(backendUrl);
+  if (token) target.searchParams.set("token", token);
+  return target.toString();
+}
+
+async function showLoadingThenConnect(
+  win,
+  backendUrl = BACKEND_URL,
+  { reconnect = false, initialPath = "" } = {},
+) {
   const healthUrl = `${backendUrl}/api/status`;
   const wc = win.webContents;
   // Paint the splash in the user's chosen accent (persisted from a prior session
@@ -3122,8 +3172,8 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL, { reconnect
         // gateway is ready, then fade out and hand off to the dashboard.
         await fadeLoadingScreen(wc);
         if (win.isDestroyed()) return;
-        wc.loadURL(`${backendUrl}?token=${token}`);
-        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        wc.loadURL(dashboardEntryUrl(backendUrl, initialPath, token));
+        if (backendUrl === BACKEND_URL && win === mainWindow) startLivenessMonitor(win);
         return;
       }
 
@@ -3138,8 +3188,8 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL, { reconnect
 
       if (status !== 403) {
         // Not an auth block — the gateway serves without a token.
-        wc.loadURL(backendUrl);
-        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        wc.loadURL(dashboardEntryUrl(backendUrl, initialPath));
+        if (backendUrl === BACKEND_URL && win === mainWindow) startLivenessMonitor(win);
         return;
       }
 
@@ -3327,7 +3377,7 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL, { reconnect
         // Deliberately NOT flagged as a reconnect: every path here goes through a
         // dialog button the user just clicked, so the re-entry may raise (#6373).
         if (win.isDestroyed()) return;
-        return showLoadingThenConnect(win, backendUrl);
+        return showLoadingThenConnect(win, backendUrl, { initialPath });
       }
       // Quit
       if (win === mainWindow) {
@@ -3339,6 +3389,69 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL, { reconnect
       return;
     }
   }
+}
+
+// ── Standalone dashboard windows ──
+
+function createConnectionWindow(backendUrl, port, initialPath = "") {
+  const connOpts = {
+    width: 1280,
+    height: 860,
+    minWidth: 550,
+    minHeight: 600,
+    backgroundColor: "#0f1117",
+  };
+  // Same platform-conditional chrome as the main window (see createWindow):
+  // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
+  // frame:false on CSD-preferring Linux desktops, native frame elsewhere.
+  if (IS_MAC) connOpts.titleBarStyle = "hidden";
+  if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
+  if (IS_WINDOWS) {
+    connOpts.titleBarStyle = "hidden";
+    connOpts.autoHideMenuBar = true;
+    connOpts.titleBarOverlay = {
+      color: WINDOWS_TITLEBAR_BACKGROUND,
+      symbolColor: nativeTheme.shouldUseDarkColors
+        ? WINDOWS_TITLEBAR_SYMBOL_DARK
+        : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
+      height: HEADER_CSS_PX,
+    };
+  }
+  if (LINUX_FRAMELESS) {
+    connOpts.frame = false;
+    connOpts.autoHideMenuBar = true; // same rationale as createWindow
+  }
+  const connWin = new BaseWindow(connOpts);
+  if (IS_WINDOWS && typeof connWin.setMenuBarVisibility === "function") {
+    connWin.setMenuBarVisibility(false);
+  }
+
+  setupWindowContents(connWin, backendUrl);
+
+  // `initialPath` may carry a one-shot intent ("/chat?new=1" mints a blank
+  // session), so the 403 retry must re-request where the window ACTUALLY is --
+  // replaying a consumed intent would mint a second session over the one on
+  // screen. Updated before onNavigate runs, so a 403 uses the URL that failed.
+  let retryTarget = initialPath;
+  const onNavigate = createTokenRetryHandler(async () => {
+    let token = await fetchLocalToken(backendUrl);
+    if (!token) ({ token } = await fetchRemoteToken(port));
+    if (token && !connWin.isDestroyed()) {
+      connWin.webContents.loadURL(dashboardEntryUrl(backendUrl, retryTarget, token));
+    }
+  });
+  connWin.webContents.on("did-navigate", (_e, url, httpCode) => {
+    retryTarget = dashboardRetryPath(url, backendUrl, retryTarget);
+    onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
+  });
+
+  return connWin;
+}
+
+async function openNewSessionWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const win = createConnectionWindow(BACKEND_URL, PORT, "/chat?new=1");
+  await showLoadingThenConnect(win, BACKEND_URL, { initialPath: "/chat?new=1" });
 }
 
 // ── New Connection Window ──
@@ -3381,51 +3494,7 @@ async function openNewConnectionWindow() {
     if (!mainWindow || mainWindow.isDestroyed()) return;
 
     const backendUrl = `http://localhost:${port}`;
-    const connOpts = {
-      width: 1280,
-      height: 860,
-      minWidth: 550,
-      minHeight: 600,
-      backgroundColor: "#0f1117",
-    };
-    // Same platform-conditional chrome as the main window (see createWindow):
-    // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
-    // frame:false on CSD-preferring Linux desktops, native frame elsewhere.
-    if (IS_MAC) connOpts.titleBarStyle = "hidden";
-    if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
-    if (IS_WINDOWS) {
-      connOpts.titleBarStyle = "hidden";
-      connOpts.autoHideMenuBar = true;
-      connOpts.titleBarOverlay = {
-        color: WINDOWS_TITLEBAR_BACKGROUND,
-        symbolColor: nativeTheme.shouldUseDarkColors
-          ? WINDOWS_TITLEBAR_SYMBOL_DARK
-          : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
-        height: HEADER_CSS_PX,
-      };
-    }
-    if (LINUX_FRAMELESS) {
-      connOpts.frame = false;
-      connOpts.autoHideMenuBar = true; // same rationale as createWindow
-    }
-    const connWin = new BaseWindow(connOpts);
-    if (IS_WINDOWS && typeof connWin.setMenuBarVisibility === "function") {
-      connWin.setMenuBarVisibility(false);
-    }
-
-    setupWindowContents(connWin, backendUrl);
-
-    const onNavigate = createTokenRetryHandler(async () => {
-      let token = await fetchLocalToken(backendUrl);
-      if (!token) ({ token } = await fetchRemoteToken(port));
-      if (token && !connWin.isDestroyed()) {
-        connWin.webContents.loadURL(`${backendUrl}?token=${token}`);
-      }
-    });
-    connWin.webContents.on("did-navigate", (_e, _url, httpCode) => {
-      onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
-    });
-
+    const connWin = createConnectionWindow(backendUrl, port);
     // Every connection is a standalone window (tracked for menu actions).
     await showLoadingThenConnect(connWin, backendUrl);
   });
@@ -3689,6 +3758,7 @@ app.whenReady().then(async () => {
       // same persisted state createWindow() restores from.
       alwaysOnTop: !!(store.get("windowState") || {}).alwaysOnTop,
       toggleAlwaysOnTop,
+      openNewSessionWindow: () => openNewSessionWindow(),
       openNewConnectionWindow: () => openNewConnectionWindow(),
       renameCurrentWindow: () => renameCurrentWindow(),
       promptRemoteHost: () => promptRemoteHost(),
@@ -4118,48 +4188,41 @@ app.whenReady().then(async () => {
     }
   });
 
-  // Pierre highlight-churn reports (src/lib/pierrePerf.ts). Buffered in memory
-  // and flushed to the log only when the renderer dies -- see pierre-perf-log.js
-  // for why nothing is written in steady state (glog has no rotation, so a line
-  // every few seconds would grow the user's log without bound).
+  // Renderer memory-trajectory samples (src/lib/memoryWatch.ts). Buffered in
+  // memory and flushed to the log only when the renderer dies -- see
+  // memory-watch-log.js for why nothing is written in steady state (glog has no
+  // rotation, so a line every few seconds would grow the user's log without
+  // bound).
   //
-  // The payoff: every future renderer crash carries the two minutes of
-  // highlighter activity that preceded it, on a normal install, with no env var
-  // set ahead of time.
+  // The payoff over the two probes this replaces: every future renderer crash
+  // carries the five minutes of MEMORY MOVEMENT that preceded it, measured on the
+  // resource that actually runs out. The previous instruments recorded allocation
+  // paths in committed bytes, and the crash is a cage ADDRESS-SPACE exhaustion at
+  // 0.5% object-heap occupancy -- so they could report healthy right up to the
+  // abort, which is what they did across 11 consecutive crashes.
   //
-  // KIROCREW_DEBUG additionally logs each window as it arrives, for watching a
+  // KIROCREW_DEBUG additionally logs each sample as it arrives, for watching a
   // live reproduction instead of reading a post-mortem. Checked per message so
   // toggling the variable needs no rebuild.
-  ipcMain.on("pierre-perf", (_event, w) => {
-    // Only the primary renderer's activity belongs in this buffer. The channel is
-    // reachable from any window that loads the shared preload (companion panels,
-    // secondary dashboards), but the flush is triggered by THIS window's
-    // render-process-gone -- so accepting a sibling's reports would file its
-    // highlighting under the primary renderer's crash history and point the
+  ipcMain.on("memory-sample", (_event, s) => {
+    // Only the primary renderer's trajectory belongs in this buffer. The channel
+    // is reachable from any window that loads the shared preload (companion
+    // panels, secondary dashboards), but the flush is triggered by THIS window's
+    // render-process-gone -- so accepting a sibling's samples would file its
+    // memory growth under the primary renderer's crash history and point the
     // post-mortem at the wrong process. Mis-attributed evidence is worse than
     // none, because it is acted upon.
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (_event.sender !== mainWindow.webContents) return;
-    if (!pierrePerfLog.record(w)) return;
+    if (!memoryWatchLog.record(s)) return;
+    // Let the cheap always-on series decide when the expensive authoritative one
+    // runs. A detailed memory-infra dump walks every allocator in every process,
+    // so it is not something to hold on continuously for a crash that happens a
+    // few times a week -- but the run-up to this crash IS growth, which is exactly
+    // the signal available here.
+    void cageTrace.considerArming(memoryWatchLog.oldestExternalKB(), memoryWatchLog.latestExternalKB());
     if (!profilingEnabled(process.env)) return;
-    const line = pierrePerfLog.lastLine();
-    if (line) glog(line);
-  });
-
-  // Large binary-allocation reports (src/lib/allocWatch.ts). Buffered in memory
-  // and flushed on render-process-gone next to the crash line — the last entries
-  // name the ArrayBuffer/TypedArray behind a V8 cage OOM, which pierre-perf's
-  // heap numbers show but cannot attribute. Steady state writes nothing (glog has
-  // no rotation); KIROCREW_DEBUG logs each event as it arrives for a live repro.
-  ipcMain.on("big-alloc", (_event, ev) => {
-    // Same primary-renderer discipline as pierre-perf: the flush is triggered by
-    // THIS window's death, so a sibling window's report would be filed under the
-    // wrong process's crash history. Mis-attributed evidence is worse than none.
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    if (_event.sender !== mainWindow.webContents) return;
-    if (!bigAllocLog.record(ev)) return;
-    if (!profilingEnabled(process.env)) return;
-    const line = bigAllocLog.lastLine();
+    const line = memoryWatchLog.lastLine();
     if (line) glog(line);
   });
 
@@ -4371,6 +4434,14 @@ app.on("before-quit", () => {
   isQuitting = true;
   // Flush the final metrics window before the gateway teardown begins.
   try { if (desktopMetricsRecorder) desktopMetricsRecorder.stop(); } catch { /* best effort */ }
+  // Land an armed cage capture before teardown. Its window timer is unref'd so it
+  // will never fire during shutdown, and stopRecording is the only thing that
+  // writes the trace -- without this call the capture still running when the
+  // session ended, often the most interesting one, is discarded outright.
+  // Best-effort by design: before-quit cannot await, and we deliberately do NOT
+  // preventDefault to buy time, because a diagnostic that can stall a user's quit
+  // is worse than a trace that occasionally loses the race.
+  void cageTrace.stopForQuit();
   shutdownMochi();
   try { shutdownCrewCompanion(); } catch { /* best effort */ }
   stopGateway();

@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import requires_symlinks
+from kiro_crew.acp.runtime import AcpWorkspaceBindingError
 from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKEND_KIRO, AcpPromptStats
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.messaging.link import ChannelLink
@@ -28,6 +30,12 @@ def cfg():
     return c
 
 
+async def _empty_provider_stream(_command: str):
+    """An empty async iterator for provider methods consumed by ``async for``."""
+    if False:  # pragma: no cover - establishes the async-generator protocol
+        yield None
+
+
 def _mock_provider_factory():
     """Return a factory that creates mock LLMProviders."""
 
@@ -40,10 +48,26 @@ def _mock_provider_factory():
         # "alive" only by truthiness while leaking an un-awaited coroutine.
         m.is_process_alive = lambda: True
         m.context_usage_pct = lambda: 0.0
+        m.context_window_tokens = lambda: 0
         m.has_active_turn = lambda: False
+        m.runtime_info = lambda: (None, None)
+        m.stream_command = MagicMock(side_effect=_empty_provider_stream)
         return m
 
     return factory
+
+
+def _raw_sid(mgr, key: str):
+    """The stored sid, read straight off the map entry.
+
+    ``SessionMap.get`` additionally requires the transcript ``<sid>.json`` to
+    exist on disk, so it answers None for any synthetic sid — which would make a
+    "was it cleared?" assertion pass whether or not the clear ran. These tests
+    care about the stored pointer, so they read it.
+    """
+    from kiro_crew.session_map import canonical_key
+
+    return (mgr._session_map._data.get(canonical_key(key)) or {}).get("sid")
 
 
 def _alive_provider_factory():
@@ -58,7 +82,10 @@ def _alive_provider_factory():
         m.is_process_alive = lambda: True
         m.is_alive = lambda: True
         m.context_usage_pct = lambda: 0.0
+        m.context_window_tokens = lambda: 0
         m.has_active_turn = lambda: False
+        m.runtime_info = lambda: (None, None)
+        m.stream_command = MagicMock(side_effect=_empty_provider_stream)
         return m
 
     return factory
@@ -1979,6 +2006,7 @@ class TestReloadProviderFactory:
         mgr.release("k1")
         # Put something in warm pool
         mock_pool_p = AsyncMock()
+        mock_pool_p.is_process_alive = lambda: False
         mgr._warm_pool.put_nowait((mock_pool_p, "agent"))
 
         with (
@@ -2310,6 +2338,123 @@ class TestDiscardConversation:
         assert not mgr.has_session("k1")
 
     @pytest.mark.asyncio
+    async def test_skip_if_busy_refuses_while_a_turn_holds_the_semaphore(self, cfg):
+        """The guard reads the SEMAPHORE, which is why it has to live here.
+
+        ``get_or_create`` leaves the semaphore held until ``release``, and the
+        provider reports ``has_active_turn() is False`` throughout — a turn that
+        holds the semaphore without a prompt in flight yet. So a CALLER probing
+        the provider and then calling this would see "idle", tear the session
+        down, and take the provider away from a turn that had already been
+        admitted. Refusing here, under the lock that pops the session, is what
+        closes that window.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        # The blind spot, made explicit: the provider says idle while busy.
+        assert provider.has_active_turn() is False
+
+        discarded = await mgr.discard_conversation("k1", replay=False, skip_if_busy=True)
+
+        assert discarded is False
+        provider.shutdown.assert_not_awaited()
+        assert mgr.has_session("k1"), "the refusal must leave the session intact"
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_changes_nothing_at_all(self, cfg):
+        """Not a partial teardown: the replay flag must not move either, or the
+        caller's retry would find suppression already consumed."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+
+        assert await mgr.discard_conversation("k1", replay=False, skip_if_busy=True) is False
+
+        assert mgr.consume_replay_suppression("k1") is False
+
+    @pytest.mark.asyncio
+    async def test_skip_if_busy_proceeds_once_the_turn_releases(self, cfg):
+        """The refusal is a wait, not a cancellation."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        assert await mgr.discard_conversation("k1", replay=False, skip_if_busy=True) is False
+
+        mgr.release("k1")
+        discarded = await mgr.discard_conversation("k1", replay=False, skip_if_busy=True)
+
+        assert discarded is True
+        provider.shutdown.assert_awaited_once()
+        assert mgr.consume_replay_suppression("k1") is True
+
+    @pytest.mark.asyncio
+    async def test_the_default_still_tears_down_a_busy_session(self, cfg):
+        """``skip_if_busy`` defaults False, so every pre-existing caller — the
+        poisoned-conversation escalation among them — keeps its behaviour."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+
+        discarded = await mgr.discard_conversation("k1")
+
+        assert discarded is True
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_successor_mapped_during_shutdown_keeps_its_sid(self, cfg):
+        """The sid clear must not outlive the pop.
+
+        Ordered deterministically rather than by timing: the successor is mapped
+        from inside ``provider.shutdown``, which is precisely the await the
+        teardown suspends on. That is the whole window the bug needs — pop, then
+        a concurrent channel turn creates and maps a new session under the same
+        key, then a clear deferred past the shutdown wipes the NEW session's
+        pointer. Clearing in the same tick as the pop closes it.
+
+        Observed on the RAW entry, not through ``SessionMap.get``: that getter
+        additionally requires ``<sid>.json`` to exist on disk, so for a synthetic
+        sid it answers None whether or not the clear ran — which would make this
+        assertion pass with the bug present.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        mgr._session_map.set("k1", "original-sid")
+
+        async def _map_a_successor_while_shutting_down():
+            mgr._session_map.set("k1", "successor-sid")
+
+        provider.shutdown = AsyncMock(side_effect=_map_a_successor_while_shutting_down)
+
+        await mgr.discard_conversation("k1", replay=False)
+
+        provider.shutdown.assert_awaited_once()
+        assert _raw_sid(mgr, "k1") == "successor-sid", (
+            "the successor session's sid was erased by a clear deferred past the " "shutdown await"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_sid_is_still_cleared_with_no_successor(self, cfg):
+        """Scope pin: the clear still happens — it just happens earlier."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        mgr._session_map.set("k1", "original-sid")
+
+        await mgr.discard_conversation("k1", replay=False)
+
+        assert _raw_sid(mgr, "k1") == ""
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_does_not_clear_the_sid(self, cfg):
+        """``skip_if_busy`` refusing must leave the mapping alone too — the clear
+        sits after the early return, not before it."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr._session_map.set("k1", "original-sid")
+
+        assert await mgr.discard_conversation("k1", replay=False, skip_if_busy=True) is False
+
+        assert _raw_sid(mgr, "k1") == "original-sid"
+
+    @pytest.mark.asyncio
     async def test_discard_conversation_unlinks_temp_files_from_the_session_queue(
         self, cfg, tmp_path
     ):
@@ -2506,6 +2651,7 @@ class TestContextInfo:
         with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
             assert SessionManager._resolve_agent_model("small") == "pinned-by-small"
 
+    @requires_symlinks
     def test_resolve_agent_model_refuses_a_link_to_a_sensitive_target(self, tmp_path, monkeypatch):
         """A spec that is a symlink resolving onto a sensitive target is refused,
         so the model is not resolved out of whatever the link names."""
@@ -2977,12 +3123,6 @@ class TestSlackLinkHelpers:
         assert mgr.find_key_by_sid("sid-abc") == "k1"
         assert mgr.find_key_by_sid("unknown") is None
 
-    def test_delete_session_map_entry(self, cfg):
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        mgr._session_map.set("k1", "sid-abc")
-        mgr.delete_session_map_entry("k1")
-        assert mgr.find_key_by_sid("sid-abc") is None
-
 
 class TestGetPid:
     """Tests for get_pid."""
@@ -3012,22 +3152,26 @@ class TestGetPid:
         assert mgr.get_pid("nonexistent") is None
 
 
-class TestIsProviderAliveFallback:
-    """Test is_provider_alive fallback to is_alive when no is_process_alive."""
+class TestIsProviderAliveProcessVerdict:
+    """Test is_provider_alive reads the provider's process-level verdict.
+
+    The is_alive fallback for a provider that does not override
+    ``is_process_alive`` lives in the LLMProvider ABC default, not here —
+    it is pinned by the ABC contract tests in
+    ``test_session_provider_liveness.py``.
+    """
 
     @pytest.mark.asyncio
-    async def test_fallback_to_is_alive(self, cfg):
+    async def test_returns_the_process_liveness_verdict(self, cfg):
         from unittest.mock import MagicMock
 
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("k1")
         mgr.release("k1")
-        # Remove is_process_alive so it falls back
-        if hasattr(provider, "is_process_alive"):
-            del provider.is_process_alive
-        provider.is_alive = MagicMock(return_value=True)
-        result = await mgr.is_provider_alive("k1")
-        assert result is True
+        provider.is_process_alive = MagicMock(return_value=True)
+        assert await mgr.is_provider_alive("k1") is True
+        provider.is_process_alive = MagicMock(return_value=False)
+        assert await mgr.is_provider_alive("k1") is False
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -3273,6 +3417,7 @@ class TestClaudeBackendCompaction:
         # already registered a fresh replacement under the same key.
         replacement_provider = AsyncMock()
         replacement_provider.shutdown = AsyncMock()
+        replacement_provider.is_process_alive = lambda: True
         replacement = _Session(
             provider=replacement_provider, first_turn=FirstTurnState.NOTHING_ARMED
         )
@@ -4265,6 +4410,7 @@ class TestContextInfoBasic:
         bg_info = [i for i in info if i["key"] == BACKGROUND_KEY]
         assert len(bg_info) == 1
         assert "Background" in bg_info[0]["name"]
+        await mgr.close_all()
 
 
 class TestCleanupLoopResilience:
@@ -4952,6 +5098,33 @@ class TestOpenTaskSession:
         mgr.release(key)
         await mgr.release_subagent_runtime(parent)
         await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_macos_workspace_mismatch_uses_dedicated_provider(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        runtime = MagicMock()
+        runtime.create_session = AsyncMock(
+            side_effect=AcpWorkspaceBindingError("exact workspace required")
+        )
+        mgr._get_or_bootstrap_run_runtime = AsyncMock(return_value=runtime)
+        dedicated = MagicMock()
+        mgr.get_or_create = AsyncMock(return_value=(dedicated, True, False))
+
+        result = await mgr.open_task_session(
+            "taskrunner:run3:runtime",
+            "taskrunner:run3:task0",
+            agent="kirocrew",
+            cwd="/repo/packages/app",
+            approval_policy="auto",
+        )
+
+        assert result == (dedicated, True, False)
+        mgr.get_or_create.assert_awaited_once_with(
+            "taskrunner:run3:task0",
+            agent="kirocrew",
+            approval_policy="auto",
+            cwd="/repo/packages/app",
+        )
 
 
 class TestLoadRecoveryHistoryReplay:

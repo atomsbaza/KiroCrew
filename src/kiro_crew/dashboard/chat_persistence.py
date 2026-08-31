@@ -17,9 +17,14 @@ from itertools import islice
 
 from kiro_crew import model_registry
 from kiro_crew.agent import kiro_agents_dir_path
-from kiro_crew.agent_discovery import _read_agent_spec
+from kiro_crew.agent_discovery import agent_model_map
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.config.loader import (
+    CHAT_ENTRY_CACHE_BYTES_DEFAULT,
+    CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
+    KiroCrewConfig,
+    config_dir,
+)
 from kiro_crew.dashboard.channel_slots import slot_closed_since
 from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
@@ -249,22 +254,15 @@ def _build_kiro_model_map() -> dict[str, str]:
     produce a byte-identical dict. Callers restoring many slots should build it
     once and pass it down (see ``kiro_model_map`` params below).
     """
-    out: dict[str, str] = {}
     try:
-        for f in kiro_agents_dir_path().glob("*.json"):
-            # Hardened reader: a refused spec (oversized, sensitive symlink,
-            # non-object JSON, ...) is skipped like an absent one instead of
-            # aborting the whole scan through the outer except.
-            data = _read_agent_spec(f)
-            if data is None:
-                continue
-            model = data.get("model", "")
-            if data.get("name"):
-                out[data["name"]] = model
-            out[f.stem] = model
+        return agent_model_map(
+            agents_dir=kiro_agents_dir_path(),
+            operation="chat_persistence",
+            source="unknown",
+        )
     except Exception:
         logger.debug("Failed to build kiro model map", exc_info=True)
-    return out
+        return {}
 
 
 def _load_restore_cfg() -> "KiroCrewConfig | None":
@@ -1756,14 +1754,20 @@ def _archive_dropped_lines(
 # the bound is a cliff rather than a slope -- each save walks its window in
 # order, so with several slots taking turns the LRU evicts each window just
 # before its next save and the hit rate collapses to zero instead of degrading.
-# The entry bound is therefore chosen to hold several concurrent slot windows.
+# The default entry bound holds several concurrent slot windows; because the
+# right size is host-dependent (a gateway with many active slots overflows the
+# entry bound while the byte bound still has headroom), both the entry bound and
+# the byte ceiling are configurable
+# (``dashboard.chat_entry_cache_max_entries`` / ``chat_entry_cache_max_bytes``).
 #
 # The flush site skips the cache for a window longer than the entry bound, which
 # closes that cliff for ONE oversized window and nothing more. Several slots
 # whose COMBINED windows exceed the bound each stay under it individually, so
-# they take the cached path and hit the same zero-hit cliff unguarded. That is
-# accepted rather than fixed: detecting it needs a live view across slots, while
-# the cost of being wrong is only the key derivation on a miss.
+# they take the cached path and hit the same zero-hit cliff unguarded. Detecting
+# that needs a live view across slots, which no single save has; the mitigation
+# is the configurable entry bound above -- an operator whose host shows the
+# multi-slot cliff raises it -- while the cost of the residual case is only the
+# key derivation on a miss.
 #
 # The entry count alone does NOT bound memory, because an entry is as large as
 # its message: a cache full of megabyte-sized messages would retain gigabytes.
@@ -1773,7 +1777,7 @@ def _archive_dropped_lines(
 # per-entry ceiling above which an entry is computed but never stored (so one
 # huge message cannot evict the whole cache), and a total-byte ceiling evicted
 # alongside the entry count. Worst-case retention is the lesser of
-# ``_ENTRY_CACHE_MAX x _ENTRY_MAX_CACHEABLE_BYTES`` and ``_ENTRY_CACHE_MAX_BYTES``.
+# ``max_entries x _ENTRY_MAX_CACHEABLE_BYTES`` and the configured byte ceiling.
 #
 # Size is measured as the length of the key payload, which the front door has
 # already built for hashing, so it costs nothing extra. It measures the input
@@ -1784,12 +1788,73 @@ def _archive_dropped_lines(
 # holding identical message content share one entry; and a cached ``None`` (a
 # transient role) is a legitimate value, so membership -- not truthiness -- is
 # what distinguishes a hit from a miss.
-_ENTRY_CACHE_MAX = 4096
-_ENTRY_CACHE_MAX_BYTES = 32 * 1024 * 1024
+#
+# ``_ENTRY_MAX_CACHEABLE_BYTES`` stays a module constant: it guards against ONE
+# huge message evicting the whole cache, a shape that does not vary by host the
+# way the working-set bounds do.
 _ENTRY_MAX_CACHEABLE_BYTES = 256 * 1024
 _entry_cache_lock = threading.Lock()
 _entry_cache: OrderedDict[str, tuple[dict | None, int]] = OrderedDict()
 _entry_cache_bytes = 0
+
+# Lazily resolved ``(max_entries, max_bytes)`` for the entry cache. Resolved
+# once per process and then served from this module global: the builder runs on
+# every message of every flush, so it must not stat or parse ``config.json``
+# per call, and the one-time read keeps the hot path free of config I/O the way
+# the loader's push pattern does for the event loop. A changed value therefore
+# takes effect on the next gateway restart, which the config field descriptions
+# state. ``None`` means "not resolved yet"; tests reset it via the autouse
+# cache-isolation fixture in ``test/conftest.py``.
+_entry_cache_bounds_cached: tuple[int, int] | None = None
+_entry_cache_bounds_read_warned = False
+
+
+def _entry_cache_bounds() -> tuple[int, int]:
+    """Configured ``(max_entries, max_bytes)`` bounds for the entry cache.
+
+    Reads the validated config once (loader-clamped to the documented ranges)
+    and memoises the pair for the process lifetime. Falls back to the built-in
+    defaults when the loaded values are not real integers (a stubbed config
+    object would otherwise flow a non-numeric value into the eviction
+    comparison) -- that shape is process-permanent, so it latches. A config
+    read that RAISES falls back to the defaults for this call WITHOUT
+    latching, so a transient failure retries on the next call instead of
+    discarding an operator's setting for the process lifetime; ``load()``
+    degrades to defaults internally rather than raising, so a persistently
+    raising read is not a realistic hot-path cost. The memo is written only
+    after a successful read, which also makes concurrent first calls resolve
+    toward the config value: two successful readers store the same pair, and a
+    failing reader stores nothing.
+    """
+    global _entry_cache_bounds_cached, _entry_cache_bounds_read_warned
+    bounds = _entry_cache_bounds_cached
+    if bounds is None:
+        bounds = (CHAT_ENTRY_CACHE_ENTRIES_DEFAULT, CHAT_ENTRY_CACHE_BYTES_DEFAULT)
+        try:
+            dashboard = KiroCrewConfig.load().dashboard
+            max_entries = dashboard.chat_entry_cache_max_entries
+            max_bytes = dashboard.chat_entry_cache_max_bytes
+            if (
+                isinstance(max_entries, int)
+                and not isinstance(max_entries, bool)
+                and isinstance(max_bytes, int)
+                and not isinstance(max_bytes, bool)
+            ):
+                bounds = (max_entries, max_bytes)
+        except Exception:
+            # Log once per process: silently discarding a configured bound
+            # reproduces the exact symptom (a thrashing cache) the config
+            # exists to fix, with nothing to diagnose from.
+            if not _entry_cache_bounds_read_warned:
+                _entry_cache_bounds_read_warned = True
+                logger.warning(
+                    "chat entry-cache bounds config read failed; using defaults "
+                    "until a read succeeds",
+                    exc_info=True,
+                )
+            return bounds
+        _entry_cache_bounds_cached = bounds
+    return bounds
 
 
 def _approx_window_payload_bytes(window: list[dict]) -> int:
@@ -1858,15 +1923,17 @@ def _build_message_entry(m: dict) -> dict | None:
             return entry
     except Exception:
         return entry
+    # Resolve the configured bounds BEFORE taking the cache lock: the first call
+    # in the process reads config from disk, and that read must not run under a
+    # lock the flush path contends on.
+    max_entries, max_bytes = _entry_cache_bounds()
     with _entry_cache_lock:
         previous = _entry_cache.pop(key, None)
         if previous is not None:
             _entry_cache_bytes -= previous[1]
         _entry_cache[key] = (entry, size)
         _entry_cache_bytes += size
-        while _entry_cache and (
-            len(_entry_cache) > _ENTRY_CACHE_MAX or _entry_cache_bytes > _ENTRY_CACHE_MAX_BYTES
-        ):
+        while _entry_cache and (len(_entry_cache) > max_entries or _entry_cache_bytes > max_bytes):
             _, (_evicted_entry, evicted_size) = _entry_cache.popitem(last=False)
             _entry_cache_bytes -= evicted_size
     return entry
@@ -2779,11 +2846,13 @@ def _save_slot_to_history(
             # window whose payload exceeds the BYTE ceiling self-evicts the same
             # way at a far smaller message count, so it is gated too, on a cheap
             # lower-bound estimate rather than on a measurement that would itself
-            # cost what the bypass saves.
+            # cost what the bypass saves. Gated on the same configured bounds the
+            # cache evicts by, so raising them widens the cached path in step.
+            cache_max_entries, cache_max_bytes = _entry_cache_bounds()
             build_entry = (
                 _build_message_entry_uncached
-                if len(window) > _ENTRY_CACHE_MAX
-                or _approx_window_payload_bytes(window) > _ENTRY_CACHE_MAX_BYTES
+                if len(window) > cache_max_entries
+                or _approx_window_payload_bytes(window) > cache_max_bytes
                 else _build_message_entry
             )
             window_entries = [e for m in window if (e := build_entry(m)) is not None]
@@ -2892,7 +2961,69 @@ def _save_slot_to_history(
             # from ``existing_meta`` when present), so the delete-won guard can
             # recognize a file recreated by another writer after a permanent
             # delete on the NEXT save.
+            #
+            # Read before the rotation below, but valid after it either way:
+            # rotation rewrites the meta line to stamp ``rotated_at`` and
+            # preserves every other field, so ``created_at`` — the only field
+            # this identity depends on — survives a rotation unchanged.
             slot._disk_meta_created_at = str(meta_line.get("created_at") or "")
+            # Enforce the session byte cap on THIS path too, against the FROZEN
+            # PREFIX. ``_maybe_rotate`` used to have exactly one caller
+            # (``ConversationLog.append``), so a transcript written only through
+            # this whole-file save was never size-checked while the documented cap
+            # said otherwise. The prefix is also the part that actually grows
+            # without bound: the live window is capped at ``_MAX_SLOT_MESSAGES``,
+            # so every byte a long session accumulates beyond that lands in the
+            # prefix, and the prefix is what this save re-emits verbatim forever.
+            #
+            # ``max_drop`` is the whole reason this call is safe. This save writes
+            # ``meta + frozen_prefix + serialize(window)``, so a line rotation
+            # drops from the WINDOW region is one the slot still holds in
+            # ``slot.messages`` — the next save re-emits it, rotation drops it
+            # again, and the two churn forever. Measured on the unbounded call at
+            # 30 x 100 KB with no frozen prefix: rotation dropped 10 window rows,
+            # and each of the next 5 ordinary saves resurrected and re-dropped the
+            # same 10 (5 rotations, 50 re-archived lines). Capping the drop at the
+            # prefix leaves the window's head as the file's first message line,
+            # which is the only state the frozen-prefix + window model can
+            # express; there is no representable state with a hole at the front of
+            # the window.
+            #
+            # Deliberately NOT closed by trimming ``slot.messages`` instead: this
+            # runs in the flush executor thread (see the snapshot rationale at the
+            # top of this function), where every other window mutation in the
+            # dashboard is loop-only, and it would delete messages out from under
+            # an open tab. The cost of the cap is that a session whose entire
+            # transcript is still its live window stays oversized until the memory
+            # trim gives it a prefix, or until an ``append`` writer rotates it
+            # uncapped. Oversized is recoverable; churn and lost rows are not.
+            #
+            # The ceiling is counted off the prefix bytes actually written, not
+            # ``disk_older``: on a short/truncated file the prefix carries fewer
+            # lines than the counter claims, and ``count("\n")`` is the count that
+            # matches how rotation will re-split the file.
+            #
+            # Called INSIDE ``_locked`` and after the mtime restore, so rotation
+            # cannot race another writer and cannot resurrect an mtime the close
+            # path deliberately rewound.
+            dropped = state.conversation_log._maybe_rotate(
+                path, history_key, max_drop=frozen_prefix.count("\n")
+            )
+            if dropped:
+                # Rotation removed leading messages, which moves the frozen-prefix
+                # boundary this slot is holding. Reconcile it: without this, every
+                # later save rebuilds its payload from ``body[:disk_older]`` — a
+                # floor that no longer exists — RESURRECTING the dropped messages,
+                # which rotation then drops again.
+                #
+                # A plain subtraction, because ``max_drop`` above guarantees
+                # ``dropped`` came entirely from the prefix. ``_disk_window_len``
+                # is deliberately left alone: it is a PREFIX length over the
+                # window ("``messages[:n]`` are on disk"), so there is no value it
+                # could take to describe a window whose head is missing from disk —
+                # which is exactly why rotation is not allowed to create that
+                # state.
+                slot._disk_older_count = max(0, slot._disk_older_count - dropped)
             # Record the post-write mtime in the frozen-prefix cache (even when
             # there is no frozen prefix, ``disk_older == 0``). The cache doubles
             # as the "did another process touch this file since we last wrote
@@ -2905,17 +3036,28 @@ def _save_slot_to_history(
             # the on-disk window region (after the frozen prefix), and because
             # ``disk_older`` is unchanged a bare frozen+window rebuild on the next
             # save would otherwise silently delete them.
-            try:
-                _st = path.stat()
-                slot._frozen_prefix_cache = (
-                    _st.st_mtime,
-                    _st.st_size,
-                    disk_older,
-                    frozen_prefix,
-                    foreign_lines,
-                )
-            except OSError:
+            #
+            # After a rotation the cached tuple would be stale on the two fields
+            # that matter: ``disk_older`` and ``frozen_prefix`` describe the
+            # pre-rotation file. Caching it is worse than caching nothing,
+            # because the next save trusts the cache instead of re-reading and so
+            # re-emits the dropped rows. Drop the cache and let that save pay one
+            # O(file) re-read against the reconciled counts above; rotation is
+            # rare, so this costs nothing on the steady path.
+            if dropped:
                 slot._frozen_prefix_cache = None
+            else:
+                try:
+                    _st = path.stat()
+                    slot._frozen_prefix_cache = (
+                        _st.st_mtime,
+                        _st.st_size,
+                        disk_older,
+                        frozen_prefix,
+                        foreign_lines,
+                    )
+                except OSError:
+                    slot._frozen_prefix_cache = None
             state.conversation_log._invalidate_cache(history_key)
             state.conversation_log.note_tab_id(history_key, tab_id)
             return True

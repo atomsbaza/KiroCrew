@@ -22,7 +22,7 @@ import logging
 import re
 from typing import Any, Awaitable, Callable
 
-from kiro_crew import session_directive
+from kiro_crew import name_grant, session_directive
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
@@ -61,11 +61,14 @@ APPROVAL_INTERACTIVE = "interactive"
 #: e.g. by awaiting a button click). Returns None/False => deny.
 ApprovalDecider = Callable[[Any], Awaitable[bool]]
 
-#: A synchronous predicate: given a tool title, return True to auto-approve
-#: that tool regardless of the interactive ladder. The caller injects this
-#: (keeping the driver channel-neutral) to preserve hook-driven auto-approval
-#: such as ``auto_approve_subagent_spawn`` for the ``spawn_run`` tool.
-AutoApprovePredicate = Callable[[str], bool]
+#: A synchronous predicate: given the PERMISSION EVENT, return True to
+#: auto-approve that tool regardless of the interactive ladder. The caller
+#: injects this (keeping the driver channel-neutral) to preserve hook-driven
+#: auto-approval such as ``auto_approve_subagent_spawn`` for the ``spawn_run``
+#: tool. It receives the whole event — never just the title — because the
+#: title is model-authored and a security predicate must key on canonical
+#: identity (``event.tool_name`` / ``event.is_shell``).
+AutoApprovePredicate = Callable[[Any], bool]
 
 #: A session-directive consumer: ``(kind, args) -> awaitable``. The driver
 #: invokes it when a genuine directive-tool result (see ``session_directive``)
@@ -277,11 +280,14 @@ class TurnDriver:
         Optional async callback for the interactive ladder. When omitted,
         interactive mode is deny-by-default.
     auto_approve_tool:
-        Optional sync predicate ``(tool_title) -> bool``. When it returns
-        True for a permission request, the tool is auto-approved immediately
-        (no buttons, no decider wait), mirroring native ``handle_message``'s
-        ``auto_approve_subagent_spawn`` hook for ``spawn_run``. Injected by the
-        caller so the driver stays channel-neutral.
+        Optional sync predicate ``(permission_event) -> bool``. When it
+        returns True for a permission request, the tool is auto-approved
+        immediately (no buttons, no decider wait), mirroring native
+        ``handle_message``'s ``auto_approve_subagent_spawn`` hook for
+        ``spawn_run``. It receives the EVENT so the check can use canonical,
+        non-model-authored identity (``tool_name``/``is_shell``) rather than
+        the forgeable title. Injected by the caller so the driver stays
+        channel-neutral.
     deny_all_tools:
         Reject EVERY permission request, before any auto-approve path. For a turn
         driven by a sender the channel does not trust as its operator: the
@@ -316,6 +322,9 @@ class TurnDriver:
         deny_all_tools: bool = False,
         tool_gate: Callable[[Any], str] | None = None,
         directive_consumer: DirectiveConsumer | None = None,
+        audit_session_key: str = "",
+        audit_agent: str = "kirocrew",
+        closing_gate: Callable[[], None] | None = None,
     ) -> None:
         self.provider = provider
         self.renderer = renderer
@@ -324,6 +333,12 @@ class TurnDriver:
         self.auto_approve_tool = auto_approve_tool
         self.auto_approve_session = auto_approve_session
         self.deny_all_tools = deny_all_tools
+        # Audit identity ONLY — injected by the caller (which owns the session
+        # key and agent name) so the driver's security-decision audit rows are
+        # attributable without the driver importing any channel module. Never
+        # used for routing or authorization.
+        self.audit_session_key = audit_session_key
+        self.audit_agent = audit_agent
         # PreToolUse security gate: given a permission-request event, returns
         # "deny" (hard-block, un-overridable), "auto_approve" (hook approves,
         # e.g. reads), or "" (passthrough to the approval ladder). Injected by
@@ -339,6 +354,14 @@ class TurnDriver:
         # Terminal stop reason of the last run() — read by the dispatcher's
         # post-turn bookkeeping (e.g. COMPACTION_FAILED -> session reset).
         self.last_stop_reason: str = ""
+        # Synchronous pre-registration shutdown gate, supplied by the dispatcher
+        # as a zero-arg closure over its SessionManager and session key. It lives
+        # HERE rather than at each call site because the only placement that is
+        # actually atomic is the one immediately before the provider stream opens,
+        # and `run()` owns that line. Raising from it aborts the turn before any
+        # prompt is registered. A driver built without one keeps the old ungated
+        # behaviour, so a stand-in predating the parameter still works.
+        self.closing_gate = closing_gate
 
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
@@ -410,6 +433,25 @@ class TurnDriver:
                 )
 
         await self.renderer.on_turn_start()
+        # Lease-dispatch race gate, placed HERE because this is the only line at
+        # which it is actually atomic. The dispatcher claimed the session long
+        # before this, and everything since -- the context build, and the
+        # `on_turn_start` platform round-trip immediately above -- is awaited. A
+        # gate at the call site therefore still leaves that round-trip open: a
+        # restart landing in it sets `_closing` and takes `close_all`'s drain
+        # snapshot while no turn is registered, and the prompt below then opens
+        # BEHIND that snapshot, where teardown kills it mid-turn holding its
+        # native lock and the user gets an empty response instead of a notice.
+        #
+        # Synchronous, with no await between this call and the `async for` below.
+        # `provider.stream(...)` registers the turn before its own first await
+        # (AcpClient.stream_events clears _turn_done up front), so the gate and
+        # the registration form one span ordered against `_closing`. This is the
+        # same shape the dashboard runner and the native Slack handler use, and
+        # the reason the gate is one line here rather than four at the call
+        # sites. Raises SessionClosingError, which each dispatcher catches.
+        if self.closing_gate is not None:
+            self.closing_gate()
         async for event in self.provider.stream(message):
             kind = event.kind
             if kind == EVENT_TEXT_CHUNK:
@@ -520,27 +562,70 @@ class TurnDriver:
                         )
                         continue
                     if _gate == "auto_approve":
-                        await self.provider.approve_tool(event.request_id)
-                        sel().log_api_access(
-                            caller="turn_driver",
-                            operation="tool_permission",
-                            outcome="auto_approved",
-                            source="messaging",
-                            resources=(
-                                f"request_id={event.request_id} "
-                                f"mode={self.approval_mode} reason=hook"
-                            ),
+                        # The gate's hook granted this by NAME (the
+                        # `auto_approve_tools` globs, or the read-only
+                        # allowlist). Honour it only while each program name in
+                        # the command still resolves to the program it appears
+                        # to name; a shadowed, agent-tree or unidentified
+                        # resolution DOWNGRADES to the ladder below (spawn
+                        # hook, session trust, interactive buttons,
+                        # deny-by-default) — never a hard block. The check is
+                        # awaited HERE, at the one honour point shared by every
+                        # channel's gate, because each channel's `_tool_gate`
+                        # is synchronous and loop-bound and must not do the
+                        # check's filesystem work.
+                        _ng_refusal = await name_grant.refusal_for_event(event)
+                        if _ng_refusal is None:
+                            await self.provider.approve_tool(event.request_id)
+                            sel().log_api_access(
+                                caller="turn_driver",
+                                operation="tool_permission",
+                                outcome="auto_approved",
+                                source="messaging",
+                                resources=(
+                                    f"request_id={event.request_id} "
+                                    f"mode={self.approval_mode} reason=hook"
+                                ),
+                            )
+                            continue
+                        logger.warning(
+                            "declining a hook auto-approve: %s; the request "
+                            "falls through to the channel's normal approval "
+                            "ladder",
+                            _ng_refusal.log_text,
                         )
-                        continue
+                        # The decline row uses the shared cross-surface writer
+                        # (log_tool_invocation) rather than this ladder's
+                        # log_api_access rows, so every surface's decline has
+                        # ONE shape and the disclosure rule (constant log_text
+                        # + code, redacted title, never the detail) lives in
+                        # one place.
+                        name_grant.log_decline(
+                            # Empty source: SEL infers the real transport
+                            # (discord/telegram/...) from the session key's
+                            # namespace prefix. The driver is channel-neutral,
+                            # so naming a surface here would misattribute all
+                            # four transports to one made-up value.
+                            source="",
+                            # The caller-injected audit identity: the driver
+                            # itself is channel-neutral, but the one security
+                            # decision it makes must be attributable to a
+                            # session and agent.
+                            session_key=self.audit_session_key,
+                            agent=self.audit_agent,
+                            event=event,
+                            refusal=_ng_refusal,
+                            tier="hook_auto_approve",
+                            metadata={"mode": self.approval_mode},
+                            sel_factory=sel,
+                        )
                 # Early auto-approve paths take precedence over the interactive
                 # ladder, mirroring native handle_message: approve immediately,
                 # no buttons, no decider wait.
                 #  - hook: auto_approve_subagent_spawn -> spawn_run
                 #  - per-session Trust / global YOLO (injected predicate)
                 _auto_reason = ""
-                if self.auto_approve_tool is not None and self.auto_approve_tool(
-                    getattr(event, "title", "") or ""
-                ):
+                if self.auto_approve_tool is not None and self.auto_approve_tool(event):
                     _auto_reason = "hook_auto_approve"
                 elif self.auto_approve_session is not None and self.auto_approve_session():
                     _auto_reason = "session_trust"

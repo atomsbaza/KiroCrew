@@ -990,6 +990,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.pr-and-issue-chips-on-session-cards",
+    "label": "PR and Issue Chips on Session Cards",
+    "labelKey": "pages.settings.chatPanel.session_card_source_links",
+    "description": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.prevent-sleep-while-running",
     "label": "Prevent sleep while running",
     "labelKey": "pages.settings.chatPanel.prevent_sleep_while_running",
@@ -1363,13 +1372,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "instances.chat-on-a-crew",
+    "label": "Chat on a crew",
+    "labelKey": "pages.settings.remoteCrewPanel.chat_on_a_crew",
+    "description": "Adds “New chat on crew” to the create menu, which starts a session that runs on a connected crew. Unfinished: it opens in that crew’s own pane, and sessions running on a crew are not listed here yet.",
+    "tab": "instances",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "instances.enable-remote-crew-management",
     "labelKey": "pages.settings.instancesPanel.enable_remote_crew_management",
     "tab": "instances",
     "type": "toggle",
     "occurrence": 1,
     "configKey": "instances.enabled",
-    "label": "Enable remote crew management"
+    "label": "Enable remote instance management"
   },
   {
     "id": "notifications.sound-category-turn",
@@ -1423,6 +1441,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "notifications",
     "type": "toggle",
     "occurrence": 1
+  },
+  {
+    "id": "notifications.sound-category-agent",
+    "labelKey": "pages.settings.notificationsPanel.category_agent",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Proactive agent messages",
+    "description": "When the agent proactively messages you outside a chat"
+  },
+  {
+    "id": "notifications.sound-category-skills",
+    "labelKey": "pages.settings.notificationsPanel.category_skills",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Skills",
+    "description": "New skill candidates awaiting your approval"
   },
   {
     "id": "notifications.sources",
@@ -1565,7 +1601,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "section": "rules"
     },
     "label": "Your custom denies",
-    "description": "Add your own deny patterns (Python-compatible regex). These are enforced at Kiro Crew's PreToolUse gate alongside the built-in rules."
+    "description": "Add your own deny patterns (Python-compatible regex). These are enforced at {{productName}}'s PreToolUse gate alongside the built-in rules."
   },
   {
     "id": "shortcuts.enable-shortcuts",
@@ -1733,7 +1769,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.model",
     "label": "Model",
     "labelKey": "pages.settings.sttSettings.model",
-    "description": "Larger models are more accurate but slower to run. A model downloads on first use, so the first dictation after switching models may appear to hang or time out while the download completes.",
+    "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,

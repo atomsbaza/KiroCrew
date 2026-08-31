@@ -532,6 +532,24 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "and replayed into later context.",
     ),
     (
+        "Auto-skill update merge prompt",
+        "history_consolidation.py",
+        "The existing live skill body is redacted before it enters the model prompt "
+        "that merges a proposed update, and the model's merged output is scanned again.",
+    ),
+    (
+        "Auto-skill pending candidate staging",
+        "history_consolidation.py",
+        "LLM-authored descriptions, triggers, procedures, and generated scripts are "
+        "redacted before SkillsLoader writes a pending create or update candidate.",
+    ),
+    (
+        "Auto-skill direct publication",
+        "history_consolidation.py",
+        "LLM-authored descriptions, triggers, and procedures are redacted before "
+        "immediate live skill creation or direct refinement through SkillsLoader.",
+    ),
+    (
         "Side-panel stream",
         "dashboard/handlers/side.py",
         "StreamRedactor mirroring the main chat for the side-question stream.",
@@ -1204,6 +1222,22 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # hygiene so a response echoing a credential or exfiltration URL cannot
         # leak into the log ring / /api/logs stream; not an egress boundary.
         "task_planner.py",
+        # Audit-side log hygiene: log_decline scrubs the model-authored tool
+        # title before writing the shared auto_approve_declined SEL row. The
+        # audit log is a gate-side record, not an output bound for a human or
+        # a third party — the surfaces that SHOW a refusal (the dashboard's
+        # notice line) are the registered sinks.
+        "name_grant.py",
+        # Internal coordinator partitions behind the single registered
+        # ``subagent.py`` output boundary.  They redact lifecycle payloads before
+        # handing them to facade-owned event/completion callbacks, but the split
+        # adds no new transport or audience and therefore no additional posture
+        # row.
+        "subagent_manager/admission.py",
+        "subagent_manager/continuation.py",
+        "subagent_manager/monitoring.py",
+        "subagent_manager/run.py",
+        "subagent_manager/terminal.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
@@ -1327,6 +1361,18 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/chat_title.py",
         "dashboard/chat_utils.py",
         "dashboard/chat_voice.py",
+        # Owner-driven components extracted from dashboard/state.py.  They
+        # redact while staging or dispatching through the facade, but they do
+        # not introduce new logical egress paths: the same DashboardState
+        # boundaries were already represented by the facade's registered sink
+        # rows.  Classifying the implementation files separately would make a
+        # behavior-preserving decomposition change the public posture items and
+        # count even though no new value crosses a process or persistence
+        # boundary.
+        "dashboard/interaction_coordinator.py",
+        "dashboard/notification_coordinator.py",
+        "dashboard/slot_projection.py",
+        "dashboard/websocket_hub.py",
         # Pre-redacts follow-up items before handing to state.py's WS egress
         # (the registered sink); its own return string is re-redacted by
         # chat_runner before broadcast. Not itself an egress boundary.
@@ -1516,6 +1562,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
+        # Live translation redacts the MODEL's answer before writing it to the
+        # meeting's translations.json. The source line was already redacted at
+        # dispatch, so this covers only what a model reintroduced, and the
+        # user-visible surface is the app's own translations route.
+        "apps/builtins/meetings/backend/domain/translate.py",
         "apps/builtins/meetings/backend/providers/calendar.py",
         "apps/builtins/meetings/backend/providers/tasks.py",
         "apps/builtins/meetings/backend/routes/agents.py",

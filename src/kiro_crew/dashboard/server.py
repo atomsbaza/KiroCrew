@@ -36,8 +36,11 @@ from kiro_crew.channel_transcript_migration import migrate_channel_transcripts
 from kiro_crew.config import data_home
 from kiro_crew.config.loader import (
     KiroCrewConfig,
+    consume_managed_service_launch_environment,
+    load_loop_stall_exit_after,
     refresh_config_meta_stamp,
     refresh_materialized_agents,
+    resolve_loop_stall_exit_after,
 )
 from kiro_crew.dashboard import (
     cautious_boot,
@@ -163,8 +166,10 @@ from kiro_crew.platform import (
 from kiro_crew.power import SleepInhibitor
 from kiro_crew.safety_override import (
     apply_config_duration,
+    describe_dropped_grant,
     grant_declared_yolo,
     safety_override,
+    take_dropped_grant,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -419,6 +424,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # tool is unreachable in production while handler-level tests still pass.
         "/api/session-control/create",
         "/api/session-control/stop",
+        "/api/session-control/close",
         "/api/session-control/send",
         "/api/session-control/read",
     }
@@ -696,7 +702,17 @@ _BASE_CSP = (
     # imports are blocked no matter what the per-app srcdoc <meta> CSP says
     # (when two policies apply, the most restrictive wins per directive).
     # Same pattern as the widget CDN allowances (tailwind/jsdelivr/cdnjs).
-    "script-src 'self' 'unsafe-inline' "
+    # 'wasm-unsafe-eval': the Pierre highlight workers tokenize with the
+    # shiki-wasm engine (website/src/pierre/config.ts, PIERRE_REGEX_ENGINE —
+    # chosen there because the JS engine has no backtracking ceiling and a
+    # pathological grammar match kills the renderer as a cage OOM).
+    # WebAssembly.compile/instantiate requires this source expression in the
+    # executing context's script-src, and a same-origin worker takes its CSP
+    # from its own script RESPONSE — this header — not from the document that
+    # spawned it. Without it the tokenizer worker's WASM instantiation is
+    # refused and every diff surface dies on first highlight. It permits ONLY
+    # WebAssembly compilation, never JS eval ('unsafe-eval' stays out).
+    "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' "
     "https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com "
     "https://esm.sh; "
     # https://fonts.googleapis.com + https://fonts.gstatic.com: index.html loads
@@ -1286,6 +1302,9 @@ def _register_mcp_routes(app: web.Application) -> None:
         "/api/session-control/stop", _deferred_session_control("api_session_control_stop")
     )
     app.router.add_post(
+        "/api/session-control/close", _deferred_session_control("api_session_control_close")
+    )
+    app.router.add_post(
         "/api/session-control/send", _deferred_session_control("api_session_control_send")
     )
     app.router.add_get(
@@ -1340,9 +1359,13 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_patch("/api/autonudge/{loop_id}", api_autonudge_update)
     app.router.add_delete("/api/autonudge/{loop_id}", api_autonudge_delete)
 
-    # Agent questions — blocking question-card round-trip for the ask_question
-    # MCP tool. The POST holds open until the user answers, so it must not be
-    # wrapped in any short-timeout middleware.
+    # Agent questions. The MCP ask_question tool no longer posts here: it returns
+    # a session directive and the dashboard posts a NON-BLOCKING card (see
+    # mcp_tools.control.ask_question). This API stays live because the UI reads
+    # /pending to rehydrate cards after a reload and answers or dismisses them
+    # through the routes below, and POST /api/ask-question still opens a blocking
+    # wait for any caller that uses it — so it must not be wrapped in any
+    # short-timeout middleware.
     from kiro_crew.dashboard.handlers.ask_question import (
         api_ask_question,
         api_ask_question_answer,
@@ -1833,6 +1856,23 @@ def _claimed_dashboard_slots(state: DashboardState) -> frozenset[str]:
     except Exception:
         logger.debug("could not read claimed dashboard slots", exc_info=True)
         return frozenset()
+
+
+def _take_prior_dropped_grant() -> Any:
+    """Consume the PREVIOUS process's safety-override record, if any.
+
+    Run off the event loop (the caller wraps it in ``asyncio.to_thread``): it is a
+    file open on a filesystem that may be slow, and nothing about boot should wait
+    on it. Ordering against ``_apply_startup_yolo`` does not matter, because the
+    record carries the writing pid and this process's own record is never read as
+    a dropped one. Never raises: the gateway must not fail to boot over a
+    notification, and the grant is off either way.
+    """
+    try:
+        return take_dropped_grant()
+    except Exception:
+        logger.debug("Could not read the prior safety-override record", exc_info=True)
+        return None
 
 
 def _apply_startup_yolo(state: DashboardState, cfg: Any) -> None:
@@ -2626,6 +2666,11 @@ async def start_dashboard(
     assume_kiro_ready: bool = False,
 ) -> tuple[web.AppRunner, DashboardState]:
     """Start the dashboard web server.  Returns ``(runner, state)``."""
+    # The generated service marker describes this launch, not every process the
+    # dashboard may later spawn. Snapshot it before starting app backends or
+    # child terminals, then use only that snapshot to choose the watchdog grace.
+    _launch_environment = consume_managed_service_launch_environment()
+
     # Auto-create consolidator if conversation_log available but no consolidator
     if consolidator is None and conversation_log is not None:
         try:
@@ -3517,11 +3562,14 @@ async def start_dashboard(
     # and a hard-coded 25s turned those into hard exits that lost in-flight
     # work. The default is unchanged; the loader clamps the range.
     try:
-        _exit_after = float(KiroCrewConfig.load().dashboard.loop_stall_exit_after_secs)
+        _exit_after = float(load_loop_stall_exit_after(_launch_environment))
     except Exception:
         logger.debug("loop-stall exit budget config unavailable; using default", exc_info=True)
-        _exit_after = 25.0
+        # Config failure must not erase the managed-service grace that protects
+        # the process while its config filesystem is itself under pressure.
+        _exit_after = float(resolve_loop_stall_exit_after(environ=_launch_environment))
     _loop_watchdog = LoopStallWatchdog(dump_file=_dump_file, exit_after=_exit_after)
+    _heap_trim_maintainer = platform_compat.HeapTrimMaintainer()
 
     async def _loop_heartbeat() -> None:
         # 5s (not 10s) so the watchdog's armed dump-then-exit timer is re-petted
@@ -3544,6 +3592,12 @@ async def start_dashboard(
             # block the loop this heartbeat exists to watch. After the lag
             # read so the await can't register as loop lag.
             await state.resource_pressure_notifier.maybe_sample()
+            released = await _heap_trim_maintainer.maybe_trim()
+            if released >= platform_compat.HEAP_TRIM_LOG_THRESHOLD_BYTES:
+                logger.info(
+                    "Gateway heap trim returned %.0f MiB to the OS",
+                    released / (1024 * 1024),
+                )
             if lag > 1.0:
                 logger.warning("event-loop heartbeat: lag %.1fs (loop was blocked)", lag)
             else:
@@ -3758,6 +3812,40 @@ async def start_dashboard(
         _notify_unattended_expiry(state, source)
 
     safety_override().on_expired = _on_override_expired
+
+    # A grant that was live when the process went down is GONE -- grants are
+    # in-memory by design and this does not change that. What it changes is that
+    # the operator now hears about it. Without this, someone who granted six
+    # hours of auto-approval and restarted an hour later got no signal at all:
+    # the next unattended run just stopped on a prompt nobody was waiting for.
+    #
+    # Read OFF the loop and off the boot path: it is a file open on a filesystem
+    # that may be slow, and nothing about boot should wait on it (found in
+    # review). Safe to run after the startup grant because the record carries the
+    # writing pid, so this process's own record is never read as a dropped one.
+    #
+    # Notice only, never a restored grant, and withheld when auto-approve is live
+    # RIGHT NOW: a declared grant that the enterprise ceiling clamps to a timed
+    # one is re-established by _apply_startup_yolo above, and telling the operator
+    # it is "OFF" while it is on would be worse than saying nothing. A lapsed
+    # grant, a config-declared one and an ``until_shutdown`` one are all silent
+    # too -- see ``take_dropped_grant``.
+    try:
+        _dropped_grant = await asyncio.to_thread(_take_prior_dropped_grant)
+        if _dropped_grant is not None and not safety_override().is_active():
+            state.notify(
+                "safety",
+                "Auto-approve was dropped by a restart",
+                describe_dropped_grant(_dropped_grant),
+                meta={
+                    "source": _dropped_grant.source,
+                    "remaining_secs": _dropped_grant.remaining_secs,
+                },
+            )
+    except Exception:
+        # Startup must not fail over a notification. The grant is off either
+        # way; the worst case is the operator not being told.
+        logger.debug("Could not report a restart-dropped safety override", exc_info=True)
 
     # Restore exactly the tabs the user had open at last shutdown — these
     # come back regardless of mtime, so long-running tabs don't silently

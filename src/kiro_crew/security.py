@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
 from kiro_crew.executors import maintenance_executor
+from kiro_crew.identity_stores import fenced_home_dirs
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
 from kiro_crew.trust_patterns import ENV_ASSIGNMENT_RE
 from kiro_crew.vector_memory_constants import _contains_injection
@@ -2823,6 +2824,43 @@ _CONTROL_OPERATOR_RE = re.compile(r"[;&|\n]+")
 # ``normalize_shell_command`` already undoes, but spelled with a substitution and
 # placed MID-WORD, where a prefix-only strip never sees it.
 _EMPTY_SUBST_RE = re.compile(r"\$\(\s*\)|`\s*`|\$\{\s*\}")
+# An OUTPUT redirect. Two small sets, enumerated from the shells' own grammars rather
+# than grown one spelling per review round, so the boundary is stated instead of implied:
+#
+#   DESCRIPTOR (optional prefix)  digits -- every shell
+#                                 ``&``    both streams (bash, zsh, ksh)
+#                                 ``{name}`` automatic descriptor (bash 4.1+, zsh)
+#                                 ``*``    all streams (PowerShell)
+#   OPERATOR                      ``>`` or ``>>``
+#   MODIFIER (optional suffix)    ``&``  duplicate (bash, zsh, ksh, csh)
+#                                 ``|``  noclobber override (bash, zsh, ksh)
+#                                 ``!``  noclobber override (zsh, csh, tcsh)
+#
+# NOT covered, deliberately and on the record: fish's historical ``^`` stderr prefix
+# (removed in fish 3.0 and this module has no fish handling), and cmd.exe's ``n>&m``
+# which the digit prefix already matches. If a shell outside that list reaches this gate,
+# this set is where it has to be added.
+#
+# ``*`` is included on the FAIL-CLOSED rule this floor states for itself ("any maybe
+# answers True -- the gate can over-trigger but never under-trigger"), because the two
+# shells disagree and only one of them is safe to be wrong about. In PowerShell ``*>`` is
+# the all-streams redirect, so the program arrives on stdin and must be scanned. In bash
+# ``*`` is a GLOB that expands to filenames, so the first becomes the script -- measured:
+# ``python *> out`` runs the globbed file, and it still does with a here-string present.
+# Reading ``*>`` as a redirect therefore over-triggers under bash, which costs a denial
+# of a command combining a glob-redirect with a payload-bearing carrier; reading it as a
+# positional under PowerShell lets a credential mint through. Recorded as an accepted
+# residual rather than left implicit.
+#
+# Matched on the RAW token because ``_normalize_operand`` leaves the descriptor behind
+# (``2>&1`` -> ``2``, ``{fd}>&1`` -> ``{fd}``), which reads as an ordinary file name.
+# The brace form requires a real identifier inside: ``{a,b}`` is a brace EXPANSION the
+# shell resolves before redirect parsing, and must not be mistaken for a descriptor.
+# No token matching this is ever a positional argument in the shell that spells it.
+#
+# No ``\A`` anchor: ``.match(raw, pos)`` anchors at *pos*, which is how a word holding a
+# chain of glued redirects is walked in one pass instead of being re-sliced per operator.
+_OUTPUT_REDIRECT_RE = re.compile(r"(?:\d+|&|\*|\{[A-Za-z_][A-Za-z0-9_]*\})?>{1,2}[&|!]?")
 # ``X=kirocrew; $X token`` assigns the program name to a variable and invokes it
 # through the expansion, so neither the literal name nor the expansion alone looks
 # dangerous.  The assignment and the use are in the SAME command text, so the
@@ -3550,6 +3588,96 @@ def _substitution_bodies(text: str) -> "list[str]":
     return bodies
 
 
+def _redirect_glue_point(word: str) -> "int | None":
+    """Index where an OUTPUT redirect glued to the END of another word begins, else None.
+
+    A redirect needs no whitespace in front of it, so it can ride on the back of any
+    word: ``python -u> /dev/null <<< '<program>'`` is the flag ``-u`` plus ``> /dev/null``,
+    and bash runs the here-string. The detector only recognised a redirect at the START of
+    a word, so ``-u>`` fell through to "an ordinary interpreter flag", the redirect target
+    in the next token became the script path, and the stdin program went unscanned. The
+    ``<`` branch has always looked for its operator ANYWHERE in the word; this is the same
+    rule for the ``>`` family, and that asymmetry was the gap.
+
+    The word is SPLIT rather than skipped, because what precedes the redirect decides the
+    answer and only the caller's own branches can classify it: ``-u`` is a flag and the
+    scan continues, but ``script.py>out`` means the script supplies the program and the
+    answer is False. Measured in bash: ``python script.py> out <<< '<program>'`` runs the
+    script, not the here-string. Splitting and re-reading both halves reuses that
+    classification instead of duplicating it, so the two cannot drift apart.
+
+    None when the word has no ``>`` at all, or already begins with a redirect -- a leading
+    file descriptor belongs to the redirect, and the shell only reads digits as one when
+    they are the whole prefix (``2>err`` is fd 2; ``x2>err`` is the word ``x2``).
+    """
+    position = word.find(">")
+    if position <= 0:
+        return None
+    if _OUTPUT_REDIRECT_RE.match(word) is not None:
+        return None
+    return position
+
+
+def _output_redirect_scan(raw: str, start: int = 0) -> "tuple[str, int] | None":
+    """``(target, end)`` for the OUTPUT redirect at *start* in *raw*, or None.
+
+    ``python 2>&1 <<< '<program>'`` runs the here-string, but the detector had no branch
+    for the ``>`` family at all: it handles ``<`` and heredocs off the raw token and let
+    everything else fall through to "this is a script path". The unnumbered glued form
+    only survived by accident, because ``_normalize_operand`` reduces ``>out.txt`` to the
+    empty string and the loop skips empties -- while ``2>&1`` reduces to ``2``, a
+    perfectly good file name, so the interpreter looked like it was running a script
+    called ``2`` and the program on its stdin went unscanned.
+
+    Every spelling is a redirect and none is ever a positional: an optional leading file
+    DESCRIPTOR -- a number, ``&`` for both streams, or a ``{name}`` automatic descriptor
+    -- then ``>`` or ``>>``, then an optional ``&`` for the duplicating form or ``|`` for
+    the noclobber override.
+
+    The target STOPS at the next redirect operator, and *end* is that position, because
+    the shell starts a new redirect there: in ``python 2>/dev/null<<EOF`` the word is one
+    token, and taking all of ``/dev/null<<EOF`` as the target swallows the heredoc marker
+    and loses the program that arrives on stdin.
+
+    Only at substitution depth ZERO, though. A redirect inside ``$(...)``, ``${...}`` or
+    backticks belongs to that inner command and is not a boundary of this word:
+    ``python 2>$(echo>/dev/null;printf /dev/null) <<< '<program>'`` really is
+    ``python 2>/dev/null`` once the shell has run the substitution, and cutting the target
+    at the inner ``>`` left the tail of the substitution to be read as a script path,
+    which put the stdin program back out of view. The whole substitution is one shell
+    WORD, and :func:`_operand_span_end` is what carries it across the tokens it spans.
+
+    Depth counts EVERY ``(`` and ``{``, not only a ``$``-prefixed one, because a subshell
+    nested inside a substitution (``$( (true); printf /dev/null)``) closes with its own
+    ``)`` -- counting the opener but not that one would drop the depth to zero early and
+    reopen exactly the hole this closes. *raw* must therefore reach here with its
+    substitution delimiters intact; see the caller.
+
+    An INDEX is returned rather than the remaining text so a word holding a chain of
+    them (``>a>a>a...``) can be walked once. Re-slicing the word per operator was
+    quadratic in its length, on a floor that runs for every command -- the same defect
+    class this module pins against elsewhere, so it is not reintroduced here.
+    """
+    match = _OUTPUT_REDIRECT_RE.match(raw, start)
+    if match is None:
+        return None
+    cut = match.end()
+    depth = 0
+    in_backtick = False
+    while cut < len(raw):
+        char = raw[cut]
+        if char == "`":
+            in_backtick = not in_backtick
+        elif char in "({":
+            depth += 1
+        elif char in ")}" and depth:
+            depth -= 1
+        elif char in "<>" and not depth and not in_backtick:
+            break
+        cut += 1
+    return raw[match.end() : cut], cut
+
+
 def _here_string_payload(raw: str) -> "str | None":
     """The operand of a HERE-STRING (``<<<WORD``), ``""`` when the word is the next token.
 
@@ -3907,6 +4035,60 @@ def _python_reads_stdin(later_tokens: list[str]) -> bool:
                 heredoc_tag = marker
             else:
                 expect_tag = True  # a bare `<<` splits its tag into the next token
+            continue
+        # Scanned on a form that keeps the SUBSTITUTION delimiters. `raw` has had
+        # `_SHELL_WRAPPER_CHARS` stripped, and those include `(` and `)` -- so the word
+        # `2>$(` (the tokenizer splits on the space inside `$( (true); printf x)`) arrived
+        # here as `2>$`, with the opener gone. The scan then saw an ordinary one-character
+        # target, never entered a substitution, and the tail of the substitution was read
+        # as a script path, putting the stdin program back out of view. Quotes still come
+        # off, since a quoted redirect is still a redirect.
+        redirect_word = tok.strip("\"'")
+        glue = _redirect_glue_point(redirect_word)
+        if glue is not None:
+            # The redirect rides on the back of another word (`-u>`). Split it and let the
+            # loop read both halves, so the part BEFORE the redirect is classified by the
+            # same flag/positional branches as any other word -- `-u` continues the scan,
+            # `script.py` ends it. Once per word, since neither half can split again.
+            later_tokens = [
+                *later_tokens[:idx],
+                redirect_word[:glue],
+                redirect_word[glue:],
+                *later_tokens[idx:],
+            ]
+            continue
+        redirect = _output_redirect_scan(redirect_word)
+        if redirect is not None:
+            # An OUTPUT redirect and its target are not this command's arguments, and
+            # neither says anything about where the program comes from -- so the walk has
+            # to step over both and keep looking, exactly as it does for a stdin
+            # redirect. Falling through instead read the leftover descriptor digits of
+            # `2>&1` as a script path and answered False, so `python 2>&1 <<< '<program>'`
+            # had its stdin program go unscanned. Bash runs every one of these.
+            redirect_target, position = redirect
+            # A chain of output redirects glued into ONE word (`>a>a>a...`) is walked
+            # here, in place. Re-injecting each remainder into the token stream instead
+            # re-sliced the word per operator, which is quadratic in its length on a
+            # floor that runs for every command.
+            while position < len(redirect_word):
+                further = _output_redirect_scan(redirect_word, position)
+                if further is None:
+                    break
+                redirect_target, position = further
+            remainder = redirect_word[position:]
+            if remainder:
+                # What is left starts with a STDIN operator (`2>/dev/null<<EOF`), which
+                # the branches above know how to read. Hand it back as its own token --
+                # once per word, not once per operator -- because swallowing it loses the
+                # heredoc and with it the program on stdin.
+                later_tokens = [*later_tokens[:idx], remainder, *later_tokens[idx:]]
+            elif not redirect_target:
+                if idx >= len(later_tokens):
+                    break
+                redirect_target = later_tokens[idx].strip(_SHELL_WRAPPER_CHARS)
+                idx += 1
+            if redirect_target:
+                idx = _operand_span_end(later_tokens, idx, redirect_target)
             continue
         if "<" in raw:
             # A stdin REDIRECT and its operand are not this command's arguments either,
@@ -4347,7 +4529,53 @@ def _operands_lead_with(operands: "list[str]", spec: "tuple[object, ...]") -> bo
     return True
 
 
-def _self_module_name_index(tokens: "list[str]", i: int) -> "int | None":
+class _SelfModuleScan(NamedTuple):
+    """One token list's normalized forms plus its module-flag stop index.
+
+    ``norm[j]`` is what :func:`_normalize_operand` makes of token *j*, and ``stops[j]``
+    is the first index at or after *j* where the module-flag scan in
+    :func:`_self_module_name_index` stops.  Both are computed once per token list so
+    the scan does not repeat them for every interpreter token in it.
+    """
+
+    norm: "list[str]"
+    stops: "list[int]"
+
+
+def _is_self_module_flag(tok: str) -> bool:
+    """True where the module-flag scan in :func:`_self_module_name_index` stops.
+
+    The attached spelling only stops when the regex actually matches: ``-msomething``
+    that is not our module is an ordinary interpreter flag and the scan continues past
+    it, so the regex is part of the stop condition rather than a check made after it.
+    """
+    return tok == "-m" or (
+        tok.startswith("-m") and len(tok) > 2 and bool(_SELF_IMPORT_RE.search(tok[2:]))
+    )
+
+
+def _self_module_flag_scan(tokens: "list[str]") -> "_SelfModuleScan":
+    """Precompute one token list's normalized forms and module-flag stop indexes.
+
+    ``_self_module_name_index`` walked forward from each interpreter token to the first
+    module flag, normalizing every token it passed.  Called once per interpreter token
+    by ``_self_program_index``, that made the self-protection floor QUADRATIC in token
+    count: a command of interpreter words with no module flag among them re-walked and
+    re-normalized the whole tail every time.  Measured on the floor path, with one
+    product word present so its keyword gate opens: 0.03 s / 0.12 s / 0.49 s / 1.92 s
+    at 250 / 500 / 1000 / 2000 tokens -- about 4x per doubling, which reaches the
+    gateway's loop watchdog well inside a command an agent could emit.  Both passes
+    here are single and linear.
+    """
+    limit = len(tokens)
+    norm = [_normalize_operand(token).strip("\"'") for token in tokens]
+    stops = [limit] * (limit + 1)
+    for index in range(limit - 1, -1, -1):
+        stops[index] = index if _is_self_module_flag(norm[index]) else stops[index + 1]
+    return _SelfModuleScan(norm=norm, stops=stops)
+
+
+def _self_module_name_index(tokens: "list[str]", i: int, scan: "_SelfModuleScan") -> "int | None":
     """Index of the product module-name token in a ``python -m kiro_crew ...``
     invocation whose interpreter is at *i*, or None.
 
@@ -4355,26 +4583,35 @@ def _self_module_name_index(tokens: "list[str]", i: int) -> "int | None":
     scanning past other interpreter flags. The ``-c`` inline-program form has no
     positional subcommand token (the program builds its own argv), so it is left to
     the credential-mint import gate rather than matched here.
+
+    *scan* is REQUIRED, and must be :func:`_self_module_flag_scan` of the same *tokens*.
+    It is not optional-with-a-fallback on purpose: this function is called once per
+    token by a loop over those tokens, so a caller that could omit the scan could
+    silently reintroduce the quadratic this precompute exists to remove.  Requiring it
+    makes that a type error instead of a performance regression nobody notices.
     """
-    for j in range(i + 1, len(tokens)):
-        tok = _normalize_operand(tokens[j]).strip("\"'")
-        if tok == "-m":
-            nxt = _normalize_operand(tokens[j + 1]).strip("\"'") if j + 1 < len(tokens) else ""
-            return j + 1 if _SELF_IMPORT_RE.search(nxt) else None
-        if tok.startswith("-m") and len(tok) > 2 and _SELF_IMPORT_RE.search(tok[2:]):
-            return j  # attached -mkiro_crew
-    return None
+    limit = len(tokens)
+    j = scan.stops[i + 1]
+    if j >= limit:
+        return None
+    if scan.norm[j] == "-m":
+        nxt = scan.norm[j + 1] if j + 1 < limit else ""
+        return j + 1 if _SELF_IMPORT_RE.search(nxt) else None
+    return j  # attached -mkiro_crew
 
 
-def _self_program_index(tokens: "list[str]", i: int) -> "int | None":
+def _self_program_index(tokens: "list[str]", i: int, scan: "_SelfModuleScan") -> "int | None":
     """The argv index whose trailing operands the product CLI receives when the token
     at *i* launches it: *i* itself for the direct ``kirocrew`` form, or the module-name
     index for ``python -m kiro_crew``; else None.
+
+    *scan* is threaded through to :func:`_self_module_name_index` and is required for
+    the reason given there.
     """
     if _is_self_program(tokens[i]):
         return i
     if _PYTHON_PROGRAM_RE.match(_program_basename(tokens[i])):
-        return _self_module_name_index(tokens, i)
+        return _self_module_name_index(tokens, i, scan)
     return None
 
 
@@ -4390,8 +4627,11 @@ def _matches_self_subcommand(text_lower: str, spec: "tuple[object, ...]") -> boo
         return False
     for tokens in _self_token_frames(_shell_join_continuations(text_lower)):
         programs = _argv_programs(tokens)
+        # Once per FRAME, not once per token: this is the loop whose per-token scan
+        # made the floor quadratic.
+        scan = _self_module_flag_scan(tokens)
         for i in range(len(tokens)):
-            prog_idx = _self_program_index(tokens, i)
+            prog_idx = _self_program_index(tokens, i, scan)
             if prog_idx is None:
                 continue
             # ``echo kirocrew restart`` / ``echo python -m kiro_crew restart`` print words.
@@ -4798,21 +5038,21 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     # The internal reader opens the DB read-only + SEL-audited (NOT via
     # is_sensitive_path), so it still works; the sandbox bind-mount list
     # (sandbox.py) is SEPARATE, so kiro-cli's own auth is unaffected.
-    ".local/share/kiro-cli",
-    ".local/share/amazon-q",
-    "Library/Application Support/kiro-cli",
-    "Library/Application Support/amazon-q",
-    # Windows layouts of the same stores. Current kiro-cli writes the local,
-    # non-roaming app-data directory (%LOCALAPPDATA% defaults to
-    # ~/AppData/Local); the Roaming entries cover layouts that used
-    # %APPDATA% (defaults to ~/AppData/Roaming). These matchers are
-    # home-anchored, so a profile redirected outside the home directory is not
-    # covered -- the default location is what agent file tools can reach by a
-    # fixed relative path.
-    "AppData/Local/kiro-cli",
-    "AppData/Local/amazon-q",
-    "AppData/Roaming/kiro-cli",
-    "AppData/Roaming/amazon-q",
+    # The identity-store directories come from the single canonical table
+    # (``identity_stores.IDENTITY_STORE_ROOTS``) so this fence and the five other
+    # readers cannot drift apart (#6352). The splice emits all eight in table
+    # order (``.local/share`` -> ``Library/Application Support`` ->
+    # ``AppData/Local`` -> ``AppData/Roaming``, kiro-cli before amazon-q), which
+    # is the exact order this list carried before the refactor -- a golden test
+    # freezes that the final list is unchanged.
+    #
+    # Windows layouts: current kiro-cli writes the local, non-roaming app-data
+    # directory (%LOCALAPPDATA% defaults to ~/AppData/Local); the Roaming entries
+    # cover layouts that used %APPDATA% (defaults to ~/AppData/Roaming). These
+    # matchers are home-anchored, so a profile redirected outside the home
+    # directory is not covered -- the default location is what agent file tools
+    # can reach by a fixed relative path.
+    *fenced_home_dirs(),
 ]
 
 # ── KiroCrew's own data-home secrets & governance trust-root ──
@@ -4862,6 +5102,12 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 _CREW_SECRET_LEAVES: list[str] = [
     ".env",
+    # Owner-authored meetings edits are deliberately outside the meeting
+    # directories agents write. They are returned verbatim to the owner and may
+    # contain credential-shaped examples or private corrections, so an agent must
+    # neither read nor overwrite them through file tools. The Meetings backend
+    # opens this directory directly, so its save/overlay/revert flow is unaffected.
+    "apps/meetings/data/edits",
     # The Notes builtin stores a GitHub Personal Access Token here so it can
     # push a vault. Owner-only mode (0600) does not isolate another process
     # running as the same UID, and the token is a live bearer credential for the
@@ -5206,6 +5452,53 @@ _CREW_SECRET_LEAVES: list[str] = [
 _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
 ]
+
+# ── Publish artifacts of a keystone leaf ──
+# Every leaf above is published through ``atomic_write``, which writes a
+# ``tempfile.mkstemp(dir=path.parent, suffix=".tmp")`` sibling and renames it over the
+# target; several stores also take a lock file beside the leaf they guard
+# (``.policy.lock`` for the ops autonomy ceiling, ``ops_mission_control_secrets.json.lock``,
+# ``.crons.lock``). Those siblings carry the SAME bytes as the leaf -- the temp holds the
+# full payload for the whole write -- but a leaf entry matches its exact name only, so
+# they sat outside the fence while the guarantee was stated as absolute.
+#
+# A DIRECTORY leaf never had this gap: its temps land INSIDE the fenced directory, where
+# the ``startswith(target + os.sep)`` rule already covers them. That is exactly why
+# ``webhooks``, ``routing``, ``.vault``, ``kas``, ``run``, ``cron-history`` and
+# ``apps/aws-control/data`` are written as directories, and their comments say so. The gap
+# is the leaves whose parent is NOT itself fenced -- in practice the crew data-home root,
+# which cannot simply be fenced wholesale because reading ``config.json`` and
+# ``sessions.db`` there is routine and intended (see ``_WRITE_PROTECTED_HOME_PATHS``).
+#
+# So the fence is DERIVED FROM the leaf declarations rather than restated per leaf: an
+# artifact-shaped name sitting in the parent directory of any keystone leaf is protected.
+# A leaf added later inherits the protection with no second entry to remember, which is
+# the only version of this that stays true -- the reason the gap existed at all is that
+# the exception was invisible at every call site.
+#
+# Derived from ``_CREW_SECRET_LEAVES``, deliberately NOT from ``_SENSITIVE_HOME_DIRS``:
+# that list also carries ``.aws``, ``.ssh`` and the kiro-cli identity stores, whose parent
+# is ``$HOME`` ITSELF, so deriving from it would fence ``~/*.tmp`` and ``~/*.lock`` across
+# the user's entire home directory.
+#
+# Keyed on the artifact SHAPE, not on ``<leaf>.tmp``: the real mkstemp name is
+# ``tmpXXXXXXXX.tmp`` and carries no leaf name at all, so a leaf-derived temp name would
+# fence a spelling no writer produces. ``<leaf>.lock`` IS a real shape
+# (``ops_mission_control_secrets.json.lock``), and the suffix rule covers both.
+#
+# Not included: ``deploy/pending-deploys.lock``. Its directory holds no keystone leaf, so
+# there is no keystone payload beside it for the fence to protect.
+_KEYSTONE_ARTIFACT_SUFFIXES: tuple[str, ...] = (".tmp", ".lock")
+_KEYSTONE_ARTIFACT_PARENTS: list[str] = sorted(
+    {
+        # Every entry is ``<crew-prefix>/<leaf>`` so it always contains a separator,
+        # making the rsplit safe: a bare leaf yields the crew home root, a path-shaped
+        # leaf yields its own directory (``workspace/md-notebook``).
+        f"{prefix}/{leaf}".rsplit("/", 1)[0]
+        for prefix in _CREW_HOME_PREFIXES
+        for leaf in _CREW_SECRET_LEAVES
+    }
+)
 
 # ── Write-protected paths (block modification, allow reads) ──
 # Runtime config files carry security-relevant resource ceilings (concurrent
@@ -5648,6 +5941,40 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # the exact-leaf forms.
         rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves}){path_end}"
     )
+    # Publish artifacts of a keystone leaf, mirroring the tool-path clause in
+    # ``_is_keystone_publish_artifact``. Required, not optional: "protected on one path
+    # only is not protected" is stated three times in this module, and the leaf's temp
+    # holds the leaf's own bytes.
+    #
+    # Why ``sensitive_path`` above does not already catch these: ``path_end`` is the class
+    # of characters a SHELL treats as the end of a word, and ``.`` is deliberately not in
+    # it, so the literal leaf name followed by ``.tmp`` never satisfies the terminator.
+    # Matched on the artifact SHAPE rather than a leaf-derived name because the real
+    # mkstemp form (``tmpXXXXXXXX.tmp``) contains no leaf name at all.
+    #
+    # The filename run excludes ``/`` so this stays exactly one level deep -- a direct
+    # child of a keystone leaf's own parent, matching the equality test the tool path
+    # makes on the parent directory.
+    #
+    # The tail is a name-character LOOKAHEAD, not one of the enumerated terminator
+    # classes, and the separator before the filename is the generalized ``gsep`` that
+    # absorbs canonical no-op chains (``/./``, ``/x/../``). Both follow the
+    # ``bare_protected_path`` branch further down, whose comment states the reasoning:
+    # excluding name characters after the match keeps a DIFFERENT file out
+    # (``tmpAB.tmpx`` stays allowed) while a trailing ``.``, ``$``, metacharacter or
+    # separator is still a match. An enumerated class has to name every spelling a shell
+    # or filesystem treats as equivalent, and review found three it had missed in
+    # succession -- a metacharacter, an expanded-away ``$var``, and a ``/./`` segment.
+    # The lookahead closes that whole family instead of the members discovered so far,
+    # which is why this branch does not reuse ``path_end`` / ``win_path_end``.
+    artifact_parents_pattern = "|".join(re.escape(d) for d in _KEYSTONE_ARTIFACT_PARENTS)
+    artifact_suffix_alt = "|".join(
+        re.escape(suffix.lstrip(".")) for suffix in _KEYSTONE_ARTIFACT_SUFFIXES
+    )
+    artifact_path = (
+        rf"{home_alts}/(?:{artifact_parents_pattern})"
+        rf"/[^/\s'\"]*\.(?:{artifact_suffix_alt})(?![\w-])"
+    )
     # Windows-native spellings of the same fenced dirs, matched in the RAW
     # command text. POSIX shlex consumes unquoted backslashes during
     # tokenization, and an embedded interpreter script
@@ -5661,6 +5988,26 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # itself the signal (same fail-safe posture as the branches above), so
     # over-matching an odd mixed-separator spelling is the safe direction.
     win_sep = r"[\\/]"
+    # Win32 collapses a repeated separator run, so ``kiro-cli`` and
+    # ``\\kiro-cli`` and ``//kiro-cli`` name the same entry. Matching only the
+    # single-separator spelling was a bypass of every store branch at once
+    # (#6350): a doubled separator at an inter-segment boundary named the fenced
+    # path while matching no branch.
+    #
+    # The patterns below deliberately still spell ONE separator, and the run is
+    # collapsed in the SUBJECT instead -- once, linearly, in
+    # ``is_sensitive_bash_command`` via ``_collapse_separator_runs``.
+    #
+    # Admitting a run in the PATTERNS (``{win_sep}+``) was tried first and is a
+    # denial-of-service on this very gate: the run appears inside the starred
+    # generalized separator below and again after it, so a long run can be split
+    # between them many ways and the engine consumes the whole run at every start
+    # offset. Measured, 6,000 backslashes in one command: 33s against 1.3s on
+    # base, past the gateway's 25s watchdog (found in review). Making the run
+    # maximal with a lookahead only halved it, and capping it at 64 bought speed
+    # by letting a 65-separator spelling escape the fence outright -- trading a
+    # hang for a bypass. Collapsing the subject is complete for any run length
+    # and leaves every pattern here exactly as tight as it already was.
     # Generalized separator: a plain separator, optionally preceded by any
     # chain of canonical no-ops — single-dot segments (``\.``) and same-level
     # down-up excursions (``\X\..``). This is what makes traversal spellings
@@ -5671,6 +6018,37 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # elsewhere — the safe direction for this gate, which blocks on naming
     # alone. The name run is length-capped to bound backtracking.
     win_gsep = rf"(?:{win_sep}(?:\.|[^\\/\s'\"]{{1,64}}{win_sep}\.\.))*{win_sep}"
+    # Shell word-end terminator for the Windows-native branches below. Mirrors the POSIX
+    # ``path_end`` above, INCLUDING the shell metacharacters, and for the reason stated
+    # there: the class is every character a shell itself treats as the end of a word, and
+    # widening a DENY boundary can only ever deny more, which is the safe direction for a
+    # gate that blocks on naming alone.
+    #
+    # Until this existed each Windows branch spelled its own ``(?:sep|space|$|quote)``,
+    # which a metacharacter walked straight through -- ``type <fenced path>&whoami`` named
+    # the file and was not matched, while the POSIX spelling of the same command was. Found
+    # by the GPT review lane on the artifact branch; applied to the whole family, because a
+    # fence that is tight on an atomic-write temp and loose on the keystone leaf beside it
+    # protects the transient copy and not the secret.
+    # ``$`` is a literal member of the class, not the regex end-anchor that appears
+    # earlier in the alternation: PowerShell (and cmd.exe with ``$env:``) EXPANDS a
+    # variable reference, so ``Get-Content <fenced path>$null`` removes the ``$null`` and
+    # reads the fenced file, while the matcher saw an unterminated path and allowed it.
+    # A literal ``$`` therefore ends a path for matching purposes. The POSIX side is
+    # already covered here by its own branches -- measured, not assumed -- so this is
+    # deliberately a Windows-only addition rather than a change to ``path_end``.
+    # ``.`` is deliberately NOT a member, though Windows does strip a trailing dot when
+    # opening a file. Adding it here refused ``ls -d ~/.kiro/crew/backup.tar``: these
+    # branches accept forward slashes too, so they also govern POSIX spellings, and
+    # ``backup`` is a fenced DIRECTORY leaf whose name prefixes unrelated filenames. A
+    # terminator sitting after a directory name cannot tell the alias ``backup.`` from the
+    # different file ``backup.tar``, and refusing the latter regressed the read-only
+    # listing that #6021 exists to allow. The artifact branches solve their own version of
+    # this with a name-character LOOKAHEAD instead, which is anchored at the end of a
+    # complete filename and so can make the distinction. The leaf branches' trailing-dot
+    # alias is therefore left open here rather than closed with a rule that costs a
+    # legitimate read.
+    win_path_end = rf"(?:{win_sep}|\s|$|['\"]|[;&|()<>,:`$])"
     win_dirs_pattern = "|".join(
         win_gsep.join(re.escape(part) for part in d.split("/"))
         for d in _SENSITIVE_HOME_DIRS
@@ -5697,14 +6075,27 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|{re.escape('${env:HOMEDRIVE}${env:HOMEPATH}')})"
     )
     win_home_alts = (
-        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}|{tilde}|{home_var})"
+        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}"
+        f"|{tilde}|{home_var})"
     )
     # Between the anchor and the fenced remainder, accept the same
     # canonical-no-op chains (``\.\``, ``\X\..\``): they are equivalent to a
     # plain separator, so ``%APPDATA%\.\kiro-cli\data.sqlite3`` and
     # ``...\AppData\Roaming\..\Roaming\kiro-cli\...`` still name the store.
     win_sensitive_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern}){win_path_end}"
+    )
+    # Windows-native spelling of the publish artifacts above. The pairing invariant
+    # applies to this spelling too, not only to POSIX-versus-tool: a native path is the
+    # one form the tokenizing passes cannot see, so leaving it out would fence the temp
+    # everywhere except in an embedded-script literal.
+    win_artifact_parents_pattern = "|".join(
+        win_gsep.join(re.escape(part) for part in d.split("/"))
+        for d in _KEYSTONE_ARTIFACT_PARENTS
+    )
+    win_artifact_path = (
+        rf"{win_home_alts}{win_gsep}(?:{win_artifact_parents_pattern})"
+        rf"{win_gsep}[^\\/\s'\"]*\.(?:{artifact_suffix_alt})(?![\w-])"
     )
     # ``%APPDATA%`` already points INTO ``AppData\Roaming``, so a spelling like
     # ``%APPDATA%\kiro-cli\data.sqlite3`` names a fenced store WITHOUT the
@@ -5728,7 +6119,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # right after it is a canonical no-op specific to this anchor.
     appdata_sensitive_path = (
         rf"{appdata_var}(?:{win_sep}\.\.{win_sep}Roaming)*"
-        rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_gsep}(?:{appdata_remainders}){win_path_end}"
     )
     # ``%LOCALAPPDATA%`` is the same shape one directory over: it points INTO
     # ``AppData\Local``, so ``%LOCALAPPDATA%\kiro-cli\data.sqlite3`` names a
@@ -5754,7 +6145,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # right after it is this anchor's canonical no-op.
     localappdata_sensitive_path = (
         rf"{localappdata_var}(?:{win_sep}\.\.{win_sep}Local)*"
-        rf"{win_gsep}(?:{localappdata_remainders})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_gsep}(?:{localappdata_remainders}){win_path_end}"
     )
     # Windows-native spelling of the write-protected leaves. The POSIX leaf
     # branch above anchors on ``/`` separators, so on Windows the resolved home
@@ -5774,7 +6165,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     )
     win_write_protected_path = (
         rf"{win_home_alts}{win_gsep}(?:{win_wp_prefixes}){win_gsep}"
-        rf"(?:{win_wp_leaves})(?:{win_sep}|\s|$|['\"])"
+        rf"(?:{win_wp_leaves}){win_path_end}"
     )
     # A native spelling whose LEAF is an expansion: ``%USERPROFILE%\.kiro\crew\%F%``
     # names the keystone without spelling any of its literal leaves, so no branch
@@ -5830,7 +6221,8 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         r"|\$[A-Za-z_][A-Za-z0-9_]*)"
     )
     win_crew_var_leaf_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_crew_leaf_parents}){win_sep}{any_expansion}"
+        rf"{win_home_alts}{win_gsep}(?:{win_crew_leaf_parents})"
+        rf"{win_sep}{any_expansion}"
     )
     # ── ~/.kiro/agents WRITE-protection (a whole DIRECTORY, not a leaf) ──
     # A spec under this dir becomes a KIROCREW_MCP_TARGET_<SERVER> command the
@@ -5880,7 +6272,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     )
     win_agents_write_path = (
         rf"(?:{win_home_alts}{win_gsep}(?:{win_agents_dir_alt})"
-        rf"|{win_kiro_home_var}{win_gsep}(?:{agents_leaf_alt}))(?:{win_sep}|\s|$|['\"])"
+        rf"|{win_kiro_home_var}{win_gsep}(?:{agents_leaf_alt})){win_path_end}"
     )
     # Bare path-SEGMENT match for the globally distinctive leaves. Both branches
     # above require a home anchor and a crew prefix, so both are defeated by a
@@ -5922,6 +6314,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"{sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
+        # (3b) publish artifacts of a keystone leaf -- the atomic-write temp and the lock
+        # sibling -- in both the POSIX and the Windows-native spelling. Verb-independent
+        # like (2)/(3): naming the artifact is the signal, so a redirect, a ``cp``, or an
+        # embedded ``open(...,'w')`` is caught without enumerating write verbs.
+        rf"|(?:^|.*[\s'\"=:,;]){artifact_path}"
         # (4) Windows-native spelling, verb-independent (same token anchor):
         # covers quoted backslash paths AND embedded-script literals that the
         # tokenizing passes cannot see. (5) the %APPDATA% / %LOCALAPPDATA%
@@ -5931,6 +6328,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # all, because branches (3) and (6) both fall to a ``cd`` plus a
         # relative name.
         rf"|(?:^|.*[\s'\"=:,;]){win_sensitive_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){win_artifact_path}"
         rf"|(?:^|.*[\s'\"=:,;]){appdata_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){localappdata_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){win_write_protected_path}"
@@ -6264,6 +6662,42 @@ def _path_in_home_dirs(path_str: str, home_dirs: list[str], base_dir: str | None
     return False
 
 
+def _is_keystone_publish_artifact(path_str: str, base_dir: str | None = None) -> bool:
+    """Return True if *path_str* is the atomic-write temp or lock beside a keystone leaf.
+
+    Closes the gap between a keystone leaf's FINAL name, which
+    :data:`_SENSITIVE_HOME_DIRS` fences, and the intermediate inodes its publish
+    actually goes through -- see :data:`_KEYSTONE_ARTIFACT_PARENTS` for why the rule is
+    derived from the leaf list instead of restated per leaf.
+
+    Two properties are load-bearing:
+
+    - It reuses :func:`_candidate_forms` and :func:`_home_dir_targets`, so the
+      symlink-resolution, casefolding and ``KIROCREW_HOME`` re-anchoring cannot drift
+      from the main gate. A relocated crew home is covered because a
+      ``<crew-prefix>``-rooted entry hits the prefix-stripping arm in
+      :func:`_home_dir_targets_uncached`; a symlink aimed at a live temp is covered
+      because the resolved form is one of the candidates.
+    - The parent is compared for EQUALITY, not by prefix. An artifact is a direct child
+      of the leaf's own directory, and a prefix test would sweep every descendant of the
+      crew home whose name happens to end in ``.tmp`` -- far wider than this needs, in a
+      directory that must stay readable.
+    """
+    if not path_str:
+        return False
+    artifact_parents = _home_dir_targets(_KEYSTONE_ARTIFACT_PARENTS)
+    for cand in _candidate_forms(path_str, base_dir):
+        cand_cf = cand.casefold()
+        # Suffixes are authored lowercase and the candidate is casefolded, so this is
+        # the same case-insensitive comparison the rest of the gate makes -- on
+        # macOS/Windows ``FOO.TMP`` and ``foo.tmp`` are the same file.
+        if not cand_cf.endswith(_KEYSTONE_ARTIFACT_SUFFIXES):
+            continue
+        if os.path.dirname(cand_cf) in artifact_parents:
+            return True
+    return False
+
+
 def is_sensitive_path(path_str: str, base_dir: str | None = None) -> bool:
     """Return True if the path points to a read+write-sensitive location.
 
@@ -6272,8 +6706,16 @@ def is_sensitive_path(path_str: str, base_dir: str | None = None) -> bool:
     writes of credential files and the governance trust-root
     (:data:`_SENSITIVE_HOME_DIRS`). See :func:`_path_in_home_dirs` for the
     symlink/casefold matching contract.
+
+    Also covers a protected leaf's publish artifacts
+    (:func:`_is_keystone_publish_artifact`): the temp an ``atomic_write`` renames over
+    the leaf holds the leaf's full payload, so READ is blocked alongside write -- a
+    write-only fence there would still disclose ``.env`` or ``token_signing.key`` to a
+    reader that wins the race.
     """
-    return _path_in_home_dirs(path_str, _SENSITIVE_HOME_DIRS, base_dir)
+    return _path_in_home_dirs(
+        path_str, _SENSITIVE_HOME_DIRS, base_dir
+    ) or _is_keystone_publish_artifact(path_str, base_dir)
 
 
 def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
@@ -6323,10 +6765,16 @@ def is_sensitive_write_path(path_str: str, base_dir: str | None = None) -> bool:
     written by the agent. Enforced at the file-edit tool gate
     (``hooks.on_tool_call`` on the ACP ``edit`` kind) — see
     :data:`_WRITE_PROTECTED_HOME_PATHS` for the rationale.
+
+    The publish-artifact clause is repeated from :func:`is_sensitive_path` rather than
+    left to be inherited, because this gate is documented as a SUPERSET of it: omitting
+    it here would leave a keystone temp writable through the edit gate while the
+    read+write gate refused it, the same one-path-only hole the pairing notes above warn
+    about.
     """
     return _path_in_home_dirs(
         path_str, _SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS, base_dir
-    )
+    ) or _is_keystone_publish_artifact(path_str, base_dir)
 
 
 def sensitive_home_dirs() -> tuple[str, ...]:
@@ -6526,12 +6974,16 @@ _SENSITIVE_SEGMENT_ALT = "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS)
 # Windows-native relative spelling (``..\..\.aws\credentials``) is caught by
 # the traversal matcher below alongside the POSIX one. Forward-slash-only
 # entries still match (the class includes ``/``), so this strictly widens.
+# A repeated separator run is handled by collapsing the SUBJECT before this
+# matcher runs, not by admitting a run here (#6350) -- see
+# ``_collapse_separator_runs``.
 _SENSITIVE_SEGMENT_ALT_ANYSEP = "|".join(
     r"[\\/]".join(re.escape(part) for part in d.split("/"))
     for d in _SENSITIVE_HOME_DIRS
 )
 _RELATIVE_SENSITIVE_RE = re.compile(
-    rf"(?:^|[\s'\"=:,;])(?:\.\.?[\\/])+(?:{_SENSITIVE_SEGMENT_ALT_ANYSEP})(?:[\\/]|\s|$|['\"])",
+    rf"(?:^|[\s'\"=:,;])(?:\.\.?[\\/])+(?:{_SENSITIVE_SEGMENT_ALT_ANYSEP})"
+    rf"(?:[\\/]|\s|$|['\"])",
     re.IGNORECASE,
 )
 
@@ -6606,6 +7058,68 @@ _LINK_CREATE_VERBS: frozenset[str] = frozenset({"ln", "link"})
 _REDIR_PREFIX_RE = re.compile(r"^\d*(?:>>?|<(?!<))")
 
 
+_SEPARATOR_RUN_RE = re.compile(r"[\\/]{2,}")
+#: What a path token may start after, used to recognise a LEADING separator run
+#: (a UNC prefix) as opposed to an interior one.
+_PATH_TOKEN_BOUNDARY = " \t\"'=:,;(<>|&`"
+
+
+def _separator_collapsed_variants(command: str) -> tuple[str, ...]:
+    """Return *command* with separator runs collapsed, one copy per spelling.
+
+    Win32 collapses a repeated separator run, so ``%LOCALAPPDATA%\\\\kiro-cli``
+    and ``%LOCALAPPDATA%\\kiro-cli`` open the same file. The fence matches raw
+    text, so without this the doubled spelling named a fenced store while
+    matching no branch (#6350).
+
+    Collapsing is done to the SUBJECT rather than by admitting a run in the
+    patterns, because a run inside the patterns is a denial-of-service on this
+    gate: it appears both inside the starred generalized separator and after it,
+    so the engine walks the splits and re-consumes the whole run at every start
+    offset (measured 33s on 6,000 backslashes against 1.3s on base, past the 25s
+    watchdog).
+
+    Up to FOUR copies, along two axes, because a single rewrite loses cases:
+
+    * **Which separator.** Not every pattern accepts either character -- the
+      resolved home literal is ``re.escape``-d and requires the platform's exact
+      separator -- so collapsing to one fixed character left a MIXED run
+      (``D:/\\profiles\\u``) matching neither spelling (found in review).
+    * **Whether a LEADING run stays a pair.** A UNC path begins with two
+      separators that its anchor requires, so collapsing them broke every UNC
+      spelling that ALSO had an interior run:
+      ``\\\\server\\share\\.kiro\\\\crew\\security_policy.json`` matched neither
+      the original (interior run) nor the collapsed copy (no UNC prefix left),
+      and the keystone read was permitted (found in review). The boundary form
+      keeps a run that starts a token at two characters and still collapses the
+      interior ones.
+
+    Empty tuple when there is no run to collapse, so the common command costs one
+    search and nothing else. Duplicates are dropped, so a command with only
+    interior backslash runs yields two copies rather than four.
+    """
+    if not _SEPARATOR_RUN_RE.search(command):
+        return ()
+
+    variants: list[str] = []
+    for sep in ("/", "\\"):
+        for keep_leading_pair in (False, True):
+
+            def _replace(
+                match: "re.Match[str]",
+                sep: str = sep,
+                keep_leading_pair: bool = keep_leading_pair,
+            ) -> str:
+                start = match.start()
+                leading = start == 0 or command[start - 1] in _PATH_TOKEN_BOUNDARY
+                return sep * 2 if (keep_leading_pair and leading) else sep
+
+            variant = _SEPARATOR_RUN_RE.sub(_replace, command)
+            if variant != command and variant not in variants:
+                variants.append(variant)
+    return tuple(variants)
+
+
 def is_sensitive_bash_command(command: str) -> str | None:
     """Check if a bash command reads sensitive paths, accesses IMDS, or leaks env creds.
 
@@ -6631,6 +7145,32 @@ def is_sensitive_bash_command(command: str) -> str | None:
     # it (was gated on ln/cp only, so dd/base64/xxd/head/tail slipped past).
     if _RELATIVE_SENSITIVE_RE.search(command):
         return "Blocked: command references a sensitive credential path via relative traversal"
+
+    # ── Pass 1b: the pass-1 matchers again over separator-COLLAPSED copies ──
+    # Win32 collapses a repeated separator run, so ``%LOCALAPPDATA%\\kiro-cli``
+    # opens the fenced store that ``%LOCALAPPDATA%\kiro-cli`` names -- and the
+    # patterns above spell one separator, so the doubled form matched no branch
+    # (#6350). Collapsing the subject closes that for every run length at linear
+    # cost; admitting a run in the patterns instead was measured as a
+    # watchdog-crossing hang on this gate (see ``_separator_collapsed_variants``).
+    #
+    # ALL THREE pass-1 checks are repeated, not just the path matcher: the
+    # extraction check is a separate control, and omitting it let
+    # ``tar -xf evil.tar -C $HOME//.kiro/crew`` overwrite governance files
+    # through the doubled separator (found in review).
+    #
+    # Run only after the original missed, so nothing that needs the run intact
+    # (a UNC ``\\server\share`` anchor) loses its match.
+    for collapsed in _separator_collapsed_variants(command):
+        if _get_sensitive_re().search(collapsed):
+            return "Blocked: command accesses sensitive credential path"
+        if _extracts_into_trust_root(collapsed):
+            return "Blocked: command extracts into the governance trust-root directory"
+        if _RELATIVE_SENSITIVE_RE.search(collapsed):
+            return (
+                "Blocked: command references a sensitive credential path "
+                "via relative traversal"
+            )
 
     # ── Pass 2: normalizer-based sensitive path detection ──
     normalizer_result = _check_sensitive_via_normalizer(command)
@@ -11136,28 +11676,6 @@ def normalize_shell_command(cmd: str) -> list[str]:
     return resolved
 
 
-def resolve_command_paths(tokens: list[str]) -> list[str]:
-    """Resolve path-like tokens to their canonical absolute form.
-
-    Runs os.path.realpath() on tokens that look like filesystem paths
-    (start with /, ~, ./, or ../) to resolve symlinks and directory traversal.
-    Non-path tokens are returned unchanged.
-
-    Args:
-        tokens: List of shell tokens (typically from normalize_shell_command).
-
-    Returns:
-        New list with path-like tokens resolved to their realpath.
-    """
-    resolved: list[str] = []
-    for token in tokens:
-        if _is_path_like(token):
-            resolved.append(os.path.realpath(token))
-        else:
-            resolved.append(token)
-    return resolved
-
-
 # Drive-letter absolute path (``C:\...`` or ``C:/...``). Anchored to a single
 # ASCII letter + colon + separator so ``key:value`` option tokens do not match.
 _WIN_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -11385,14 +11903,6 @@ _IMDS_IP = "169.254.169.254"
 # SSRF gate which also blocks it (CWE-918 dual-stack parity).
 _IMDS_IPV6 = "fd00:ec2::254"
 
-# HTTP tools that can fetch IMDS -- broader than just curl/wget
-_HTTP_TOOLS_RE = re.compile(
-    r"(?:curl|wget|http|https|fetch|lwp-request|lynx|links|"
-    r"python|ruby|perl|node|nc|ncat|socat|telnet|"
-    r"Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b",
-    re.IGNORECASE,
-)
-
 
 def _check_imds_access(command: str) -> str | None:
     """Detect attempts to access the IMDS endpoint via any encoding.
@@ -11577,16 +12087,35 @@ def resource_limit_spec(config: dict | None = None) -> list[tuple[str, int]]:
 
     Names, not ``resource`` constants: the consumer resolves them with
     ``getattr`` and skips any its platform lacks. A value of ``0`` means "leave
-    inherited" and is dropped here.
+    inherited" and is dropped here -- the OPPOSITE of what ``0`` means on the
+    cgroup path, which reads two of these same keys and treats ``0`` as "use the
+    module default" because systemd rejects a zero property. Both domains are
+    stated on ``ResourceLimitsConfig``, which is where the coercion lives.
     """
     limits = dict(_RLIMIT_DEFAULTS)
-    if config and isinstance(config.get("resource_limits"), dict):
-        rl_config = config["resource_limits"]
+    if config:
+        # The one validated parse for this block. Two things this replaces a
+        # local ``val >= 0`` test to get: an Infinity from json.loads used to
+        # pass that test and then raise OverflowError inside ``int()`` -- with no
+        # try/except on this path, so it propagated out of resource_limit_preexec
+        # and failed the spawn; and a fraction in (0, 1) used to floor to 0,
+        # which is this path's "leave inherited" sentinel, silently dropping a
+        # limit the operator had asked for. from_raw refuses both and says so.
+        # circular import: config.loader reaches back into this module (it
+        # imports security.is_sensitive_path function-locally for the same
+        # reason), so importing the loader at security's module scope would
+        # close the cycle. Kept function-level, matching sandbox and
+        # resource_status, which read the same block under the same constraint.
+        from kiro_crew.config.loader import ResourceLimitsConfig
+
+        parsed = ResourceLimitsConfig.from_raw(config.get("resource_limits"))
         for key in _RLIMIT_DEFAULTS:
-            val = rl_config.get(key)
-            # Accept 0 (explicit disable) and positive ints; ignore junk.
-            if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
-                limits[key] = int(val)
+            # None means "not usable" -- keep the documented default rather than
+            # inventing a number. An explicit 0 survives, because disabling a
+            # limit is a real request here.
+            val = getattr(parsed, key, None)
+            if val is not None:
+                limits[key] = val
 
     # (rlimit name, requested soft/hard value in the rlimit's native unit).
     max_memory_bytes = limits["max_memory_mb"] * 1024 * 1024

@@ -10,6 +10,35 @@ Chat sessions are served from the warm pool when eligible (default pool
 agent, default cwd, no resume mapping); otherwise they cold-start on first
 message via `get_or_create()`.
 
+## Implementation Boundaries
+
+`SessionManager` remains the compatibility facade in `session.py`; callers keep
+using its existing public, import, and monkeypatch seams. Mutable policy and
+state are composed behind that facade:
+
+- `session_allocation.py` — live registry, key folding, semaphore leases,
+  cold-start allocation, claims, and companion runtimes
+- `session_pool.py` — warm-provider spawn, inventory, claim, health, and discard
+- `session_background.py` — persistent and multiplexed background runtimes
+- `session_compaction.py` — context gates, compaction execution, verdicts,
+  cooldowns, and guarded escalation
+- `session_lifecycle.py` — refresh/reload, reset/remove/destroy/discard,
+  identity retirement, stop, drain, and close ordering
+- `session_cleanup.py` — cleanup-task state, watchdog hooks, idle/RSS/stuck-turn
+  policy, and process/filesystem sweeps
+
+Cross-boundary calls that were observable on `SessionManager` route back through
+the facade, and patchable module dependencies are resolved through injected
+call-time functions. Persistence remains owned by the existing `SessionMap`
+contract; this decomposition does not change its stored format.
+
+The owner protocols and forwarding dependency adapters are transitional
+compatibility boundaries, not extension points. New internal behavior belongs
+on the service that owns its state; widen a protocol or adapter only when an
+existing facade/import/monkeypatch seam requires it. Individual adapters may be
+retired in follow-up changes after repository-wide callers and characterization
+tests have moved off the corresponding legacy seam.
+
 ## Background Session
 
 `BACKGROUND_KEY = "_bg"` is a persistent shared session for lightweight
@@ -250,20 +279,17 @@ send time.
 - **Idle cleanup**: expires sessions after `session.timeout_secs` (default
   60min). Never expires `BACKGROUND_KEY`. Dashboard per-tab sessions
   (`dashboard:{slot_key}`) idle-expire like any other session.
-- **Session Watchdog** (`watchdog.py`): the cleanup loop delegates its periodic
-  behaviours to a `SessionWatchdog` — a stateless sequential dispatcher over
-  named `CleanupHook(name, run)` entries (Command pattern; `tick()` isolates a
-  hook failure with a debug-level backstop only, never promoting the severity
-  of errors the lifted inline blocks swallowed). Hooks registered in
-  `SessionManager.__init__`: `idle_expiry` (gate + clamped timeout published
-  onto `self._idle_sweep_enabled`/`self._idle_timeout` by `_cleanup_loop`),
-  `orphan_mcp` (maintenance-executor offload), `denied_commands`
-  (re-enforcement offloaded to the maintenance executor — deliberate
-  sync→thread change from the old inline block), `rss_threshold`, and
-  `stuck_turn`. The
-  orphan-PID / session-root / sandbox-profile sweeps remain inline in
-
-  `_cleanup_loop` (CR 2 extracts them).
+- **Session Watchdog** (`watchdog.py`): `SessionCleanup` owns the cleanup-loop
+  state and delegates named periodic behaviours to a `SessionWatchdog` — a
+  stateless sequential dispatcher over `CleanupHook(name, run)` entries
+  (`tick()` isolates a hook failure with a debug-level backstop only, never
+  promoting the severity of errors the lifted inline blocks swallowed). The
+  hooks are assembled through the `SessionManager` facade so existing
+  monkeypatch seams remain observable: `idle_expiry`, `orphan_mcp`,
+  `rss_threshold`, `stuck_turn`, and `bg_drain_reap`.
+  `SessionCleanup._cleanup_loop` then directly coordinates the session-root,
+  sandbox-artifact, bytecode-cache, periodic tracked-PID, and untracked-MCP
+  sweeps.
 - **Stuck-turn reporting** (`_stuck_turn_check`, threshold
   `_STUCK_TURN_REPORT_SECS` = 300s, not configurable): reports a turn whose
   consumer has stopped pulling events. Exists because the per-turn watchdog in
@@ -818,29 +844,18 @@ dashboard-turn-loop refactor.
 
 ```
 start_pool()
-  ├── _enforce_denied_commands()  → inject deniedCommands into ALL agent configs
   ├── _spawn_warm() × pool_size   → warm pool queue (instant assignment)
   └── _ensure_background()        → BACKGROUND_KEY session (persistent)
 ```
 
-## Security: deniedCommands Enforcement
+## Security: PreToolUse Command Enforcement
 
-`_enforce_denied_commands()` (from `agent.py`) injects the bundled `deniedCommands`
-patterns into agent configs in `~/.kiro/agents/`. The scope is controlled by
-`agent.enforce_denied_commands` config option:
-
-- `"all"` (default): enforce on ALL agent configs (kirocrew + AIM + third-party)
-- `"kirocrew"`: only enforce on `kirocrew.json`, skip other agents (lite agents always skipped)
-
-This addresses user complaints about KiroCrew overwriting customizations on non-KiroCrew agents every ~60 seconds.
-
-- **At startup**: `start_pool()` calls it before spawning any sessions
-- **Periodic**: `_cleanup_loop()` calls it every ~60s (catches manual edits)
-- **At install**: `install_agent()` calls it after writing `kirocrew.json`
-- **Mtime-based**: skips unchanged files for efficiency
-- **Merge semantics**: union of existing + bundled patterns (never removes agent's own)
-- **Targets**: both `execute_bash` and `shell` tool settings
-- **Config**: set via `~/.kiro/crew/config.json` or Dashboard Config Summary
+Command denial is enforced by Kiro Crew's bundled `hooks.py` `PreToolUse` gate,
+not by injecting `deniedCommands` into kiro agent specs. Agent config generation
+keeps the bundled security hooks as the immutable base, merges user hooks after
+them, and strips retired `deniedCommands` / `autoAllowReadonly` fields left by an
+older installation. Session startup and periodic cleanup do not rewrite agent
+configs.
 
 ## Orphaned MCP Server Cleanup
 
@@ -968,7 +983,7 @@ a trust root on its own; publication therefore also writes a
 
 ### Stateless session-directive tools (`session_directive.py`, #755)
 
-Six session-bound MCP tools — `monitor_start`, `monitor_update`, `autonudge_stop`, `set_project`, `suggest_followup`, `ask_question` — used to resolve their OWN session identity (the strict sidecar resolver above) and call a loopback HTTP endpoint, which only produced a usable per-call caller when MCP-gateway **pooling** was enabled. They are now **stateless**: the tool validates its arguments and returns a *directive* — a human-readable confirmation line plus a machine-readable marker (`session_directive.encode`) carrying the validated payload and NO session key. The session-aware consumer, `dashboard/chat_runner._run_chat`'s `EVENT_TOOL_RESULT` handler, decodes the marker (`session_directive.decode`) and applies the effect IN-PROCESS against ITS OWN `slot`/`session_key` via `dashboard/session_directive_apply.py`, then strips the marker from the stored transcript. This works with pooling OFF (the default) because the consumer already owns the session, so no per-process identity source is needed.
+Seven session-bound MCP tools — `monitor_start`, `monitor_update`, `autonudge_stop`, `set_project`, `suggest_followup`, `ask_question`, `reset_conversation` — used to resolve their OWN session identity (the strict sidecar resolver above) and call a loopback HTTP endpoint, which only produced a usable per-call caller when MCP-gateway **pooling** was enabled. They are now **stateless**: the tool validates its arguments and returns a *directive* — a human-readable confirmation line plus a machine-readable marker (`session_directive.encode`) carrying the validated payload and NO session key. The session-aware consumer, `dashboard/chat_runner._run_chat`'s `EVENT_TOOL_RESULT` handler, decodes the marker (`session_directive.decode`) and applies the effect IN-PROCESS against ITS OWN `slot`/`session_key` via `dashboard/session_directive_apply.py`, then strips the marker from the stored transcript. This works with pooling OFF (the default) because the consumer already owns the session, so no per-process identity source is needed.
 
 Subagent isolation is therefore **structural, not cryptographic**: a subagent's tool result flows through the subagent's own runner and can only ever bind to the subagent's session, never its parent's — there is no `/proc` walk to get wrong. The tools still call `_resolve_session_key_strict()`, but only as a context guard to short-circuit sessions where a directive can never be applied (cron/hook/subagent) and to steer non-`dashboard:` `ask_question` callers to the `[OPTIONS:]` tag — not to bind the effect.
 
@@ -978,7 +993,7 @@ Security properties (enforced in `session_directive.decode` plus the applier):
 - **Native sub-agent calls refused**: they surface as flat events in the parent loop but have no independently bindable slot, so the applier declines them.
 - **SEL audit on every application**: `apply_session_directive` emits a tool-invocation event tagged `source="mcp-directive"` with outcome `success` / `denied` (e.g. a `set_project` sensitive-path block) / `error`, since the effect now runs in the consumer rather than in the tool body or an HTTP endpoint.
 
-The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `set_project` additionally requires structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
+The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `reset_conversation` is the one directive whose core is not reachable inline: it queues `SessionManager.discard_conversation` on the slot for `chat_runner._consume_pending_reset` to apply at a turn boundary, because the discard is a full provider teardown and the producer is mid-turn — the same deferral `set_project` uses, and the reason the immediate route (`POST /api/chat/slots/{slot}/reset-conversation`) answers 409 on a busy slot rather than tearing down a turn mid-write. It queues the session key THIS TURN ran on, passed in by the consumer, never re-resolved from the slot: `linked_session_key` is mutable, so a cron or workflow injection that rebinds the slot between the request and the consume would otherwise discard whatever the slot points at by then and leave the caller's conversation alone. Only the END-OF-TURN consume may apply a discard (`allow_discard`); the two earlier consume points run just before a turn acquires the session, where a teardown lands under a channel turn already streaming on it. Even at that boundary it does not assume: the discard goes through `discard_conversation(..., skip_if_busy=True)`, which refuses under the same session lock that pops the session, mirroring `reset`'s own guard. Probing from the consumer and tearing down afterwards would leave a window in which a channel message acquires the session's semaphore and begins streaming a reply the teardown then destroys — and the semaphore is the stricter signal anyway, since `provider.has_active_turn()` cannot see a turn holding the semaphore with no prompt in flight yet. A refusal returns False and changes nothing, replay flag and session map included, so the consumer leaves the flag armed for a later boundary. The sid clear runs in the SAME tick as the pop, with no await between them — deferring it past the shutdown awaits lets a concurrent channel turn map a SUCCESSOR session under the key while the old provider is still shutting down, and the clear then erases the successor's pointer instead of the discarded one. Sub-agent children are the other wait — `discard_conversation` releases the shared runtime they run on, so a running or queued child, or an in-flight completion-event delivery, also leaves the flag ARMED rather than killing the child's work. Both that consume and the route's 409 read one predicate, `chat_utils.subagents_attached`, so the two cannot drift. The queued flag is in-memory slot state: a gateway restart while it sits armed drops the reset the confirmation promised, which is accepted rather than persisted — the cost is one un-applied reset the caller can ask for again, against durable state for a transient intent. `set_project` and `reset_conversation` additionally require structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
 
 Gateway-off (the default topology this targets), the model's tool result is the tool's OWN returned line delivered over kiro-cli's MCP pipe; the applier's confirmation string and SEL audit are recorded on KiroCrew's own surfaces (transcript / WS / hooks) and do NOT rewrite the model's tool result. Each tool therefore phrases its own message as a *request* that the consumer applies (and may refuse — no interactive session, invalid/sensitive path, capped/paused loop) rather than asserting the effect already landed.
 

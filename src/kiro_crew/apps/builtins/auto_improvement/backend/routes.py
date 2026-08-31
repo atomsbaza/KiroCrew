@@ -259,10 +259,26 @@ def _redact_tree(value: Any) -> Any:
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
-    """Parse a JSON object body, tolerating an empty one."""
+    """Parse a JSON object body, tolerating an empty one.
+
+    Diverges DELIBERATELY from the dashboard contract
+    (``dashboard/handlers/_shared.read_bounded_json``, which answers 400 for a
+    non-object): every call site here treats the result as a config *patch* and
+    only ever reads known keys off it (``set(patch)``, ``patch.items()``,
+    ``body.get(...)``), so an empty object is a legitimate no-op request. A
+    malformed OR non-object body therefore collapses to ``{}`` (an empty patch)
+    on purpose rather than a 400 — there is no field whose absence widens an
+    operation here, unlike ``session_storage._json_body``.
+
+    The catch is narrowed to the client-input failure set
+    (``LookupError`` from an unknown ``charset=`` codec, ``RecursionError`` from a
+    deeply nested body, ``ValueError``/``UnicodeDecodeError`` from undecodable or
+    non-JSON bytes) so a mid-read transport error (a client disconnect) still
+    propagates rather than being mislabelled a client mistake.
+    """
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is a client error, not a crash
+    except (LookupError, RecursionError, ValueError):
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -341,7 +357,7 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
         return busy
 
     def _clone() -> tuple[dict, str]:
-        return clone_setup.setup_safe_clone(url, store.scratch_dir())
+        return clone_setup.setup_safe_clone(url, store.scratch_path())
 
     # `result` is a PARAMETER, not a closure read. It used to be a free variable of this
     # handler, which broke the moment clone+persist moved inside `_clone_and_persist` to take
@@ -782,6 +798,8 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         clone = str(config.get("clone") or "").strip()
         if not clone:
             return {"ok": False, "error": "no repository configured"}
+        if not clone_setup._repository_is_isolated(Path(clone)):
+            return {"ok": False, "error": "repository isolation check failed — re-run setup"}
 
         body = body_path.read_text(encoding="utf-8")
         # The queued body leads with the summary as an H1; the recipe wants the

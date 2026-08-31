@@ -3446,6 +3446,277 @@ class TestIsSensitivePath:
         assert is_sensitive_path("") is False
 
 
+class TestKeystonePublishArtifacts:
+    """A keystone leaf's atomic-write temp and lock sibling are on the floor too.
+
+    ``atomic_write`` publishes every keystone leaf through a
+    ``tempfile.mkstemp(dir=path.parent, suffix=".tmp")`` sibling and renames it over the
+    target, and several stores take a lock file beside the leaf they guard. The temp
+    holds the leaf's FULL payload for the duration of the write, so both gates must
+    refuse it -- fencing the final name alone left the publish path outside the fence.
+    """
+
+    # ── the real shapes, on the tool path ──
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_mkstemp_temp_in_the_crew_root_is_fenced(self, prefix: str) -> None:
+        """The shape atomic_write ACTUALLY produces: a random name, no leaf in it."""
+        assert is_sensitive_path(f"~/{prefix}/tmpAB12CD34.tmp") is True
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_lock_siblings_in_the_crew_root_are_fenced(self, prefix: str) -> None:
+        # .policy.lock guards the ops autonomy ceiling; the *.json.lock form is the
+        # ops secrets store's; .crons.lock is the cron store's.
+        assert is_sensitive_path(f"~/{prefix}/.policy.lock") is True
+        assert is_sensitive_path(f"~/{prefix}/ops_mission_control_secrets.json.lock") is True
+        assert is_sensitive_path(f"~/{prefix}/.crons.lock") is True
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_leaf_suffixed_temp_is_fenced(self, prefix: str) -> None:
+        """The shape issue #5050 measured, kept even though no writer emits it.
+
+        Covered by the same suffix rule at no extra cost, and a hand-rolled writer
+        adopting this convention later inherits the protection.
+        """
+        assert is_sensitive_path(f"~/{prefix}/computer_use.json.tmp") is True
+        assert is_sensitive_path(f"~/{prefix}/security_policy.json.tmp") is True
+        assert is_sensitive_path(f"~/{prefix}/token_signing.key.tmp") is True
+        assert is_sensitive_path(f"~/{prefix}/.env.tmp") is True
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_artifact_beside_a_nested_leaf_is_fenced(self, prefix: str) -> None:
+        """The rule follows the leaf, so a leaf outside the root is covered as well."""
+        assert is_sensitive_path(f"~/{prefix}/workspace/md-notebook/One.md.abcd.tmp") is True
+
+    def test_the_write_gate_stays_a_superset(self) -> None:
+        """is_sensitive_write_path is documented as a superset, so it must agree."""
+        from kiro_crew.security import is_sensitive_write_path
+
+        assert is_sensitive_write_path("~/.kiro/crew/tmpAB12CD34.tmp") is True
+        assert is_sensitive_write_path("~/.kiro/crew/.policy.lock") is True
+
+    # ── the same shapes on the shell path ──
+    # "protected on one path only is not protected" -- the tool-path clause above is
+    # worthless if the shell can still name the file.
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat ~/.kiro/crew/tmpAB12CD34.tmp",
+            "cat ~/.kiro/crew/.policy.lock",
+            "cat ~/.kiro/crew/computer_use.json.tmp",
+            "cat ~/.kiro/crew/ops_mission_control_secrets.json.lock",
+            "cat $HOME/.kirocrew/tmpAB12CD34.tmp",
+            # Verb-independent: a redirect and a copy are caught without enumerating
+            # write verbs.
+            "echo pwned > ~/.kiro/crew/tmpAB12CD34.tmp",
+            "cp /tmp/evil ~/.kiro/crew/tmpAB12CD34.tmp",
+            # Windows-native spellings, which the POSIX tokenizing passes cannot see.
+            r"type C:\Users\u\.kiro\crew\tmpAB12CD34.tmp",
+            r"type C:\Users\u\.kiro\crew\.policy.lock",
+            r"type %USERPROFILE%\.kiro\crew\tmpAB12CD34.tmp",
+            r"python -c \"open(r'C:\Users\u\.kiro\crew\tmpAB12CD34.tmp','w')\"",
+        ],
+    )
+    def test_shell_forms_are_refused(self, command: str) -> None:
+        assert is_sensitive_bash_command(command) is not None
+
+    @pytest.mark.parametrize("terminator", ["&", ";", "|", "&&whoami", ">out"])
+    def test_a_shell_metacharacter_does_not_end_the_fence(self, terminator: str) -> None:
+        """A metacharacter after the path still names the path.
+
+        The POSIX ``path_end`` already treats every shell word-end character as a
+        terminator. The Windows branches each spelled a narrower class
+        (separator/space/end/quote), so ``type <fenced path>&whoami`` named the file and
+        walked through, while the POSIX spelling of the same command was caught. Both
+        spellings now share one terminator.
+        """
+        posix = f"cat ~/.kiro/crew/tmpAB12CD34.tmp{terminator}"
+        win = rf"type C:\Users\u\.kiro\crew\tmpAB12CD34.tmp{terminator}"
+        assert is_sensitive_bash_command(posix) is not None
+        assert is_sensitive_bash_command(win) is not None
+
+    @pytest.mark.parametrize("terminator", ["&", ";", "|"])
+    def test_the_keystone_leaf_shares_that_terminator(self, terminator: str) -> None:
+        """The leaf must not be looser than its own temp.
+
+        A fence tight on the atomic-write temp and loose on the secret beside it protects
+        the transient copy and not the payload, so the shared terminator is applied to the
+        whole Windows family rather than to the artifact branch alone.
+        """
+        assert (
+            is_sensitive_bash_command(rf"type C:\Users\u\.kiro\crew\computer_use.json{terminator}")
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command(rf"type C:\Users\u\.kiro\crew\.env{terminator}") is not None
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # PowerShell expands the variable away, so the path actually read is the
+            # fenced one. Reported by review against the Windows terminator.
+            r"Get-Content C:\Users\u\.kiro\crew\computer_use.json$null",
+            r"type C:\Users\u\.kiro\crew\.env$null",
+            r"type C:\Users\u\.kiro\crew\tmpAB12CD34.tmp$null",
+            r"type C:\Users\u\.kiro\crew\.policy.lock$null",
+            r"Get-Content %USERPROFILE%\.kiro\crew\token_signing.key$env:x",
+        ],
+    )
+    def test_an_empty_expansion_does_not_end_the_fence(self, command: str) -> None:
+        """A trailing ``$var`` is removed by the shell, so it must not end the path.
+
+        The terminator alternation already contained a regex ``$``, but that is the
+        end-of-string ANCHOR -- it never matched a literal dollar sign, so
+        ``<fenced path>$null`` read as an unterminated path and was allowed. The POSIX
+        spelling of the same command was already covered by its own branches, so the
+        literal ``$`` is added to the Windows class only.
+        """
+        assert is_sensitive_bash_command(command) is not None
+
+    def test_the_dollar_addition_does_not_over_block(self) -> None:
+        """A ``$`` elsewhere in a command is not a fenced path."""
+        assert is_sensitive_bash_command("echo $HOME") is None
+        assert is_sensitive_bash_command("cat ~/project/notes.txt") is None
+        assert is_sensitive_bash_command("VAR=$HOME cat ~/project/notes.txt") is None
+        assert is_sensitive_bash_command("cd $HOME && ls") is None
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/config.json") is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A canonical no-op segment between the artifact's parent and its filename.
+            # The leaf branch already absorbed these because it joins every segment of
+            # its entry with the generalized separator; the artifact branch put a plain
+            # separator before its WILDCARD filename and let them through.
+            r"type C:\Users\u\.kiro\crew\.\tmpAB12CD34.tmp",
+            r"type C:\Users\u\.kiro\crew\.\.policy.lock",
+            r"type C:\Users\u\.kiro\crew\x\..\tmpAB12CD34.tmp",
+            "cat ~/.kiro/crew/./tmpAB12CD34.tmp",
+            "cat ~/.kiro/crew/x/../tmpAB12CD34.tmp",
+            # Windows strips a trailing dot when opening, so this names the same file.
+            r"type C:\Users\u\.kiro\crew\tmpAB12CD34.tmp.",
+            "cat ~/.kiro/crew/tmpAB12CD34.tmp.",
+        ],
+    )
+    def test_a_canonical_alias_does_not_end_the_fence(self, command: str) -> None:
+        """Spellings the shell or filesystem treats as the same path must still match."""
+        assert is_sensitive_bash_command(command) is not None
+
+    def test_the_leaf_branch_covers_the_noop_segment_but_not_the_trailing_dot(self) -> None:
+        """Honest scope: the no-op segment is closed on the leaf branch, the dot is not.
+
+        The leaf branch already absorbed no-op chains, because it joins every segment of
+        its entry with the generalized separator. Its TRAILING-DOT alias is left open on
+        purpose: closing it needs ``.`` in the terminator, and because these branches also
+        accept forward slashes, that refused ``ls -d ~/.kiro/crew/backup.tar`` -- a
+        different file whose name is prefixed by the fenced directory leaf ``backup``, and
+        the read-only listing #6021 exists to allow. A terminator after a directory name
+        cannot separate the alias from the sibling; the artifact branches can, because
+        their lookahead sits at the end of a complete filename.
+        """
+        assert (
+            is_sensitive_bash_command(r"type C:\Users\u\.kiro\crew\.\computer_use.json") is not None
+        )
+        # The pre-existing gap, asserted so a future change to the terminator is a
+        # deliberate decision rather than a surprise.
+        assert is_sensitive_bash_command(r"type C:\Users\u\.kiro\crew\computer_use.json.") is None
+        # ...and the read that constrains it stays allowed.
+        assert is_sensitive_bash_command("ls -d ~/.kiro/crew/backup.tar") is None
+
+    def test_the_alias_tolerance_still_rejects_a_different_file(self) -> None:
+        """The lookahead admits a trailing separator or dot, never a longer NAME.
+
+        This is the boundary that keeps the tolerance from becoming a wildcard: a file
+        whose name merely starts with an artifact name is a different file.
+        """
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/tmpAB12CD34.tmpx") is None
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/tmpAB12CD34.tmp-old") is None
+        assert is_sensitive_bash_command("cat ~/project/build.tmpl") is None
+        assert is_sensitive_bash_command("cat ~/project/yarn.lock") is None
+
+    # ── it must not over-block ──
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_routine_crew_root_reads_still_allowed(self, prefix: str) -> None:
+        """The reason the crew root cannot simply be fenced wholesale."""
+        assert is_sensitive_path(f"~/{prefix}/config.json") is False
+        assert is_sensitive_path(f"~/{prefix}/sessions.db") is False
+        assert is_sensitive_path(f"~/{prefix}/notes.txt") is False
+
+    def test_the_users_own_home_is_not_swept(self) -> None:
+        """The parent set is derived from the CREW leaves, not from every sensitive path.
+
+        ``_SENSITIVE_HOME_DIRS`` also carries ``.aws``, ``.ssh`` and the identity
+        stores, whose parent is ``$HOME`` itself -- deriving the artifact parents from
+        that list would fence every ``*.tmp`` and ``*.lock`` in the user's home.
+        """
+        assert is_sensitive_path("~/scratch.tmp") is False
+        assert is_sensitive_path("~/yarn.lock") is False
+        assert is_sensitive_path("~/project/yarn.lock") is False
+        assert is_sensitive_bash_command("cat ~/project/yarn.lock") is None
+        assert is_sensitive_bash_command("npm ci --prefer-offline") is None
+
+    def test_the_parent_is_matched_by_equality_not_prefix(self) -> None:
+        """An artifact is a DIRECT child of the leaf's directory.
+
+        A prefix test would sweep every descendant of the crew home whose name ends in
+        ``.tmp`` -- much wider than this needs, in a directory that must stay readable.
+        """
+        assert is_sensitive_path("~/.kiro/crew/sub/deeper/x.tmp") is False
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/sub/deeper/x.tmp") is None
+
+    def test_a_directory_without_a_keystone_leaf_is_out_of_scope(self) -> None:
+        """``deploy/`` takes a lock but holds no keystone leaf.
+
+        There is no keystone payload beside it for the fence to protect, so it is
+        deliberately excluded rather than swept in by proximity.
+        """
+        assert is_sensitive_path("~/.kiro/crew/deploy/pending-deploys.lock") is False
+
+    def test_the_leaves_themselves_are_still_fenced(self) -> None:
+        """No regression: the artifact clause is additive."""
+        assert is_sensitive_path("~/.kiro/crew/computer_use.json") is True
+        assert is_sensitive_path("~/.kiro/crew/security_policy.json") is True
+        assert is_sensitive_path("~/.kiro/crew/.env") is True
+        assert is_sensitive_path("~/.kiro/crew/webhooks/tokens.json") is True
+
+    def test_a_relocated_crew_home_is_covered(self, tmp_path, monkeypatch) -> None:
+        """KIROCREW_HOME re-anchoring is inherited, not reimplemented.
+
+        The keystone leaves live directly under a custom ``KIROCREW_HOME``, so the
+        artifact rule has to follow them there or the fence is bypassed by setting the
+        env var. Covered because a ``<crew-prefix>``-rooted entry hits the
+        prefix-stripping arm in ``_home_dir_targets_uncached``.
+        """
+        relocated = tmp_path / "custom-crew-home"
+        relocated.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(relocated))
+        assert is_sensitive_path(str(relocated / "tmpAB12CD34.tmp")) is True
+        assert is_sensitive_path(str(relocated / ".policy.lock")) is True
+        # ...and the over-block guard holds there too.
+        assert is_sensitive_path(str(relocated / "config.json")) is False
+
+    def test_a_symlink_aimed_at_a_live_temp_is_caught(self, tmp_path, monkeypatch) -> None:
+        """The resolved candidate form is checked, so a benign link name does not help."""
+        home = tmp_path / "home"
+        crew = home / ".kiro" / "crew"
+        crew.mkdir(parents=True)
+        temp = crew / "tmpAB12CD34.tmp"
+        temp.write_text("secret-payload-mid-write\n")
+        # Path.home() reads HOME on POSIX and USERPROFILE on Windows, and the gate anchors
+        # its targets on Path.home() -- so setting only HOME leaves the Windows anchor on
+        # the real profile and the fake home below is never recognised. Set both.
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        link = ws / "notes.txt"
+        link.symlink_to(temp)
+        assert is_sensitive_path(str(link)) is True
+
+
 class TestHomeDirTargetsCache:
     """Tests for the TTL cache in front of ``_home_dir_targets_uncached``.
 
@@ -6035,6 +6306,238 @@ class TestWindowsPathShapes:
         for fenced in (".aws\\credentials", "AppData\\Roaming\\kiro-cli\\data.sqlite3"):
             cmd = f"type '{home}\\{fenced}'"
             assert is_sensitive_bash_command(cmd) is not None, cmd
+
+
+class TestWindowsSeparatorRuns:
+    """A repeated path separator names the same file the single one does.
+
+    Win32 collapses a separator run, so ``kiro-cli`` and ``\\\\kiro-cli`` and
+    ``//kiro-cli`` are one entry. The fence matched RAW text with exactly one
+    separator per boundary, so a doubled separator anywhere in the chain reached
+    the fenced store while matching no branch (#6350) -- including the live SSO
+    bearer-token database under ``AppData\\Local\\kiro-cli``.
+
+    Asserted as a MATRIX rather than per spelling, because closing these one at
+    a time is what produced the previous shape: every anchor times every run
+    shape times every boundary position. The whole class is host-independent --
+    the raw pass never reads ``os.name`` -- so these run and mean the same thing
+    on the Linux and macOS runners as on Windows. What a non-Windows host
+    CANNOT show is Win32 actually collapsing the run; that equivalence is
+    assumed from the platform contract, and these tests pin the matcher's side
+    of it.
+    """
+
+    #: Every anchor the Windows branches accept, in a spelling that needs no
+    #: host support: the generic drive-letter home, the cmd.exe and PowerShell
+    #: profile variables, and the POSIX-ish anchors the raw pass also allows.
+    ANCHORS = (
+        r"C:\Users\u",
+        "%USERPROFILE%",
+        "$env:USERPROFILE",
+        "~",
+        "$HOME",
+    )
+    #: Separator runs. Two and three backslashes, the forward-slash spelling,
+    #: and both mixed orders -- Win32 treats all of them as one boundary.
+    RUNS = ("\\\\", "\\\\\\", "//", "\\/", "/\\")
+
+    @staticmethod
+    def _double_nth_separator(path: str, index: int) -> str:
+        """Return *path* with its *index*-th backslash doubled."""
+        head, tail = "", path
+        for _ in range(index + 1):
+            cut = tail.index("\\")
+            head += tail[: cut + 1]
+            tail = tail[cut + 1 :]
+        return f"{head}\\{tail}"
+
+    @pytest.mark.parametrize("run", RUNS)
+    @pytest.mark.parametrize("fenced", (r".aws\credentials", r".ssh\id_rsa"))
+    def test_a_run_right_after_the_anchor_still_names_the_store(
+        self, run: str, fenced: str
+    ) -> None:
+        # The report measured the leak on the alias branch and the home-anchored
+        # branch alike, so the run is exercised against EVERY anchor. ``.aws``
+        # and ``.ssh`` were reported as unaffected; they are not -- the report
+        # only doubled the separator before the LEAF, which the trailing
+        # boundary already absorbed.
+        for anchor in self.ANCHORS:
+            cmd = f'type "{anchor}{run}{fenced}"'
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("fenced", [d for d in security._SENSITIVE_HOME_DIRS if "/" in d])
+    def test_a_run_at_every_inter_segment_boundary_is_blocked(self, fenced: str) -> None:
+        # A doubled separator immediately before the LEAF was already blocked
+        # (the trailing boundary absorbs one), which is why the gap read as
+        # narrower than it was. Walk EVERY boundary of a multi-segment fenced
+        # dir instead of trusting one position.
+        native = "\\".join(fenced.split("/"))
+        path = f"C:\\Users\\u\\{native}\\data.sqlite3"
+        boundaries = path.count("\\")
+        assert boundaries >= 4, path
+        for index in range(boundaries):
+            spelling = self._double_nth_separator(path, index)
+            cmd = f'type "{spelling}"'
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("run", RUNS)
+    def test_the_appdata_alias_branches_tolerate_a_run(self, run: str) -> None:
+        # ``%LOCALAPPDATA%`` names the CURRENT kiro-cli store, and the alias
+        # branches carry their own anchor-specific no-op excursion
+        # (``\..\Roaming``), which has its own separators.
+        for var, product in (("%APPDATA%", "kiro-cli"), ("%LOCALAPPDATA%", "kiro-cli")):
+            cmd = f'type "{var}{run}{product}\\data.sqlite3"'
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+        for cmd in (
+            f'type "%APPDATA%\\..{run}Roaming\\kiro-cli\\data.sqlite3"',
+            f'type "%APPDATA%{run}..\\Roaming\\kiro-cli\\data.sqlite3"',
+            f'type "%LOCALAPPDATA%\\..{run}Local\\kiro-cli\\data.sqlite3"',
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("run", RUNS)
+    def test_a_run_composes_with_the_canonical_no_ops(self, run: str) -> None:
+        # The generalized separator already accepted ``\.`` and ``\X\..``
+        # excursions. A run at the seam between an excursion and the next
+        # segment is the same equivalence one level in.
+        for cmd in (
+            f'type "%LOCALAPPDATA%\\.{run}kiro-cli\\data.sqlite3"',
+            f'type "C:\\Users\\u\\.aws\\..{run}.aws\\credentials"',
+            f'type "C:\\Users\\u{run}.aws\\..\\.aws\\credentials"',
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("run", RUNS)
+    def test_the_anchorless_relative_traversal_matcher_tolerates_a_run(self, run: str) -> None:
+        # The relative matcher has no anchor to lean on, so its own traversal
+        # prefix and segment joins each need the run: ``..\\.aws\credentials``
+        # is the same file ``..\.aws\credentials`` is.
+        for cmd in (
+            f"cat ..{run}.aws\\credentials",
+            f"cat ..{run}..\\.ssh\\id_rsa",
+            f"cat ..\\AppData{run}Local\\kiro-cli\\data.sqlite3",
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("run", RUNS)
+    def test_the_windows_write_gates_tolerate_a_run(self, run: str) -> None:
+        # ``~/.kiro/agents`` is a code-execution boundary, not a read fence: a
+        # planted spec becomes a command the gateway execs outside the
+        # per-session sandbox. The crew variable-leaf branch is the same shape
+        # with a computed leaf.
+        for cmd in (
+            f'echo x > "C:\\Users\\u\\.kiro{run}agents\\evil.json"',
+            f'echo x > "%USERPROFILE%\\.kiro{run}agents\\evil.json"',
+            f'echo x > "$env:KIRO_HOME{run}agents\\evil.json"',
+            f'echo x > "%USERPROFILE%\\.kiro\\crew{run}%F%"',
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("leaf", security._WRITE_PROTECTED_BASH_LEAVES)
+    def test_the_write_protected_leaves_tolerate_a_run(self, leaf: str) -> None:
+        for prefix in (".kiro\\crew", ".kirocrew"):
+            cmd = f'echo forged > "C:\\Users\\u\\{prefix}\\\\{leaf}"'
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_the_resolved_home_literal_anchor_tolerates_a_run(self) -> None:
+        # A home that is NOT under ``Users``/``home`` has only the resolved
+        # literal to match on. The PATTERN spells one separator, so a run is
+        # handled by collapsing the SUBJECT first -- this asserts the
+        # composition, which is what the gate actually evaluates. Built through
+        # ``_build_sensitive_regex`` directly: it is a pure function of the
+        # home, so no module cache is disturbed and no Windows host is needed.
+        with mock.patch.object(security.Path, "home", return_value=Path("D:\\profiles\\u")):
+            pattern = security._build_sensitive_regex()
+        for spelling in (
+            r"D:\profiles\\u\.aws\credentials",
+            r"D:\profiles\u\\.aws\credentials",
+            r"D:\profiles\\u\\.ssh\id_rsa",
+            # A MIXED run: collapsing to one fixed separator left this unmatched,
+            # because the escaped home literal wants a backslash (found in
+            # review). Both spellings are emitted, so one of them matches.
+            r"D:/\profiles\u\.aws\credentials",
+        ):
+            cmd = f'type "{spelling}"'
+            variants = security._separator_collapsed_variants(cmd)
+            assert any(pattern.search(v) for v in variants), spelling
+        # The single-separator spelling needs no collapsing at all, and an
+        # unrelated profile on the same drive is not the fenced home either way.
+        assert pattern.search(r'type "D:\profiles\u\.aws\credentials"')
+        assert not pattern.search(r'type "D:\profiles\u2\notes.txt"')
+        assert not any(
+            pattern.search(v)
+            for v in security._separator_collapsed_variants(r'type "D:\profiles\\u2\notes.txt"')
+        )
+
+    def test_benign_paths_with_a_run_stay_allowed(self) -> None:
+        # Widening a deny boundary can only deny more, so the controls matter:
+        # a run in an ordinary path must not become a refusal, and a name that
+        # merely starts with a fenced one is a different directory.
+        for cmd in (
+            r'type "C:\src\myproj\\README.md"',
+            r'type "%LOCALAPPDATA%\\Microsoft\Edge\prefs.json"',
+            r'type "C:\Users\u\\Documents\notes.txt"',
+            r'type "C:\Users\u\\.awsx\notes.txt"',
+            r'type "C:\Users\u\\.kiro\agentsx\notes.txt"',
+            r"cat ..\\docs\readme.md",
+            r'type "C:\Users\\u2\Documents\a.txt"',
+        ):
+            assert is_sensitive_bash_command(cmd) is None, cmd
+
+    def test_a_run_does_not_smuggle_an_extraction_into_the_trust_root(self) -> None:
+        # The extraction check is a SEPARATE control from the path matcher, so
+        # repeating only the matcher over the collapsed copy let a doubled
+        # separator carry an archive into the governance root (found in review).
+        for cmd in (
+            "tar -xf evil.tar -C $HOME//.kiro/crew",
+            "tar -xf evil.tar -C ~//.kiro//crew",
+            "tar -xzf evil.tar -C $HOME/\\.kiro/crew",
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("run", ("//", "\\\\", "\\/", "/\\"))
+    def test_a_mixed_run_is_normalized_to_both_separators(self, run: str) -> None:
+        # A run made of both characters collapses to neither spelling on its own,
+        # so both are emitted. Exercised through the real gate, not the helper.
+        cmd = f'type "%LOCALAPPDATA%{run}kiro-cli\\data.sqlite3"'
+        assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_a_unc_path_with_an_interior_run_is_still_fenced(self) -> None:
+        # A UNC path BEGINS with two separators that its anchor requires, so
+        # collapsing them broke every UNC spelling that also had an interior run:
+        # the original missed on the interior run and the collapsed copy had no
+        # UNC prefix left, so the keystone read was permitted (found in review).
+        for cmd in (
+            r'type "\\server\share\.kiro\\crew\security_policy.json"',
+            r'type "\\server\share\.kiro\crew\\security_policy.json"',
+            r'type "//server/share/.kiro//crew/security_policy.json"',
+            r'cat "\\srv\homes\u\\.ssh\id_rsa"',
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_the_unchanged_unc_spelling_still_matches(self) -> None:
+        # The control: a UNC path with no interior run needs no collapsing and
+        # must keep matching on the original command.
+        cmd = r'type "\\server\share\.kiro\crew\security_policy.json"'
+        assert is_sensitive_bash_command(cmd) is not None
+
+    def test_a_pathological_separator_run_is_decided_quickly(self) -> None:
+        # The run classes are DISJOINT from the name run (which excludes
+        # separators) and from ``.``, so admitting one-or-more adds no
+        # quantifier ambiguity. Pinned because a starred group holding an
+        # ambiguous adjacent pair is exponential, and this file has been there:
+        # an exponential shape shows as seconds at a few hundred characters.
+        for payload in (
+            "\\" * 400,
+            "\\." * 200,
+            "\\a\\.." * 100,
+            "\\" * 200 + "." * 200,
+        ):
+            cmd = f'type "%LOCALAPPDATA%{payload}X"'
+            start = time.perf_counter()
+            is_sensitive_bash_command(cmd)
+            elapsed = time.perf_counter() - start
+            assert elapsed < 2.0, f"{elapsed:.2f}s on {len(cmd)} chars"
 
 
 class TestBareTokenProtectedLeaves:

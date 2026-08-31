@@ -191,25 +191,26 @@ def test_launchd_live_worktree_resolves_checkout(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_load_fallback_repos_collects_ancestor_remotes(monkeypatch):
-    """A remote whose base is an ancestor of upstream becomes a fallback repo."""
+    """A differently named repo whose base is an ancestor becomes a fallback repo."""
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
-            return 0, "origin\nfork\nstale\n", ""
+            return 0, "origin\nold\nstale\n", ""
         if "--is-ancestor" in cmd:
-            return (0 if "fork/main" in cmd else 1), "", ""
+            return (0 if "old/main" in cmd else 1), "", ""
         if "get-url" in cmd:
             remote = cmd[-1]
-            # Upstream is a genuinely different repository from the fork, so the
-            # fork's ancestor main still qualifies as a pre-rename fallback repo.
+            # The ancestor remote is a genuinely different REPOSITORY — a
+            # pre-rename name, not a fork of upstream under another owner — so
+            # its ancestor main still qualifies as a fallback repo.
             if remote == "origin":
                 return 0, "git@github.com:kirodotdev/KiroCrew.git\n", ""
-            return 0, "git@github.com:someone/kirocrew.git\n", ""
+            return 0, "git@github.com:someone/kirocrew-old.git\n", ""
         return 1, "", "unexpected"
 
     monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
     monkeypatch.setattr(mod, "_run_cmd", fake_run)
     await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == ["someone/kirocrew"]
+    assert mod._FALLBACK_REPOS == ["someone/kirocrew-old"]
 
 
 @pytest.mark.asyncio
@@ -274,27 +275,85 @@ async def test_load_fallback_repos_recognizes_scp_and_git_suffix_as_same(monkeyp
 
 @pytest.mark.asyncio
 async def test_load_fallback_repos_dedupes_multiple_aliases_of_one_repo(monkeypatch):
-    """Two aliases of one genuine fork collapse to a single fallback entry."""
+    """Two aliases of one genuine pre-rename repo collapse to a single entry."""
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
-            return 0, "kirocrew\nfork-a\nfork-b\n", ""
+            return 0, "kirocrew\nold-a\nold-b\n", ""
         if "--is-ancestor" in cmd:
-            # Both forks' mains are ancestors of upstream's.
+            # Both aliases' mains are ancestors of upstream's.
             return 0, "", ""
         if "get-url" in cmd:
             remote = cmd[-1]
             if remote == "kirocrew":
                 return 0, "https://github.com/kirodotdev/KiroCrew.git\n", ""
-            if remote == "fork-a":
-                return 0, "git@github.com:someone/kirocrew.git\n", ""
-            return 0, "https://github.com/someone/KiroCrew\n", ""  # same repo, other spelling
+            if remote == "old-a":
+                return 0, "git@github.com:someone/kirocrew-old.git\n", ""
+            return 0, "https://github.com/someone/KiroCrew-Old\n", ""  # same repo, other spelling
         return 1, "", "unexpected"
 
     monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
     monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
     monkeypatch.setattr(mod, "_run_cmd", fake_run)
     await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == ["someone/kirocrew"]
+    assert mod._FALLBACK_REPOS == ["someone/kirocrew-old"]
+
+
+@pytest.mark.asyncio
+async def test_load_fallback_repos_skips_same_named_fork(monkeypatch):
+    """A fork of upstream under another owner is NOT a fallback repo.
+
+    A fork's main passes ``merge-base --is-ancestor`` against upstream's until it
+    diverges, and its repo NAME is upstream's own. The fallback list is consumed
+    by repo name alone, so admitting the fork yields the ``<name>-wt-`` prefix
+    that every current-convention worktree matches — flagging the whole fleet as
+    legacy.
+    """
+    async def fake_run(cmd, **kw):
+        if cmd[-1] == "remote":
+            return 0, "kirocrew\nfork\n", ""
+        if "--is-ancestor" in cmd:
+            return 0, "", ""  # the fork's main has not diverged yet
+        if "get-url" in cmd:
+            remote = cmd[-1]
+            if remote == "kirocrew":
+                return 0, "https://github.com/kirodotdev/KiroCrew.git\n", ""
+            # Same repo NAME, different owner — a fork, not a pre-rename repo.
+            return 0, "git@github.com:someone/KiroCrew.git\n", ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
+    monkeypatch.setattr(mod, "_run_cmd", fake_run)
+    await mod._load_fallback_repos()
+    assert mod._FALLBACK_REPOS == []
+
+
+@pytest.mark.asyncio
+async def test_load_fallback_repos_keeps_renamed_repo_alongside_a_fork(monkeypatch):
+    """The name guard discriminates: the fork is dropped, the renamed repo kept.
+
+    Both candidates' mains are ancestors of upstream's, so only the repo name
+    tells them apart — proving the guard is not a blanket skip of every ancestor.
+    """
+    async def fake_run(cmd, **kw):
+        if cmd[-1] == "remote":
+            return 0, "kirocrew\nfork\nold\n", ""
+        if "--is-ancestor" in cmd:
+            return 0, "", ""
+        if "get-url" in cmd:
+            remote = cmd[-1]
+            if remote == "kirocrew":
+                return 0, "https://github.com/kirodotdev/KiroCrew.git\n", ""
+            if remote == "fork":
+                return 0, "git@github.com:someone/KiroCrew.git\n", ""
+            return 0, "git@github.com:kirodotdev/kirocrew-old.git\n", ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
+    monkeypatch.setattr(mod, "_run_cmd", fake_run)
+    await mod._load_fallback_repos()
+    assert mod._FALLBACK_REPOS == ["kirodotdev/kirocrew-old"]
 
 
 def test_normalize_repo_identity_spellings_and_host():
@@ -917,6 +976,37 @@ async def test_pod_provision_starts_run_and_records_it(monkeypatch):
 
     assert await mod._pod_provision("feat") == {"ok": True, "run_id": "run-9"}
     assert mod._PROVISION_INFLIGHT["feat"] == "run-9"
+
+
+@pytest.mark.asyncio
+async def test_pod_provision_dismiss_forgets_matching_terminal_run(monkeypatch):
+    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-1"})
+    monkeypatch.setattr(mod, "_RUNS", {"run-1": {"status": "done", "exit_code": 1}})
+
+    assert await mod._pod_provision_dismiss("feat", "run-1") == {
+        "ok": True, "dismissed": True,
+    }
+    assert "feat" not in mod._PROVISION_INFLIGHT
+
+
+@pytest.mark.asyncio
+async def test_pod_provision_dismiss_cannot_clear_replacement_run(monkeypatch):
+    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-new"})
+
+    assert await mod._pod_provision_dismiss("feat", "run-old") == {
+        "ok": True, "dismissed": False,
+    }
+    assert mod._PROVISION_INFLIGHT["feat"] == "run-new"
+
+
+@pytest.mark.asyncio
+async def test_pod_provision_dismiss_refuses_running_run(monkeypatch):
+    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-1"})
+    monkeypatch.setattr(mod, "_RUNS", {"run-1": {"status": "running"}})
+
+    result = await mod._pod_provision_dismiss("feat", "run-1")
+    assert result == {"ok": False, "error": "cannot dismiss a running provision"}
+    assert mod._PROVISION_INFLIGHT["feat"] == "run-1"
 
 
 # --------------------------------------------------------------------------
@@ -1599,6 +1689,18 @@ async def test_json_body_empty_request_is_empty_dict():
 
 
 @pytest.mark.asyncio
+async def test_json_body_unknown_charset_is_400_not_500():
+    # An unknown ``charset=`` codec makes aiohttp's decode step raise LookupError,
+    # not JSONDecodeError. The catch was ValueError-only, so this used to escape as
+    # a 500; it is a client-input mistake and must answer 400. Guards the widened
+    # (LookupError, RecursionError, ValueError) catch against a regression.
+    body, err = await mod._json_body(
+        _raw_request(b"{}", json_error=LookupError("unknown encoding: bogus-codec"))
+    )
+    assert body is None and err is not None and err.status == 400
+
+
+@pytest.mark.asyncio
 async def test_worktree_remove_handler_rejects_non_bool_force(monkeypatch):
     _sel_capture(monkeypatch)
     monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
@@ -1738,6 +1840,51 @@ async def test_pod_handlers_dispatch_to_their_action(monkeypatch, handler_name, 
     resp = await getattr(mod, handler_name)(_json_request({"name": "feat"}))
     assert json.loads(resp.text) == {"ok": True, "via": action_name}
     action.assert_awaited_once_with("feat")
+
+
+@pytest.mark.asyncio
+async def test_pod_provision_dismiss_handler_validates_and_dispatches(monkeypatch):
+    _sel_capture(monkeypatch)
+    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
+    dismiss = AsyncMock(return_value={"ok": True, "dismissed": True})
+    monkeypatch.setattr(mod, "_pod_provision_dismiss", dismiss)
+
+    resp = await mod.api_dev_fleet_pod_provision_dismiss(
+        _json_request({"name": "feat", "run_id": "run-1"})
+    )
+
+    assert json.loads(resp.text) == {"ok": True, "dismissed": True}
+    dismiss.assert_awaited_once_with("feat", "run-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw, json_error",
+    [
+        (b"{oops", ValueError("bad json")),
+        (b"[1, 2]", None),
+    ],
+)
+async def test_pod_provision_dismiss_handler_codes_a_malformed_body(
+    monkeypatch, raw, json_error
+):
+    """Every rejection from this endpoint carries a machine-readable code.
+
+    A malformed or non-object body is rejected by the shared body parser, whose
+    default 400 has no ``code``; the dismiss handler asks for one so a client
+    can branch on the failure instead of matching prose.
+    """
+    _sel_capture(monkeypatch)
+    dismiss = AsyncMock()
+    monkeypatch.setattr(mod, "_pod_provision_dismiss", dismiss)
+
+    resp = await mod.api_dev_fleet_pod_provision_dismiss(
+        _raw_request(raw, json_error=json_error)
+    )
+
+    assert resp.status == 400
+    assert json.loads(resp.text)["code"] == "invalid_body"
+    dismiss.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2074,26 +2221,48 @@ def test_foreground_backend_is_none_off_posix(monkeypatch):
 # --------------------------------------------------------------------------
 # drop-in rollback + path selector
 # --------------------------------------------------------------------------
-def test_restore_dropin_deletes_when_there_was_none(tmp_path):
+def _systemd_backend(dropin: Path) -> gateway_service.SystemdBackend:
+    """A SystemdBackend whose drop-in path is *dropin*.
+
+    ``rollback`` touches only the injected drop-in path and the module-level
+    ``atomic_write_text``, so the remaining seams stay inert stubs.
+    """
+    return gateway_service.SystemdBackend(
+        AsyncMock(return_value=(0, "", "")),
+        lambda: "kirocrew.service",
+        platform="linux",
+        which=lambda _name: "/usr/bin/systemctl",
+        dropin_path=lambda: dropin,
+        dropin_content=lambda _wt, _kcbin: "",
+    )
+
+
+def test_service_rollback_deletes_the_dropin_when_there_was_none(tmp_path):
+    """No prior drop-in -> the file staged over it is removed, not left behind."""
     dropin = tmp_path / "make-live.conf"
     dropin.write_text("[Service]\n", encoding="utf-8", newline="\n")
-    assert mod._restore_dropin(dropin, None) is True
+    assert _systemd_backend(dropin).rollback(None) is True
     assert not dropin.exists()
 
 
-def test_restore_dropin_rewrites_prior_content(tmp_path):
+def test_service_rollback_rewrites_prior_content(tmp_path):
+    """A prior drop-in -> its exact content is restored over the staged one."""
     dropin = tmp_path / "make-live.conf"
     dropin.write_text("new\n", encoding="utf-8", newline="\n")
-    assert mod._restore_dropin(dropin, "prior\n") is True
+    assert _systemd_backend(dropin).rollback("prior\n") is True
     assert dropin.read_text(encoding="utf-8") == "prior\n"
 
 
-def test_restore_dropin_reports_failure(monkeypatch, tmp_path):
+def test_service_rollback_reports_failure(monkeypatch, tmp_path):
+    """A failed restore returns False so the caller can report
+    ``rolled_back: false`` rather than claiming a rollback that did not land."""
+
     def _boom(path, content):
         raise OSError("read-only fs")
 
     monkeypatch.setattr(gateway_service, "atomic_write_text", _boom)
-    assert mod._restore_dropin(tmp_path / "make-live.conf", "prior") is False
+    backend = _systemd_backend(tmp_path / "make-live.conf")
+    assert backend.rollback("prior") is False
 
 
 @pytest.mark.asyncio

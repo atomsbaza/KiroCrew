@@ -144,7 +144,57 @@ SKILL_URI_PREFIX = "skill://"
 AGENT_SPEC_SUFFIX = ".agent-spec.json"
 
 
-def _read_agent_spec(path: Path) -> dict[str, Any] | None:
+def _audit_denied(*, operation: str, source: str, resources: str, error: str) -> None:
+    """Emit a denial audit row for a refused path, never raising.
+
+    BOTH denial paths in this module promise not to raise -- ``_read_agent_spec``
+    by the contract :func:`_warn_on_systematic_scan_failure` documents and its
+    callers read bare, and :func:`project_agent_names` in its own docstring
+    ("Never raises; an unreadable checkout yields an empty set"). Auditing the
+    denial must not become the one way to break either promise: for some
+    surfaces this is the process's FIRST SEL use, and constructing the singleton
+    mkdirs its home (``sel.py``), so an unwritable or hostile SEL directory
+    would abort whichever surface asked -- on exactly the hostile path the
+    refusal exists to handle.
+
+    The REFUSAL always stands, so nothing unaudited is ever read or scanned;
+    what is lost is the audit ROW. That is best-effort by the SEL API's own
+    design: ``log_api_access`` reserves fail-closed behaviour for its explicit
+    ``critical=True`` callers (``apps/admission.py``, the auto-improvement
+    server) and neither of these sites has ever been one. WARNING, not debug, so
+    an operator sees that the trail has a hole rather than finding out later.
+
+    The fallback names only the ``operation`` -- a fixed internal label. The
+    REFUSED PATH is deliberately not logged here: on this branch its resolved
+    target is a sensitive location (that is why it was refused), so writing it at
+    a default-visible level would leak the very thing the deny list protects.
+    The path already appears in the neighbouring ``debug`` line for anyone
+    debugging a specific file, and the SEL row -- the record designed to carry
+    it, redacted and clipped -- is what is being lost.
+    """
+    try:
+        _sel().log_api_access(
+            caller="agent_discovery",
+            operation=operation,
+            outcome="denied",
+            source=source,
+            resources=resources,
+            error=error,
+        )
+    except Exception:
+        logger.warning(
+            "SEL denial audit failed for a %s denial -- refusal stands, audit row lost",
+            operation,
+            exc_info=True,
+        )
+
+
+def _read_agent_spec(
+    path: Path,
+    *,
+    operation: str = "list_agents",
+    source: str = "list_agents",
+) -> dict[str, Any] | None:
     """Parse an agent config file, or ``None`` when it is not usable.
 
     The one reader for both scopes, so every guard applies uniformly: AppleDouble
@@ -156,6 +206,20 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
     the size cap instead of being slurped into memory during a cache warm. The
     agents directories are user-writable and shared with other tools, so none of
     these are hypothetical.
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    resolved target. Precisely BECAUSE this is the one reader for every surface,
+    a fixed label would record a denial served for an unrelated request as an
+    agent-listing cache warm (#6722): the calling surface names itself here so
+    the security trail attributes the refusal to the request that triggered it.
+    ``source`` is the interface channel (``SecurityEvent.source`` vocabulary:
+    dashboard, cli, slack, cron, ...; ``"unknown"`` when the caller serves
+    multiple channels) — every call site passes it explicitly, enforced by the
+    call-site ratchet test. Both defaults exist ONLY so a bare call reproduces
+    the historical event byte-for-byte (a forgotten future call site degrades
+    to exactly today's trail); they are not for new call sites.
+    ``caller`` stays fixed at ``"agent_discovery"``: the reader genuinely is the
+    caller into SEL, and a fixed value keeps the trail greppable by module.
     """
     if path.name.startswith("._"):
         return None
@@ -170,11 +234,9 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
         return None
     if is_sensitive_path(str(real)):
         logger.debug("Skipping sensitive agent config: %s", path)
-        _sel().log_api_access(
-            caller="agent_discovery",
-            operation="list_agents",
-            outcome="denied",
-            source="list_agents",
+        _audit_denied(
+            operation=operation,
+            source=source,
             resources=str(real),
             error="sensitive path rejected",
         )
@@ -281,7 +343,7 @@ def _declared_project_agent_name(spec: Path) -> str | None:
     allowlist: offering the filename of a broken spec has the session accept the
     agent and then fail at ``session/set_mode``.
     """
-    data = _read_agent_spec(spec)
+    data = _read_agent_spec(spec, operation="resolve_project_agent_name", source="unknown")
     if data is None:
         return None
     return spec_str(data, "name", _project_agent_fallback_name(spec))
@@ -336,10 +398,8 @@ def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
     # at a protected path, matching every other deny in this module.
     if is_sensitive_path(key):
         logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
-        _sel().log_api_access(
-            caller="agent_discovery",
+        _audit_denied(
             operation="project_agent_names",
-            outcome="denied",
             source="project_agent_names",
             resources=key,
             error="sensitive project dir rejected",
@@ -466,6 +526,57 @@ def spec_model(data: dict[str, Any]) -> str:
     return spec_str(data, "model", _DEFER_MODEL)
 
 
+def agent_model_map(
+    agents_dir: Path | None = None,
+    *,
+    operation: str,
+    source: str,
+) -> dict[str, str]:
+    """Build the full agent name/stem-to-model map for legacy history restore.
+
+    Restore needs every entry, so this intentionally scans the complete scope.
+    It keeps that surface on the hardened reader while preserving
+    security-event attribution through the required *operation* and *source*
+    arguments. A missing or non-string model stays ``""`` here so a restored
+    legacy session continues to inherit its crew/global model; this deliberately
+    differs from session's targeted runtime resolver, where no pin means
+    ``"auto"``.
+
+    A refused spec is skipped like an absent one.  If every candidate in a
+    non-empty directory is refused, the scan-level warning used by discovery is
+    emitted so a systematic gate failure is not mistaken for an empty install.
+    """
+    directory = agents_dir or _kiro_agents_dir()
+    if not directory.is_dir():
+        return {}
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError:
+        return {}
+
+    candidates = 0
+    parsed = 0
+    result: dict[str, str] = {}
+    for spec_file in files:
+        if not spec_file.name.startswith("._"):
+            candidates += 1
+        data = _read_agent_spec(
+            spec_file,
+            operation=operation,
+            source=source,
+        )
+        if data is None:
+            continue
+        model = spec_str(data, "model", "")
+        declared_name = spec_str(data, "name")
+        if declared_name:
+            result[declared_name] = model
+        result[spec_file.stem] = model
+        parsed += 1
+    _warn_on_systematic_scan_failure(directory, candidates, parsed)
+    return result
+
+
 def _builder_mcp_skills(data: dict[str, Any]) -> list[str]:
     """Extract skill names from builder-mcp args (--skill-name-filter)."""
     mcp = data.get("mcpServers") or {}
@@ -580,19 +691,16 @@ def agent_skill_globs(agent: str, agents_dir: Path | None = None) -> list[str]:
     except OSError:
         return []
     for f in candidates:
-        if f.name.startswith("._"):
-            continue
-        try:
-            real = f.resolve(strict=True)
-        except OSError:
-            continue
-        if is_sensitive_path(str(real)):
-            continue
-        try:
-            data = json.loads(real.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
+        # The one hardened reader for the user-writable agents dir: AppleDouble
+        # sidecars, symlink loops (``RuntimeError`` on resolve), sensitive
+        # resolved targets (with the SEL ``denied`` event), the size cap, and
+        # non-UTF-8 / non-object JSON all collapse to ``None`` — skipped like an
+        # absent file, preserving this function's never-raises / ``[]`` contract.
+        # Pass ``f``, not the resolved target: ``f.stem`` and
+        # ``expand_skill_uri`` below must see the ORIGINAL path so a symlinked
+        # spec's relative globs stay anchored where the symlink lives.
+        data = _read_agent_spec(f, operation="agent_skill_globs", source="unknown")
+        if data is None:
             continue
         if data.get("name") != agent and f.stem != agent:
             continue
@@ -804,7 +912,7 @@ def list_agents(
             if not f.name.startswith("._"):
                 user_candidates += 1
             try:
-                data = _read_agent_spec(f)
+                data = _read_agent_spec(f, operation="list_agents", source="unknown")
                 if data is None:
                     continue
                 agents.append(_global_agent_info(f, data))
@@ -864,7 +972,7 @@ def list_agents(
         if not pf.name.startswith("._"):
             project_candidates += 1
         try:
-            data = _read_agent_spec(pf)
+            data = _read_agent_spec(pf, operation="list_agents", source="unknown")
             if data is None:
                 continue
             info = _project_agent_info(pf, data)

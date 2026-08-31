@@ -55,7 +55,6 @@ from kiro_crew.dashboard.handlers._shared import (  # noqa: E402, F401
 
 # ── Agents (extracted to handlers/agents.py) ──
 from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
-    _auto_install_agent,
     _find_agent_config,
     _get_config_lock,
     _installed_agent_config,
@@ -136,6 +135,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_dashboard_config,
     api_file_diff,
     api_file_download,
+    api_file_office_preview,
     api_file_raw,
     api_file_read,
     api_file_search,
@@ -218,6 +218,7 @@ from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
 
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
+    api_member_activity,
     api_member_thread,
     api_members,
 )

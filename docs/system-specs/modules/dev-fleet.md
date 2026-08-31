@@ -135,6 +135,7 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/pod/restart` | `{name}` | Stop then start pod |
 | `/apps/dev-fleet/api/pod/token` | `{name}` | Mint a dashboard token for the pod |
 | `/apps/dev-fleet/api/pod/provision` | `{name}` | Start async venv+dist build (returns `{run_id}`) |
+| `/apps/dev-fleet/api/pod/provision/dismiss` | `{name, run_id}` | Forget a terminal provision failure when the run id still matches |
 | `/apps/dev-fleet/api/rebase` | `{name}` | Rebase worktree onto origin/main |
 | `/apps/dev-fleet/api/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
 | `/apps/dev-fleet/api/make-live` | `{path, dry_run?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
@@ -223,8 +224,20 @@ Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if
 
 - `runtime.active_names(cfg)` — systemctl list (blocking, offloaded via `run_in_executor`)
 - `runtime.derive_port(cfg, name)` — cksum-based port derivation (blocking, offloaded)
-- `runtime.health(port, timeout)` — HTTP probe (blocking, offloaded)
-- `runtime.mint_token(cfg, name, ttl)` — token minting (blocking, offloaded)
+- `runtime.health(cfg, name, port, timeout)` — identity-gated HTTP probe (blocking,
+  offloaded). Takes the pod's NAME, not just its port, because a derived port is
+  routinely held by another pod or by the live gateway: `port_owner` requires the
+  process a `127.0.0.1` connect reaches to be this pod's own `MainPID`, and a
+  responder that is provably somebody else's returns `HEALTH_FOREIGN` (`-2`)
+  instead of its HTTP status. The fleet row treats that as unhealthy, since the
+  frontend's `health >= 200` test already excludes a negative value. There is
+  deliberately no bare-port variant to call — see `instances/run_marker`, which
+  states the rule ("no caller can mistake reachability for identity")
+- `runtime.mint_token(cfg, name, ttl)` — credential minting (blocking, offloaded).
+  Requires POSITIVE ownership proof and refuses when ownership is merely
+  unprovable, unlike `health`, which keeps its reading: this call sends the pod's
+  own `.local_secret`, so failing open would hand a credential to whatever
+  answered
 - `runtime.recent_journal(cfg, name, n)` — journalctl tail (blocking, offloaded)
 - `provision.has_venv(path)` / `provision.has_dist(path)` — filesystem checks (offloaded)
 
@@ -471,10 +484,10 @@ running run resumes polling into the stepper (accumulating the log window as
 usual), and a failed run restores the persisted red failure state with its log
 auto-expanded. Reattached and locally-started runs are deduped by run id, so a
 fleet refetch never starts a second poll loop for a run already being tracked.
-The dismiss `×` is client-side only: a failed run's id keeps being exposed
-until a newer provision for that checkout replaces it, the run is evicted from
-the bounded registry, or the gateway restarts — so a reload after dismissing
-re-shows the failure. Server-side dismissal is deliberately out of scope here.
+The dismiss `×` posts the worktree name and run id to the server before clearing
+the local strip. The server removes the persisted id only when it still matches
+that terminal run; a stale dismiss cannot clear a newer provision, and a running
+provision cannot be dismissed. A successful response therefore survives reload.
 
 ## Action narration (restart + sync feedback)
 
@@ -657,6 +670,45 @@ The probe executes a **snapshot** of `npm_preflight.py` copied into an unguessab
 stdlib-only, so the copy needs no package context. Both halves matter: `-I` drops
 the cwd from `sys.path`, and the snapshot means an editable install cannot make
 the tree being synced supply the code doing the verifying.
+
+**The install is skipped when the answer is already on disk.** Most syncs are
+backend-only and change nothing under `website/`, so paying a full scratch install
+to re-derive "is this lockfile installable" on every Pull + Build is cost without
+information. `_install_already_proven` skips it, and only when BOTH hold: `git
+diff --name-only <ref> -- website` is empty, meaning the incoming ref changes no
+path under the frontend half at all, AND `website/node_modules` is populated (not
+merely present — an interrupted `npm ci` leaves an empty directory, which proves
+nothing). Without a tree there is no evidence, so a fresh checkout's first sync
+still probes. Anything the comparison cannot answer — a failing or missing `git`,
+a timeout — probes as well: the unknown case costs an install rather than a
+guarantee.
+
+A populated tree is evidence, not a verified install, and the bound is worth
+stating: a prior frontend sync whose post-merge `npm ci` died partway can leave a
+partial tree beside the merged lockfile, and later backend-only syncs will skip on
+it, since from there on the subtree is unchanged and nothing re-examines it. The
+consequence is the same class as the dead-registry residual — the skip decides only
+whether this sync pays for a rehearsal, so a refusal lands one step later rather
+than never, and the transaction keeps the checkout consistent either way. Issue
+[#7132](https://github.com/kirodotdev/KiroCrew/issues/7132) tracks the stronger
+evidence check that would close it.
+
+The condition is the whole subtree rather than just `package-lock.json` /
+`package.json` / `.npmrc`, and the difference is load-bearing. With those three
+identical but frontend SOURCE changed, a skipped probe lets the merge land, and a
+failing `npm ci` afterwards leaves the checkout with new source and the
+previously-built bundle — the stale-bundle half of the very defect this section
+exists to prevent. Requiring the entire subtree to be unchanged makes that
+unreachable: with no frontend change there is no new bundle owed, so a failed sync
+leaves the frontend byte-for-byte as it was.
+
+What makes the skip safe rather than merely cheap is where a failure lands. Under
+this condition the transaction above restores the tree on any non-zero step, the
+lockfile it matches did not change, and neither did the source the bundle was
+built from. A skipped probe can only leave a state a later `npm ci` fixes, never
+one no revision produced. A skip is reported on the run's `preflight:` detail line
+rather than the generic pass line, so it is visible in the log instead of
+inferable from a missing pause.
 
 **Failure causes reach the dashboard as an exit code, not as text.** The probe
 exits with a reserved code (41-45) and the runner owns two more (46 ambiguous

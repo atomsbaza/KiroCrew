@@ -168,15 +168,11 @@ src/kiro_crew/apps/scaffold.py
 src/kiro_crew/apps/teardown.py
 src/kiro_crew/artifact_source.py
 src/kiro_crew/artifacts.py
-src/kiro_crew/atomic_write.py
 src/kiro_crew/beacon.py
 src/kiro_crew/builtin_skills/browser-recording/scripts/record_browser.py
 src/kiro_crew/builtin_skills/ios-simulator-preview/scripts/sim_mirror.py
 src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/local_review.py
-src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/pr_findings.py
-src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/pr_status.py
 src/kiro_crew/changelog.py
-src/kiro_crew/channel.py
 src/kiro_crew/channel_history.py
 src/kiro_crew/channel_transcript_migration.py
 src/kiro_crew/cli_bench.py
@@ -229,7 +225,6 @@ src/kiro_crew/dashboard/handlers/memory.py
 src/kiro_crew/dashboard/handlers/notifications_push.py
 src/kiro_crew/dashboard/handlers/security.py
 src/kiro_crew/dashboard/handlers/side.py
-src/kiro_crew/dashboard/handlers/source_providers.py
 src/kiro_crew/dashboard/handlers/sso_login.py
 src/kiro_crew/dashboard/handlers/steering.py
 src/kiro_crew/dashboard/handlers/terminal.py
@@ -252,7 +247,6 @@ src/kiro_crew/dashboard/tailnet_serve.py
 src/kiro_crew/dashboard/terminal_commands.py
 src/kiro_crew/dashboard/theme_validate.py
 src/kiro_crew/dashboard/token_secret.py
-src/kiro_crew/dashboard/turn_dispatch.py
 src/kiro_crew/dashboard/urls.py
 src/kiro_crew/dashboard/workflow_inject.py
 src/kiro_crew/dashboard/ws_event_scope.py
@@ -283,7 +277,6 @@ src/kiro_crew/eval/scenario.py
 src/kiro_crew/frontend.py
 src/kiro_crew/gateway_shutdown_budget.py
 src/kiro_crew/github_runner.py
-src/kiro_crew/history.py
 src/kiro_crew/hooks.py
 src/kiro_crew/image_artifacts.py
 src/kiro_crew/imaging.py
@@ -313,7 +306,6 @@ src/kiro_crew/mcp_caller.py
 src/kiro_crew/mcp_cleanup.py
 src/kiro_crew/mcp_core.py
 src/kiro_crew/mcp_cron.py
-src/kiro_crew/mcp_dashboard.py
 src/kiro_crew/mcp_discovery.py
 src/kiro_crew/mcp_gateway/abort.py
 src/kiro_crew/mcp_gateway/app_call.py
@@ -343,7 +335,6 @@ src/kiro_crew/mcp_tools/knowledge.py
 src/kiro_crew/mcp_tools/skills.py
 src/kiro_crew/mcp_tools/spawn.py
 src/kiro_crew/mcp_utils.py
-src/kiro_crew/messaging/link.py
 src/kiro_crew/metrics/http_metrics.py
 src/kiro_crew/metrics/provider.py
 src/kiro_crew/metrics/recorder.py
@@ -391,7 +382,6 @@ src/kiro_crew/suggestions.py
 src/kiro_crew/testing/channel_fixtures.py
 src/kiro_crew/testing/fake_acp_backend.py
 src/kiro_crew/tips.py
-src/kiro_crew/validation.py
 src/kiro_crew/vector_memory.py
 src/kiro_crew/webhooks.py
 src/kiro_crew/weixin/client.py
@@ -408,7 +398,6 @@ test/metrics/test_provider_bucket_views.py
 test/metrics/test_schema.py
 test/metrics/test_startup_channel_attrs.py
 test/metrics/test_telemetry_titles.py
-test/metrics/test_turn_metric.py
 test/metrics/test_watchdog_metrics.py
 test/test_acp_backend_kas.py
 test/test_acp_dynamic_config.py
@@ -559,7 +548,6 @@ test/test_chat_title.py
 test/test_chat_turn_timeout_consistency.py
 test/test_chat_voice.py
 test/test_ci_surface_tests.py
-test/test_cli.py
 test/test_cli_desktop.py
 test/test_cli_doctor.py
 test/test_cli_lazy_imports.py
@@ -649,7 +637,6 @@ test/test_dashboard_worktree_coverage.py
 test/test_dashboard_ws_offloop_fanout.py
 test/test_dashboard_ws_task_tracking.py
 test/test_dashboard_yolo_startup.py
-test/test_deferred_disposition_ratchet.py
 test/test_delete_message.py
 test/test_denied_commands_api.py
 test/test_denied_commands_authority.py
@@ -784,7 +771,6 @@ test/test_host_isolation_floor.py
 test/test_host_service_guard.py
 test/test_image_artifacts.py
 test/test_inbound_unbind_notice.py
-test/test_inline_tool_cards_props.py
 test/test_install_receipt.py
 test/test_installer_distro.py
 test/test_installer_node_floor.py
@@ -991,7 +977,6 @@ test/test_pptx_maker_routes.py
 test/test_pr_readiness_evaluate.py
 test/test_pr_readiness_publish.py
 test/test_pr_readiness_sweep.py
-test/test_prepare_pr_findings.py
 test/test_prepare_pr_local_review.py
 test/test_prepare_pr_profiles.py
 test/test_prepare_pr_status.py
@@ -1003,7 +988,6 @@ test/test_project_git.py
 test/test_project_git_status_log.py
 test/test_prompt_timeout_follows_ceiling.py
 test/test_provider_dispatch.py
-test/test_publish_feed_contract.py
 test/test_publish_providers.py
 test/test_publish_sync.py
 test/test_queue_during_subagents.py
