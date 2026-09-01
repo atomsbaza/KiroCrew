@@ -12,6 +12,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -24,6 +25,12 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 _BASH = shutil.which("bash") if os.name == "posix" else None
 _needs_posix_bash = pytest.mark.skipif(
     _BASH is None, reason="requires a POSIX bash to execute the remote guard"
+)
+# The BSD-stat shim below delegates the -f %Lp answer to the host's own stat;
+# on a macOS host that delegate is itself BSD and rejects the shim's GNU-style
+# `stat -c %a`, so the simulation only stands up on a GNU-stat (Linux) host.
+_needs_gnu_stat = pytest.mark.skipif(
+    sys.platform == "darwin", reason="the shim's delegate must be GNU stat, which macOS lacks"
 )
 
 _IDC = KiroLoginTarget(
@@ -175,6 +182,7 @@ class TestPrivateLoginDir:
         assert stat.S_IMODE(loose.stat().st_mode) == 0o777
 
     @_needs_posix_bash
+    @_needs_gnu_stat
     def test_guard_reads_mode_back_through_bsd_stat_with_bash(self, tmp_path):
         # macOS ships BSD stat, which has no -c and spells the octal mode
         # -f %Lp. A shim with that surface stands in for Darwin on a Linux
