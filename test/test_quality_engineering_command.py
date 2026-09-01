@@ -101,9 +101,7 @@ async def test_direct_quality_engineering_command_rejects_invalid_syntax(tmp_pat
 
     service.start.assert_not_awaited()
     assert state._automatic_route_runs == {}
-    assert any(
-        "Usage: `/quality-review <request>`" in text for text in _slot_messages(slot)
-    )
+    assert any("Usage: `/quality-review <request>`" in text for text in _slot_messages(slot))
 
 
 @pytest.mark.asyncio

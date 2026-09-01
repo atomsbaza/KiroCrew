@@ -1199,6 +1199,8 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "exception -- so the `job_start_failed` body funnels through one `_safe` "
         "chokepoint that applies the credential + exfiltration-URL chain before the "
         "text reaches the dashboard.",
+    ),
+    (
         "Quality Engineering evidence and reports",
         "crews/quality_engineering/package.py",
         "Bounded evidence records and role handoffs are persisted under the evidence root "

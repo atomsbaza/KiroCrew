@@ -21,6 +21,19 @@ from kiro_crew.crews.quality_engineering import (
 )
 from kiro_crew.crews.quality_engineering import package as quality_package
 from kiro_crew.crews.quality_engineering.package import CrewPackageError, _payload_is_bounded
+from kiro_crew.sandbox import userns_available
+
+
+def _os_sandbox_backend_available() -> bool:
+    """True where the OS-level sandbox backend this runner relies on exists.
+
+    ``sandboxed_spawn_argv`` fails closed with ``SandboxUnavailableError`` on
+    hosts without a backend (GitHub runners: Linux denies ``unshare
+    (CLONE_NEWNS)``, Windows has no backend at all); macOS always has the
+    seatbelt. Skips — never deselects — per the CI convention in
+    ``.github/workflows/ci.yml``.
+    """
+    return sys.platform == "darwin" or userns_available()
 
 
 class _Context:
@@ -202,6 +215,10 @@ async def test_runner_rejects_relative_paths_and_unknown_checks(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _os_sandbox_backend_available(),
+    reason="requires an OS sandbox backend (userns/seatbelt)",
+)
 async def test_execute_argv_completes_normally(project: Path) -> None:
     runner = QualityEvidenceRunner()
     stdout, stderr, code, timed_out, overflow = await runner._execute_argv(
@@ -219,6 +236,10 @@ async def test_execute_argv_completes_normally(project: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _os_sandbox_backend_available(),
+    reason="requires an OS sandbox backend (userns/seatbelt)",
+)
 async def test_execute_argv_times_out_and_caps_output(project: Path) -> None:
     runner = QualityEvidenceRunner()
     result = await runner._execute_argv(
@@ -242,6 +263,10 @@ async def test_execute_argv_times_out_and_caps_output(project: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _os_sandbox_backend_available(),
+    reason="requires an OS sandbox backend (userns/seatbelt)",
+)
 async def test_execute_argv_cancellation_terminates_process(project: Path) -> None:
     runner = QualityEvidenceRunner()
     task = asyncio.create_task(

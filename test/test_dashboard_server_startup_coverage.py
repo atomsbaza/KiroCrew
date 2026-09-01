@@ -576,6 +576,7 @@ class TestStartDashboardWiring:
             await runner.cleanup()
             await _cancel_stray_tasks()
 
+
 @pytest.mark.asyncio
 async def test_workflow_completion_callback_clears_pairing_before_result_injection(
     tmp_path, monkeypatch

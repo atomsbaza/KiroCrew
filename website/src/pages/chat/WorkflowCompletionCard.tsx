@@ -163,7 +163,7 @@ const WorkflowCompletionCard = memo(function WorkflowCompletionCard({
           data-testid="workflow-completion-body"
           role="region"
           aria-labelledby={headlineId}
-          tabIndex={0}
+          tabIndex={0 /* eslint-disable-line jsx-a11y/no-noninteractive-tabindex -- keyboard-reachable scroll region, same pattern as FileRenderers.tsx */}
         >
           <MarkdownRenderer content={body} onFileOpen={onFileOpen} onFolderOpen={onFolderOpen} />
         </div>
