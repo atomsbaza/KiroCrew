@@ -55,7 +55,7 @@ async def test_direct_quality_engineering_command_starts_bounded_full_review(tmp
         await chat_runner._handle_crew_command(
             state,
             slot,
-            "/crew quality-engineering Review release readiness",
+            "/quality-review Review release readiness",
         )
 
     offload.assert_awaited_once()
@@ -86,9 +86,7 @@ async def test_direct_quality_engineering_command_starts_bounded_full_review(tmp
 @pytest.mark.parametrize(
     "message",
     [
-        "/crew",
-        "/crew software-delivery fix the API",
-        "/crew quality-engineering",
+        "/quality-review",
     ],
 )
 async def test_direct_quality_engineering_command_rejects_invalid_syntax(tmp_path, message) -> None:
@@ -104,7 +102,7 @@ async def test_direct_quality_engineering_command_rejects_invalid_syntax(tmp_pat
     service.start.assert_not_awaited()
     assert state._automatic_route_runs == {}
     assert any(
-        "Usage: `/crew quality-engineering <request>`" in text for text in _slot_messages(slot)
+        "Usage: `/quality-review <request>`" in text for text in _slot_messages(slot)
     )
 
 
@@ -120,7 +118,7 @@ async def test_direct_quality_engineering_command_rejects_unbound_project(tmp_pa
     await chat_runner._handle_crew_command(
         state,
         slot,
-        "/crew quality-engineering Review the project",
+        "/quality-review Review the project",
     )
 
     service.start.assert_not_awaited()
@@ -145,12 +143,12 @@ async def test_run_chat_handles_direct_command_before_provider_acquisition(tmp_p
         await chat_runner._run_chat(
             state,
             slot,
-            "/crew quality-engineering Check release readiness",
+            "/quality-review Check release readiness",
         )
 
     handler.assert_awaited_once_with(
         state,
         slot,
-        "/crew quality-engineering Check release readiness",
+        "/quality-review Check release readiness",
     )
     assert not state.sessions.get_or_create.called

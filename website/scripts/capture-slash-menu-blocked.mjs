@@ -33,7 +33,7 @@ const API_COMMANDS = [
   { name: '/code', description: 'Open code intelligence tools' },
   { name: '/compact', description: 'Compact conversation to free context' },
   { name: '/context', description: 'Manage context files and token usage' },
-  { name: '/crew', description: 'Run a read-only Quality Engineering review' },
+  { name: '/quality-review', description: 'Run a read-only Quality Engineering review' },
   { name: '/experiment', description: 'Toggle experimental features' },
   { name: '/goal', description: 'Set a standing goal the agent works toward across turns' },
   { name: '/help', description: 'Show available commands' },
@@ -53,7 +53,12 @@ const BLOCKED = ['/tangent', '/quit', '/exit', '/q', '/chat', '/paste', '/reply'
 
 async function main() {
   const { srv, base } = await serveDist()
-  const browser = await chromium.launch()
+  const browser = await chromium.launch({
+    // Prefer the installed Google Chrome channel: the pinned Playwright
+    // browser build may be absent on contributor machines, but Chrome (or any
+    // installed channel) produces identical frames for this static harness.
+    channel: 'chrome',
+  })
   const context = await browser.newContext({
     viewport: { width: 1400, height: 900 },
     deviceScaleFactor: 2, // 12-13px menu type renders soft at 1x on GitHub
@@ -91,17 +96,28 @@ async function main() {
     if (rows.includes(cmd)) throw new Error(`blocked command ${cmd} rendered in the menu`)
   }
   if (!rows.includes('/compact')) throw new Error('expected /compact in the menu')
-  if (!rows.includes('/crew')) throw new Error('expected /crew in the menu')
+  if (!rows.includes('/quality-review')) throw new Error('expected /quality-review in the menu')
+
+  // The list auto-scrolls to keep the highlighted row in view, which can clip
+  // rows above it; bring the QE command into the frame before shooting so the
+  // evidence actually shows it.
+  await menu.first()
+    .locator('[role="option"]', { hasText: '/quality-review' })
+    .first()
+    .scrollIntoViewIfNeeded()
+  await page.waitForTimeout(400)
 
   await page.screenshot({ path: `${OUT}/${PREFIX}-01-slash-menu-no-blocked.png` })
   console.log('wrote', `${OUT}/${PREFIX}-01-slash-menu-no-blocked.png`)
 
-  // ── Frame 2: the issue's repro "/tan" — nothing matches, menu closed ──
+  // ── Frame 2: the issue's repro "/tan" — nothing matches ──
+  // The menu either closes or renders its zero-match empty state; what must
+  // never happen is an inert /tangent row.
   await composer.fill('/tan')
   await page.waitForTimeout(600)
-  if (await menu.count() > 0 && await menu.first().isVisible()) {
-    const leftover = (await menu.first().locator('[role="option"]').allInnerTexts()).join(',')
-    throw new Error(`menu still open for /tan with rows: ${leftover}`)
+  const leftoverOptions = await page.locator('[role="option"]').allInnerTexts()
+  if (leftoverOptions.some(s => s.trim().startsWith('/tangent'))) {
+    throw new Error(`inert /tangent suggestion rendered for /tan: ${leftoverOptions.join(',')}`)
   }
   console.log('/tan matches nothing — no inert /tangent suggestion')
 

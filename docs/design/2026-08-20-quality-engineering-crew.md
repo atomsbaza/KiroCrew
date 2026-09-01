@@ -13,7 +13,7 @@ That work should be represented by a dedicated read-only Crew rather than by add
 - Add a native `quality-engineering` Crew package parallel to the existing Crew packages.
 - Provide three read-only roles: QA Strategist, E2E Engineer, and UX Reviewer.
 - Route high-confidence QA, E2E, UX, and release-readiness requests automatically.
-- Support deterministic direct invocation through `/crew quality-engineering <request>`.
+- Support deterministic direct invocation through `/quality-review <request>`.
 - Run real E2E checks through a bounded runner in an isolated environment.
 - Produce schema-validated, bounded reports with evidence, findings, gaps, and next actions.
 - Fail closed on missing project bindings, unavailable capabilities, invalid handoffs, timeouts, and incomplete evidence.
@@ -126,7 +126,7 @@ All automatic routes use the existing fixed dynamic workflow source and the addi
 The dashboard recognizes:
 
 ```text
-/crew quality-engineering <request>
+/quality-review <request>
 ```
 
 The command is parsed locally before provider session acquisition. It validates the exact Crew id, requires a non-empty request, preserves the slot's active agent, and starts the same native workflow used by automatic routing with `full_quality_review`.
@@ -138,7 +138,7 @@ The command does not expose internal role aliases, does not change the slot into
 ```text
 ordinary message ──┐
                    ├─ route decision ──┐
-/crew command ─────┘                   │
+/quality-review command ─────┘                   │
                                        ▼
                  __kirocrew.crew.quality-engineering
                                        │
@@ -268,7 +268,7 @@ User-facing text goes through the existing localization path; internal details r
 
 - Route high-confidence QA, E2E, UX, and release-readiness messages to the expected Crew and route.
 - Preserve default behavior for ordinary, ambiguous, and unbound messages.
-- Parse `/crew quality-engineering <request>` locally, reject unknown Crew ids and empty requests, and preserve active-agent/queue semantics.
+- Parse `/quality-review <request>` locally, reject unknown Crew ids and empty requests, and preserve active-agent/queue semantics.
 - Verify automatic and direct entry points converge on the same internal workflow.
 
 ### Runner and safety tests
@@ -290,7 +290,7 @@ The change is additive:
 - Existing Software Delivery and Knowledge Quality ids and routes remain unchanged.
 - Existing ordinary chat remains on the default agent path unless the new high-confidence markers match.
 - Internal worker names remain hidden from public agent aliases.
-- The new `/crew` command is only a Crew-level entry point and does not change `/agent` semantics.
+- The new `/quality-review` command is only a Crew-level entry point and does not change `/agent` semantics.
 - The live Gateway is not modified during development; the feature is validated in the dedicated worktree and becomes available to the current dashboard only after the feature is merged, built, deployed, and restarted.
 
 Implementation begins only after this proposal has been reviewed. The proposal itself does not authorize a commit, push, merge, or live Gateway restart.

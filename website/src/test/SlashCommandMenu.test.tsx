@@ -112,7 +112,7 @@ describe('SlashCommandMenu offline fallback (blocked commands hidden)', () => {
     // Fallback renders synchronously as the query default; anchor on a
     // known-good fallback command before asserting absences.
     expect(await screen.findByText('/compact')).toBeInTheDocument()
-    expect(screen.getByText('/crew')).toBeInTheDocument()
+    expect(screen.getByText('/quality-review')).toBeInTheDocument()
     for (const cmd of BLOCKED) {
       expect(screen.queryByText(cmd)).not.toBeInTheDocument()
     }

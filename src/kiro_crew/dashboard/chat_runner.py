@@ -3623,14 +3623,14 @@ def _direct_quality_project(slot: "_ChatSlot") -> tuple[str, str]:
 
 
 async def _handle_crew_command(state: "DashboardState", slot: "_ChatSlot", message: str) -> None:
-    """Handle the exact local ``/crew quality-engineering <request>`` command."""
+    """Handle the exact local ``/quality-review <request>`` command."""
 
-    parts = message.split(None, 2)
-    if len(parts) != 3 or parts[0] != "/crew" or parts[1] != "quality-engineering":
-        body = "Usage: `/crew quality-engineering <request>`."
+    parts = message.split(None, 1)
+    if len(parts) != 2 or parts[0] != "/quality-review":
+        body = "Usage: `/quality-review <request>`."
         outcome = "invalid_syntax"
     else:
-        request_text = parts[2].strip()
+        request_text = parts[1].strip()
         project_path, project_error = await asyncio.to_thread(_direct_quality_project, slot)
         service = getattr(state, "workflow_service", None)
         if not request_text:
@@ -3682,7 +3682,7 @@ async def _handle_crew_command(state: "DashboardState", slot: "_ChatSlot", messa
         session_key=slot.key,
         agent=slot.agent or "kirocrew",
         source="dashboard",
-        tool_name="/crew",
+        tool_name="/quality-review",
         tool_kind="slash_command",
         outcome=outcome,
         metadata={"slot": slot.key, "crew": "quality-engineering"},
@@ -5152,8 +5152,8 @@ async def _run_chat(
         slot.append("done", "", "done")
         return
 
-    # ── /crew quality-engineering: start the read-only QE workflow locally ──
-    if first_word == "/crew":
+    # ── /quality-review: start the read-only QE workflow locally ──
+    if first_word == "/quality-review":
         await _handle_crew_command(state, slot, message)
         return
 

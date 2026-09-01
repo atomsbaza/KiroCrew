@@ -46,6 +46,8 @@ The native Quality Engineering Crew (`quality-engineering`) treats every unverif
 quality result as blocked. Request validation rejects missing, relative, sensitive,
 traversing, symlinked, or unresolvable project paths; direct `/quality-review` syntax
 and the active slot project are validated before any workflow or provider session is used.
+traversing, symlinked, or unresolvable project paths; direct `/quality-review` syntax and the
+active slot project are validated before any workflow or provider session is used.
 
 Evidence checks are package-registered fixed argv only. A missing executable,
 unknown adapter/check, timeout, output overflow, non-zero exit, workspace-copy

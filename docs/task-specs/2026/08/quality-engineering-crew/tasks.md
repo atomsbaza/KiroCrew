@@ -19,8 +19,8 @@ Worktree: `/home/user/kirocrew-wt-automatic-crew-routing` on `feat/automatic-cre
 - A native `quality_engineering` package with three private worker agents and four routes.
 - A schema-validated `QualityEvidenceRunner` boundary with explicit adapter/check registries.
 - Additive native dispatch and automatic routing for `quality-engineering`.
-- Local dashboard command `/crew quality-engineering <request>` using `full_quality_review`.
-- Backend and frontend slash-command catalogs that advertise `/crew` consistently.
+- Local dashboard command `/quality-review <request>` using `full_quality_review`.
+- Backend and frontend slash-command catalogs that advertise `/quality-review` consistently.
 - Focused contract, safety, routing, command, and report-aggregation tests.
 - Updated existing system-spec documentation for the shipped dashboard, runner, and error behavior.
 
@@ -78,14 +78,14 @@ Worktree: `/home/user/kirocrew-wt-automatic-crew-routing` on `feat/automatic-cre
 
 - [ ] 6.1 Update `dashboard/chat_handlers.py` imports and `_automatic_route_args()` to map all supported Crew ids explicitly; unknown ids must not fall through to Knowledge Quality.
 - [ ] 6.2 Pass Quality Engineering requests with the authoritative `project_path` and the selected route while preserving the existing software/knowledge argument shapes.
-- [ ] 6.3 Refactor the shared workflow-start/acknowledgement seam only as needed so automatic routing and direct `/crew` invocation converge on the same workflow source, args, run tracking, and busy/queue behavior.
+- [ ] 6.3 Refactor the shared workflow-start/acknowledgement seam only as needed so automatic routing and direct `/quality-review` invocation converge on the same workflow source, args, run tracking, and busy/queue behavior.
 - [ ] 6.4 Extend `test/test_automatic_crew_chat.py` to assert the Quality Engineering workflow name, route, project path, service-start metadata, and default fallback behavior.
 
-## 7. Direct `/crew` command
+## 7. Direct `/quality-review` command
 
-- [ ] 7.1 Add `/crew` to `_SLASH_COMMANDS` and `SLASH_COMMAND_DESCRIPTIONS` in `dashboard/chat_utils.py`; keep it out of `_BLOCKED_SLASH_COMMANDS`.
-- [ ] 7.2 Parse `/crew` locally in `dashboard/chat_runner.py` before provider session acquisition, alongside the existing local command handlers.
-- [ ] 7.3 Accept exactly `/crew quality-engineering <request>` for this feature. Reject missing request text, unknown Crew ids, unknown subcommands, and malformed input with bounded user-facing errors and no provider session.
+- [ ] 7.1 Add `/quality-review` to `_SLASH_COMMANDS` and `SLASH_COMMAND_DESCRIPTIONS` in `dashboard/chat_utils.py`; keep it out of `_BLOCKED_SLASH_COMMANDS`.
+- [ ] 7.2 Parse `/quality-review` locally in `dashboard/chat_runner.py` before provider session acquisition, alongside the existing local command handlers.
+- [ ] 7.3 Accept exactly `/quality-review <request>` for this feature. Reject missing request text, unknown Crew ids, unknown subcommands, and malformed input with bounded user-facing errors and no provider session.
 - [ ] 7.4 Resolve the active slot's project binding, require an absolute non-sensitive path, and start the same native workflow with `full_quality_review`; do not use a message-supplied path as authority.
 - [ ] 7.5 Preserve the slot's active agent and mode, do not expose worker names, do not enter Crew Mode, and preserve existing busy-slot queue/hold semantics.
 - [ ] 7.6 Track the direct run in the same dashboard state used by automatic routes, emit the normal acknowledgement/status update, and ensure failures remain visible as blocked rather than silently falling through to the provider.
@@ -93,15 +93,15 @@ Worktree: `/home/user/kirocrew-wt-automatic-crew-routing` on `feat/automatic-cre
 
 ## 8. Slash-command API and frontend autocomplete
 
-- [ ] 8.1 Rely on the backend command catalog for the live dashboard API; add tests in `test/test_api_slash_commands.py` that `/crew` has a non-empty description and is returned while blocked commands remain absent.
-- [ ] 8.2 Update `website/src/components/SlashCommandMenu.tsx` `COMMAND_DESC_KEY` and offline fallback names with `/crew`.
+- [ ] 8.1 Rely on the backend command catalog for the live dashboard API; add tests in `test/test_api_slash_commands.py` that `/quality-review` has a non-empty description and is returned while blocked commands remain absent.
+- [ ] 8.2 Update `website/src/components/SlashCommandMenu.tsx` `COMMAND_DESC_KEY` and offline fallback names with `/quality-review`.
 - [ ] 8.3 Add the localized `components.slashCommandMenu.desc_crew` key through the repository's i18n catalog workflow for every supported locale/source catalog; do not hardcode a user-facing string in the component.
-- [ ] 8.4 Extend `website/src/test/SlashCommandMenu.test.tsx` to cover `/crew` in the resolved API path and offline fallback path without reintroducing blocked commands.
+- [ ] 8.4 Extend `website/src/test/SlashCommandMenu.test.tsx` to cover `/quality-review` in the resolved API path and offline fallback path without reintroducing blocked commands.
 - [ ] 8.5 Read `website/docs/i18n-catalog.md` and `website/docs/testing.md` before touching frontend files; use `npx tsc -b` or the build path rather than the known zero-file `npm run typecheck` shortcut.
 
 ## 9. Documentation updates
 
-- [ ] 9.1 Update `docs/system-specs/modules/learn-cron-dashboard.md` with the shipped `/crew quality-engineering` command, automatic route eligibility, project-binding requirement, run tracking, and default fallback behavior.
+- [ ] 9.1 Update `docs/system-specs/modules/learn-cron-dashboard.md` with the shipped `/quality-review` command, automatic route eligibility, project-binding requirement, run tracking, and default fallback behavior.
 - [ ] 9.2 Update `docs/system-specs/common/error-handling.md` with the bounded Quality Engineering error/status surface, partial-result behavior, and fail-closed evidence rules.
 - [ ] 9.3 Update `docs/system-specs/modules/browser.md` only for the shipped adapter boundary or capability semantics that change its documented contract; keep the existing browser install/consent model unchanged.
 - [ ] 9.4 Update `docs/system-specs/modules/computer-use.md` only if the simulator/desktop adapter crosses its documented boundary; do not grant computer-use permissions to the read-only roles.
