@@ -292,6 +292,7 @@ def _policy_deny_reason(ev: object, *, session_key: str = "", agent: str = "") -
             is_shell=is_shell,
             mcp_server_name=getattr(ev, "mcp_server_name", "") or "",
             mcp_tool_name=getattr(ev, "tool_name", "") or "",
+            mcp_identity_trusted=bool(getattr(ev, "mcp_identity_trusted", False)),
         )
     except Exception as exc:  # noqa: BLE001 - a broken gate must DENY, not authorize
         logger.warning(
