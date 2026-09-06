@@ -51,20 +51,21 @@ from kiro_crew.platform.interfaces import (
 
 
 class DefaultProviderRegistry:
-    """Registers nothing: every KNOWN backend is already in the baseline."""
+    """Registers nothing: the baseline already covers what this build selects."""
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
 
     def register_acp_backends(self) -> None:
-        # Nothing to register, and nothing this seam could register: the baseline now
-        # covers every id in ``ACP_BACKENDS_KNOWN``, and
-        # ``register_selectable_backend`` rejects an id outside that set, so there is
-        # no id it accepts that is not already selectable. The seam stays because the
-        # ProviderRegistry protocol declares it and an edition overrides this method;
-        # an edition adding a genuinely new harness has to widen
-        # ``ACP_BACKENDS_KNOWN`` as well, which is a core change, not an extension
-        # point this hook opens on its own.
+        # Nothing to register, and nothing this seam should register: the baseline
+        # covers every id in ``ACP_BACKENDS_KNOWN`` this build serves, and the one
+        # known id outside it (``opencode``) is excluded deliberately -- no
+        # enforceable permission boundary -- so an edition registering it is a
+        # decision that must be made explicitly, not a default this hook supplies.
+        # The seam stays because the ProviderRegistry protocol declares it and an
+        # edition overrides this method; an edition adding a genuinely new harness
+        # has to widen ``ACP_BACKENDS_KNOWN`` as well, which is a core change, not
+        # an extension point this hook opens on its own.
         return None
 
 

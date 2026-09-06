@@ -36,6 +36,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_KNOWN,
     POLICY_ID_BY_BACKEND,
 )
@@ -67,6 +68,10 @@ COMPONENT_CLAUDE_CODE_CLI = "claude"
 #: The codex-acp adapter. ONE component, not two: the adapter ships its own
 #: compatible Codex binary, so there is no second executable Crew resolves.
 COMPONENT_CODEX_ACP_ADAPTER = "codex-acp"
+
+#: The OpenCode harness binary. ONE component: opencode speaks ACP itself via
+#: its ``acp`` subcommand, so there is no adapter package between Crew and it.
+COMPONENT_OPENCODE = "opencode"
 
 #: How long a verdict is reused. The Claude driver shells out to mise and globs
 #: the filesystem, and the dashboard polls this endpoint, so an uncached probe
@@ -228,11 +233,48 @@ def _probe_codex() -> BackendInstallState:
     )
 
 
+def _probe_opencode() -> BackendInstallState:
+    """The OpenCode backend needs one component: its own binary.
+
+    opencode speaks ACP itself (``opencode acp``), so unlike claude there is no
+    adapter package and unlike codex no shipped-in adapter binary -- the check
+    is simply whether ``opencode`` resolves the way a spawn would resolve it
+    (override env, then mise, then the augmented PATH), through the SAME
+    resolver the spawn arm calls.
+
+    The remedy names the AUTH prerequisite, not just the installer: opencode
+    authenticates from its own account store, so a freshly installed binary
+    still dies on the first turn until ``opencode auth login`` has run. Folding
+    both steps into the one ``install_command`` line is the only server-side
+    surface that reaches the operator before a session fails (this repository
+    does not probe the credential store -- the checkable paths are not the only
+    way an opencode authenticates, so a probe verdict on them would lie in both
+    directions). ``restart_required`` mirrors the codex probe for the same
+    cached-negative skew.
+    """
+    policy_id = _policy_id(ACP_BACKEND_OPENCODE)
+    if acp_driver.opencode_resolves():
+        return BackendInstallState(
+            ACP_BACKEND_OPENCODE,
+            policy_id,
+            INSTALLED,
+            restart_required=acp_driver.opencode_cached_negative(),
+        )
+    return BackendInstallState(
+        ACP_BACKEND_OPENCODE,
+        policy_id,
+        MISSING,
+        (COMPONENT_OPENCODE,),
+        acp_driver.opencode_install_command(),
+    )
+
+
 _PROBES: Dict[str, Callable[[], BackendInstallState]] = {
     ACP_BACKEND_KIRO: _probe_kiro,
     ACP_BACKEND_KAS: _probe_kas,
     ACP_BACKEND_CLAUDE: _probe_claude,
     ACP_BACKEND_CODEX: _probe_codex,
+    ACP_BACKEND_OPENCODE: _probe_opencode,
 }
 
 

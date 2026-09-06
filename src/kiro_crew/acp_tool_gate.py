@@ -40,6 +40,7 @@ from enum import Enum
 
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_OPENCODE,
     Routing,
     permission_config_for,
     routing_for,
@@ -67,6 +68,7 @@ UNENFORCED_CONTROLS = (
 #: login``-style advice aimed at a different harness.
 _LABELS: dict = {
     ACP_BACKEND_CODEX: "OpenAI Codex",
+    ACP_BACKEND_OPENCODE: "OpenCode",
 }
 
 #: The credential store each enforced harness must still be able to read.

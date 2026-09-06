@@ -214,6 +214,56 @@ def claude_adapter_install_command() -> str:
     return f"npm i -g {CLAUDE_ACP_NPM_PKG}"
 
 
+def opencode_resolves() -> bool:
+    """Whether the ``opencode`` binary resolves to a runnable argv.
+
+    ONE component, and none of it is Crew's: opencode speaks ACP itself via its
+    ``acp`` subcommand, so there is no adapter package and no second executable
+    to distinguish. The probe asks through :func:`_resolve_opencode_acp_bin`
+    (override env → mise → augmented PATH) so the answer cannot disagree with
+    what a spawn would actually do.
+    """
+    from kiro_crew.acp.client import _resolve_opencode_acp_bin
+
+    opencode_argv, _searched_path = _resolve_opencode_acp_bin()
+    return bool(opencode_argv)
+
+
+def opencode_cached_negative() -> bool:
+    """Has the RUNNING gateway already resolved the opencode binary as absent?
+
+    Same hazard and same resolution as :func:`codex_adapter_cached_negative`:
+    the argv is resolved once per process behind an ``_UNRESOLVED`` sentinel and
+    never invalidated, so a fresh probe reporting "installed" after an install
+    would disagree with every spawn until a restart. Consulted, never
+    invalidated -- a dashboard GET must not mutate a global on the spawn path.
+    """
+    from kiro_crew.acp import client as _client
+
+    cached = getattr(_client, "_opencode_acp_argv_cache", None)
+    if cached is None or cached is getattr(_client, "_UNRESOLVED", object()):
+        return False
+    try:
+        argv, _searched = cached  # type: ignore[misc]
+    except Exception:
+        return False
+    return not argv
+
+
+def opencode_install_command() -> str:
+    """The opencode remedy: the official installer, then its own sign-in.
+
+    Two steps, deliberately in one actionable line: installing the binary alone
+    does NOT make a session work -- the harness authenticates from its own
+    account store, so ``opencode auth login`` is the prerequisite a fresh
+    install must satisfy before the first turn can be served. Naming both here
+    keeps the panel's one install line from promising something that then dies
+    on auth, which is exactly the gap the codex panel states as a standing
+    caveat instead.
+    """
+    return "curl -fsSL https://opencode.ai/install | bash && opencode auth login"
+
+
 def _native_command_client_factory():
     """Resolve the direct ACP client at call time so gateway boot stays lazy."""
     from kiro_crew.acp.client import AcpClient

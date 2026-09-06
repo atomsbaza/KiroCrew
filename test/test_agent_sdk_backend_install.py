@@ -58,8 +58,9 @@ def _stub_resolvers(
     kiro="/usr/local/bin/kiro-cli",
     adapter=(["node", "/n/acp.js"], "/usr/bin"),
     claude_cli="/usr/local/bin/claude",
+    opencode=(None, "/usr/bin"),
 ):
-    """Patch the three spawn resolvers on the module the driver imports from.
+    """Patch the four spawn resolvers on the module the driver imports from.
 
     Patched on ``kiro_crew.acp.client`` -- the DEFINING module -- because the
     driver imports them function-locally at call time, so that is the namespace
@@ -71,6 +72,7 @@ def _stub_resolvers(
     monkeypatch.setattr(client, "_resolve_kiro_bin", lambda **_kw: kiro)
     monkeypatch.setattr(client, "_resolve_claude_acp_bin", lambda: adapter)
     monkeypatch.setattr(client, "_resolve_claude_code_executable", lambda: claude_cli)
+    monkeypatch.setattr(client, "_resolve_opencode_acp_bin", lambda: opencode)
 
 
 # ── The codex driver seams ──
@@ -562,7 +564,19 @@ class TestEndpointPayloadShape:
     def test_owner_gets_one_row_per_backend_in_the_pinned_shape(self, monkeypatch):
         from kiro_crew.dashboard.handlers import acp_backend_status as handler
 
-        _stub_resolvers(monkeypatch, adapter=(None, "/usr/bin"), claude_cli=None)
+        # codex and opencode are pinned MISSING here too: this assertion describes
+        # the payload SHAPE, and a host that happens to have either binary on PATH
+        # (both are one-liner installs) would otherwise flip these rows and fail a
+        # shape test for an install fact it does not care about.
+        _stub_resolvers(
+            monkeypatch,
+            adapter=(None, "/usr/bin"),
+            claude_cli=None,
+            opencode=(None, "/usr/bin"),
+        )
+        from kiro_crew.acp import client
+
+        monkeypatch.setattr(client, "_resolve_codex_acp_bin", lambda: (None, "/usr/bin"))
         # ``selectable`` is pinned rather than read live: this assertion is about
         # the payload carrying the governance answer, not about what this
         # deployment's policy happens to permit today.
@@ -574,7 +588,13 @@ class TestEndpointPayloadShape:
         assert response.status == 200
 
         rows = json.loads(response.text or "{}")["backends"]
-        assert [r["policy_id"] for r in rows] == ["claude", "codex", "kas", "kiro"]
+        assert [r["policy_id"] for r in rows] == [
+            "claude",
+            "codex",
+            "kas",
+            "kiro",
+            "opencode",
+        ]
         for row in rows:
             assert set(row) == {
                 "id",
@@ -616,6 +636,14 @@ class TestEndpointPayloadShape:
         # ``selectable`` stays False here because this test PINS the live enum to
         # ``["", "kas"]`` above; it asserts the payload shape, not the registry.
         assert by_policy["codex"]["selectable"] is False
+        # opencode reads exactly like codex's row shape-wise, but its remedy is a
+        # two-step line: the installer AND the ``opencode auth login``
+        # prerequisite -- installing the binary alone does not make a session
+        # work, and this line is the only surface that says so before one fails.
+        assert by_policy["opencode"]["installed"] == "missing"
+        assert by_policy["opencode"]["missing_components"] == ["opencode"]
+        assert "opencode auth login" in by_policy["opencode"]["install_command"]
+        assert by_policy["opencode"]["selectable"] is False
 
     def test_an_unknown_row_names_no_components(self, monkeypatch):
         """The three-state rule, enforced at the payload boundary too.

@@ -80,6 +80,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_MEMBER_DISPATCH,
@@ -166,6 +167,7 @@ from kiro_crew.kiro_cli import known_kiro_cli_dirs, resolve_kiro_cli
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.mcp_gateway.session_servers import injection_server_names, pooled_session_servers
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.mirrors import mirror_for
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
@@ -200,6 +202,11 @@ PROTOCOL_VERSION_CLAUDE = 1
 # H10 wants the handshake stated per harness, so a divergence is a one-line edit
 # here instead of a silent downgrade of whichever harness moved first.
 PROTOCOL_VERSION_CODEX = 1
+# opencode's ``acp`` subcommand speaks the same numeric ACP version as the
+# claude and codex adapters today. Its OWN literal, per harness-parity H10: a
+# future divergence is a one-line edit here instead of a silent downgrade of
+# whichever harness moved first.
+PROTOCOL_VERSION_OPENCODE = 1
 DEFAULT_MODEL = "auto"
 
 KIRO_CLI_BIN = "kiro-cli"
@@ -258,6 +265,19 @@ _ENV_CODEX_ACP_BIN = "CODEX_ACP_BIN"
 # who sets it reaches the child through the ambient environment copy, so naming it
 # here would imply a wiring that does not exist (its claude counterpart,
 # CLAUDE_CODE_EXECUTABLE, IS explicitly forwarded — the asymmetry is deliberate).
+
+# ── opencode (ACP_BACKEND_OPENCODE) ──
+# The harness speaks ACP ITSELF: ``opencode acp`` enters stdio JSON-RPC mode and
+# answers ``initialize`` on stdout, exactly like the claude/codex adapters. There
+# is no npm adapter package between Crew and the binary, so there is no vendored
+# copy, no package entry path and no hoisted-dependency marker to check -- the
+# resolver's ladder is simply override env → mise → augmented PATH.
+OPENCODE_BIN = "opencode"
+OPENCODE_ACP_SUBCOMMAND = "acp"
+# Explicit override, spelled like the codex adapter's: an absolute path to the
+# ``opencode`` binary (the ``acp`` subcommand is appended by the spawn arm, so
+# the override names the binary, not a wrapper script argv).
+_ENV_OPENCODE_ACP_BIN = "OPENCODE_ACP_BIN"
 
 # High-frequency, content-free adapter stderr diagnostics that _drain_stderr()
 # drops instead of forwarding as per-line WARNINGs.  The driving case is the
@@ -694,6 +714,50 @@ def _resolve_codex_acp_bin() -> tuple[list[str] | None, str]:
         node_on_path = shutil.which("node", path=search_path)
         if node_on_path:
             return [node_on_path, resolved], search_path
+
+    return None, search_path
+
+
+_opencode_acp_argv_cache: tuple[list[str] | None, str] | object = _UNRESOLVED
+
+
+def _resolve_opencode_acp_bin() -> tuple[list[str] | None, str]:
+    """Find the ``opencode`` binary and the PATH searched for it.
+
+    Same contract as :func:`_resolve_claude_acp_bin` / :func:`_resolve_codex_acp_bin`
+    -- the first item is spawn argv (or ``None``), the second the PATH the last
+    step searched, cached WITH the answer so an error site cannot report a
+    different search than the one that failed. The ladder differs in one way,
+    deliberately: opencode is a native binary the operator installs, not a Node
+    adapter Crew resolves for a runtime, so there is no vendored
+    ``node_modules`` copy and no co-located ``node`` to derive -- an override or
+    a resolved path is run AS-IS, and the ``acp`` subcommand is appended here so
+    the caller gets complete argv.
+
+    Resolution order:
+      1. ``OPENCODE_ACP_BIN`` env var (explicit override; the binary path).
+      2. ``mise which opencode`` (respects MISE_DATA_DIR and all mise config,
+         covering a mise-managed install in a non-login daemon context).
+      3. Augmented PATH (includes mise shims, npm global bin, Homebrew).
+    """
+    candidates: list[str] = []
+
+    override = os.environ.get(_ENV_OPENCODE_ACP_BIN)
+    if override and Path(override).is_file():
+        candidates.append(override)
+
+    mise_resolved = _mise_which(OPENCODE_BIN)
+    if mise_resolved:
+        candidates.append(mise_resolved)
+
+    search_path = augmented_path(os.environ.get("PATH", ""))
+    on_path = shutil.which(OPENCODE_BIN, path=search_path)
+    if on_path:
+        candidates.append(_normalize_exe_casing(on_path) or on_path)
+
+    for candidate in candidates:
+        if platform_compat.is_executable_file(candidate):
+            return [candidate, OPENCODE_ACP_SUBCOMMAND], search_path
 
     return None, search_path
 
@@ -2994,6 +3058,10 @@ class AcpClient:
         return self.backend == ACP_BACKEND_CODEX
 
     @property
+    def _is_opencode(self) -> bool:
+        return self.backend == ACP_BACKEND_OPENCODE
+
+    @property
     def _model_registry_namespace(self) -> str:
         """The model_registry namespace key for this backend (``claude_code`` /
         ``acp``). A registry index selector, NOT a provider-identity check — see
@@ -3820,6 +3888,18 @@ class AcpClient:
         """Switch model on a running session (used by warm pool post-claim)."""
         if not self._session_id:
             raise AcpError("Cannot set model before session is initialized")
+        # Model switching is an OPT-IN capability (harness-parity H6): kiro-cli
+        # takes ``session/set_model``, the ``ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION``
+        # members take the config-option channel, and a harness in NEITHER has no
+        # channel this core knows. Fail fast with the reason instead of sending a
+        # verb the backend answers with -32601 and letting the session reset loop
+        # discover it. Membership in the named union, never an identity negation.
+        if self.backend not in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION | {ACP_BACKEND_KIRO}:
+            raise AcpError(
+                f"Model switching is not supported on the {acp_tool_gate.label_for(self.backend)} "
+                "backend: it implements neither session/set_model nor the "
+                "session/set_config_option model channel."
+            )
         # Unlike the spawn path, this is an explicit request for THIS model, so
         # a silent downgrade would report success while running something else.
         # Refuse before the wire and name what the account can use.
@@ -4078,11 +4158,29 @@ class AcpClient:
                 return
         if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
             await self.set_config_option("model", self._model)
-        else:
+        elif self._is_kiro:
             await self._send_request(
                 METHOD_SET_MODEL,
                 {"sessionId": self._session_id, "modelId": self._model},
             )
+        else:
+            # A backend in neither model channel has no way to receive the pin
+            # (the explicit set_model path refuses it loudly). At STARTUP the pin
+            # was not chosen for this turn, so the withhold beats the failure:
+            # stay on the backend's own default and log why, exactly as the
+            # kiro entitlement-withhold branch above does. The log line goes
+            # through the context-aware spelling: this runs in a process that
+            # composes a companion, so the baseline pair the sibling sites use
+            # would be a real downgrade (see the
+            # _BASELINE_LOG_SITE_CENSUS gate in test_security_posture.py).
+            logger.warning(
+                "ACP model %s cannot be applied on the %s backend (no model-switch "
+                "channel); staying on the backend default",
+                redact_log_via_context(str(self._model)),
+                acp_tool_gate.label_for(self.backend),
+            )
+            self._model = DEFAULT_MODEL
+            return
         logger.info("ACP model: %s", self._model)
 
     async def _reseed_after_capture(self) -> None:
@@ -4499,6 +4597,35 @@ class AcpClient:
             adapter_hidden_dirs = await _run_preflight_bounded(
                 _sandbox_preflight, self.backend, self._sandbox_mode
             )
+        elif self._is_opencode:
+            # opencode speaks ACP itself via its ``acp`` subcommand, so unlike the
+            # codex arm there is no adapter package -- argv is the binary plus that
+            # subcommand, complete from the resolver. No _sandbox_preflight and no
+            # adapter_hidden_dirs: opencode's tool calls are NOT routed through
+            # Crew's gate in v1 because the session mounts no Crew tools at all
+            # (chat-only -- it is in no SESSION_CONFIG/permission routing), so
+            # there is no compensating control to arm and nothing for the mask to
+            # cover. Membership in ACP_BACKENDS_INTERNAL_SANDBOX is unaffected: it
+            # is a native binary with no internal OS sandbox, so Crew's own layer
+            # wraps it like any other non-kiro harness.
+            global _opencode_acp_argv_cache  # noqa: PLW0603
+            if _opencode_acp_argv_cache is _UNRESOLVED:
+                _opencode_acp_argv_cache = await asyncio.to_thread(_resolve_opencode_acp_bin)
+            cached_opencode_resolution = _opencode_acp_argv_cache
+            opencode_argv, opencode_search_path = (
+                cached_opencode_resolution
+                if isinstance(cached_opencode_resolution, tuple)
+                else (None, "")
+            )
+            if not isinstance(opencode_argv, list) or not opencode_argv:
+                raise AcpError(
+                    f"{OPENCODE_BIN} not found "
+                    f"({describe_search_path(opencode_search_path)}). Install it from "
+                    f"https://opencode.ai (or with your package manager), then run "
+                    f"'{OPENCODE_BIN} auth login' to sign in before starting a "
+                    f"session, or set {_ENV_OPENCODE_ACP_BIN} to the binary path."
+                )
+            argv = opencode_argv
         else:
             # Pin ONE reading of the environment for both the search and the
             # message that reports it. The previous code resolved against the live
@@ -4705,7 +4832,15 @@ class AcpClient:
         _spawn_label = (
             CLAUDE_ACP_BIN
             if self._is_claude
-            else CODEX_ACP_BIN if self._is_codex else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+            else (
+                CODEX_ACP_BIN
+                if self._is_codex
+                else (
+                    f"{OPENCODE_BIN} {OPENCODE_ACP_SUBCOMMAND}"
+                    if self._is_opencode
+                    else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+                )
+            )
         )
         # Everything from here to the end of _spawn runs with a LIVE subprocess
         # that nothing has recorded yet, so every step must be guarded. Without
@@ -4837,7 +4972,11 @@ class AcpClient:
             _bin_label = (
                 "claude-acp"
                 if self._is_claude
-                else CODEX_ACP_BIN if self._is_codex else KIRO_CLI_BIN
+                else (
+                    CODEX_ACP_BIN
+                    if self._is_codex
+                    else OPENCODE_BIN if self._is_opencode else KIRO_CLI_BIN
+                )
             )
             logger.warning("%s stderr: %s", _bin_label, redacted)
         if suppressed:
@@ -5277,7 +5416,9 @@ class AcpClient:
             # path warmed, NOT executor hops: this call site is shared with
             # kiro-cli, and adapter work must not add a scheduling or failure
             # point to that backend's construction path (harness-parity H13).
-            # The pooled read stays off the loop, as it already was.
+            # The pooled read stays off the loop, as it already was. opencode has
+            # no hook: it is known but not selectable (no enforceable permission
+            # boundary), so no session of its own is ever created here.
             "mcpServers": [
                 *(self._claude_session_mcp_servers() if self._is_claude else []),
                 *(self._codex_session_mcp_servers() if self._is_codex else []),
@@ -5352,7 +5493,11 @@ class AcpClient:
         protocol_version: int | str = (
             PROTOCOL_VERSION_CLAUDE
             if self._is_claude
-            else PROTOCOL_VERSION_CODEX if self._is_codex else PROTOCOL_VERSION
+            else (
+                PROTOCOL_VERSION_CODEX
+                if self._is_codex
+                else PROTOCOL_VERSION_OPENCODE if self._is_opencode else PROTOCOL_VERSION
+            )
         )
         init_id = await self._send_request(
             METHOD_INITIALIZE,
@@ -5399,6 +5544,12 @@ class AcpClient:
                 # why the _meta block below gives codex no session_file either.
                 session_file = ""
                 file_ok = True
+            elif self._is_opencode:
+                # opencode's harness keeps its own session records too, so the
+                # codex shape applies verbatim: no Crew-side transcript path, the
+                # resume attempt rides on the sessionId alone.
+                session_file = ""
+                file_ok = True
             else:
                 session_file = str(kiro_sessions_dir() / f"{resume_sid}.json")
                 file_ok = Path(session_file).exists()
@@ -5422,10 +5573,10 @@ class AcpClient:
                     }
                     if self._is_claude:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
-                    elif self._is_codex:
-                        # codex-acp carries no Crew-side session file and reads no
-                        # _meta of ours, so it gets neither key rather than the
-                        # kiro session_file it would not know what to do with.
+                    elif self._is_codex or self._is_opencode:
+                        # codex-acp and opencode carry no Crew-side session file and
+                        # read no _meta of ours, so they get neither key rather than
+                        # the kiro session_file they would not know what to do with.
                         pass
                     else:
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
@@ -7220,8 +7371,14 @@ class AcpClient:
         would steal the turn's messages. kiro-cli answers ``{queued: true}`` and
         the authoritative signal is the ``steering_consumed`` notification; the
         steered reply streams back inside the SAME in-flight prompt. Returns
-        False for an empty message or when there is no active session.
+        False for an empty message, when there is no active session, or when
+        this backend is not a member of ``ACP_BACKENDS_STEER`` -- a steer sent
+        down a channel the harness does not implement is answered with
+        method-not-found, so the membership test fails fast here rather than
+        letting an unimplementable request reach the wire.
         """
+        if not self.supports_steer:
+            return False
         text = (message or "").strip()
         if not text or not self._session_id:
             return False

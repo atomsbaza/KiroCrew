@@ -44,6 +44,20 @@ ACP_BACKEND_KAS = "kas"
 # translates ACP onto its operations. Selectable on a plain build, with an install
 # probe in ``agent_sdk/backend_install.py`` behind the switch.
 ACP_BACKEND_CODEX = "codex"
+# The OpenCode harness, driven through its native ``opencode acp`` stdio
+# subcommand -- the harness speaks ACP itself, so unlike codex there is no
+# adapter package between Crew and the binary. KNOWN and install-probed
+# (``agent_sdk/backend_install.py``), but NOT selectable on a public build: a
+# live probe of ``opencode acp`` ``session/new`` shows its ACP surface exposes
+# no enforceable permission boundary -- it advertises exactly ONE
+# ``configOption`` (``model``, type select) and no permission mode, so there is
+# nothing for ``acp_tool_gate.enforce_runtime_routing`` to arm and
+# ``routing_for("opencode")`` answers ``UNVERIFIED``. A config naming it falls
+# back to the default backend with the standard not-selectable warning
+# (:func:`resolve_selected_backend` reads the registry, so the id stays
+# recognized without being offered). Membership in every set is a deliberate,
+# evidenced edit -- none are inherited here.
+ACP_BACKEND_OPENCODE = "opencode"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -57,6 +71,7 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_KAS,
         ACP_BACKEND_CODEX,
+        ACP_BACKEND_OPENCODE,
     }
 )
 
@@ -112,8 +127,20 @@ ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset({ACP_BACKEND_CLAUDE})
 #: OS boundary by ``acp_tool_gate.adapter_hidden_credential_dirs`` -- derived from
 #: the read-gate floor itself, so the compensating control covers exactly what the
 #: control it compensates for covers, minus the harness's own token store.
+#:
+#: ``ACP_BACKEND_OPENCODE`` is deliberately NOT here even though it is in
+#: ``ACP_BACKENDS_KNOWN``: its ACP surface exposes no enforceable permission
+#: boundary (see the const's comment above), so a session on it could not have
+#: the PreToolUse gate armed. Known-but-not-selectable is the honest state, and
+#: :func:`resolve_selected_backend` degrades a persisted ``"opencode"`` to the
+#: default with the standard warning rather than spawning an ungated harness.
 BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
-    {ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_CODEX}
+    {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_CODEX,
+    }
 )
 
 # ── Policy-facing spelling ──
@@ -134,6 +161,7 @@ POLICY_ID_BY_BACKEND: dict = {
     # to deny — any id this build can spell, and the mapping is what makes the id
     # nameable in a rule at all.
     ACP_BACKEND_CODEX: ACP_BACKEND_CODEX,
+    ACP_BACKEND_OPENCODE: ACP_BACKEND_OPENCODE,
 }
 
 #: The backend a deployment policy may never deny.
@@ -458,6 +486,7 @@ _MODEL_REGISTRY_NAMESPACE_BY_BACKEND: dict = {
     ACP_BACKEND_KIRO: "acp",
     ACP_BACKEND_KAS: "acp",
     ACP_BACKEND_CODEX: "acp",
+    ACP_BACKEND_OPENCODE: "acp",
 }
 
 

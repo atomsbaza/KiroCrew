@@ -15,6 +15,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
 )
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
@@ -55,6 +56,14 @@ NO_MIRROR: dict[str, str] = {
         "when that gateway is off. Do not shorten this to 'nothing is mounted': "
         "unprojected does not mean absent. Listed here to keep the omission "
         "explained; NOT a claim that it needs no mirror"
+    ),
+    ACP_BACKEND_OPENCODE: (
+        "opencode is KNOWN but NOT selectable (see acp_backends.py): its ACP "
+        "surface exposes no enforceable permission boundary, so no session runs "
+        "on it and there is no spec surface to project. A mirror becomes "
+        "necessary only when opencode becomes selectable AND per-session MCP is "
+        "proven on the wire -- at which point its mirror goes in this folder "
+        "beside claude's, exactly as claude's did"
     ),
 }
 

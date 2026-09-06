@@ -122,6 +122,7 @@ backend really emits these shapes.
 | `kas/` | `kas` | synthesized | Reached through the kiro-cli relay, so same as above. The `_meta.kiro` discriminants follow `src/kiro_crew/acp/kas_wire.py`. |
 | `claude/` | `claude` | synthesized | `claude-agent-acp` was not installed on the recording host. |
 | `codex/` | `codex` | synthesized | `codex-acp` was not installed on the recording host. |
+| `opencode/` | `opencode` | synthesized | opencode is known but NOT selectable, so no Crew session exists to capture. Shapes follow the parsers; the `session/new` surface (one `model` select `configOption`, no permission mode) is from a live probe of `opencode acp` 1.18.29. |
 
 Replacing any row with a live capture is a strict improvement and needs no
 change to the test. Record it, set `recorded` to `live`, fill in the real
