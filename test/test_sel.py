@@ -245,6 +245,35 @@ class TestEventLogging:
         assert data["event_type"] == "api_access"
         assert data["source"] == "dashboard"
 
+    def test_log_api_access_redacts_and_clips_outcome(self, log, sel_dir):
+        """``outcome`` is scrubbed like ``resources``/``error``, not forwarded raw.
+
+        It reads as a constrained vocabulary, and is one for in-tree callers, but
+        an installed app reaches this helper through ``ctx.audit`` -- so the value
+        can be caller text. This log is append-only and served over
+        ``/api/sel/events``, so a credential landing here cannot be taken back.
+        """
+        log.log_api_access(
+            caller="app:doc-store",
+            operation="doc-store.publish",
+            outcome="failed for AKIAIOSFODNN7EXAMPLE " + "x" * 900,
+        )
+        sel_file = sel_dir / "security_events.jsonl"
+        data = json.loads(sel_file.read_text(encoding="utf-8").strip())
+        assert "AKIAIOSFODNN7EXAMPLE" not in data["outcome"]
+        assert len(data["outcome"]) <= 500
+
+    @pytest.mark.parametrize(
+        "outcome", ["ok", "allowed", "denied", "completed", "rejected", "failed"]
+    )
+    def test_log_api_access_leaves_a_real_outcome_unaltered(self, log, sel_dir, outcome):
+        # The scrub above must be the identity function on every spelling in-tree
+        # code writes, or it would rewrite the meaning of existing audit rows.
+        log.log_api_access(caller="token:abc", operation="GET /api/x", outcome=outcome)
+        sel_file = sel_dir / "security_events.jsonl"
+        data = json.loads(sel_file.read_text(encoding="utf-8").strip())
+        assert data["outcome"] == outcome
+
     def test_resources_truncated(self, log, sel_dir):
         long_resource = "x" * 1000
         log.log_tool_invocation(
@@ -1152,6 +1181,12 @@ class TestInferSource:
     @pytest.mark.parametrize("key,expected", [
         ("dashboard:slot0", "dashboard"),
         ("dashboard:slot5", "dashboard"),
+        # The side chat's isolated session (`side:<slot>`) IS a dashboard
+        # surface: a dashboard-bound governance profile must bind it. Before
+        # this branch the key fell through to the "slack" fallback and a
+        # dashboard-scoped profile skipped every side turn.
+        ("side:slot0", "dashboard"),
+        ("side:dashboard:slot0", "dashboard"),
         ("cron:job123", "cron"),
         ("subagent:abc", "subagent"),
         ("taskrunner:spec1", "taskrunner"),

@@ -29,7 +29,6 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/slash-commands", handlers.api_slash_commands)
     app.router.add_get("/api/agents/detail/{name}", handlers.api_agent_detail)
     app.router.add_patch("/api/agents/detail/{name}", handlers.api_agent_detail)
-    app.router.add_delete("/api/agents/detail/{name}", handlers.api_agent_detail)
     app.router.add_post("/api/agents/detail/{name}/fork", handlers.api_agent_fork)
     app.router.add_post("/api/agents/detail/{name}/publish", handlers.api_agent_publish)
     app.router.add_post("/api/agents/detail/{name}/reset", handlers.api_agent_reset)
@@ -73,3 +72,4 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/appearances/{id}", handlers.api_appearance_detail)
     app.router.add_delete("/api/appearances/{id}", handlers.api_appearance_delete)
     app.router.add_get("/api/appearances/{id}/slot/{slot}", handlers.api_appearance_slot)
+    app.router.add_get("/api/appearances/{id}/sound/{state}", handlers.api_appearance_sound)

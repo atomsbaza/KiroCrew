@@ -616,6 +616,7 @@ class TestPipInstallChannel:
         resolves to the BASE interpreter's directory where distro pythons put
         the marker — the recommended install layout (venv on a Debian/brew
         python) must not be misread as unsupported."""
+        monkeypatch.setattr(shared_mod.importlib.util, "find_spec", lambda name: object())
         monkeypatch.setattr(shared_mod.sys, "prefix", str(tmp_path / "venv"))
         monkeypatch.setattr(shared_mod.sys, "base_prefix", str(tmp_path / "base"))
         (tmp_path / "EXTERNALLY-MANAGED").write_text("", encoding="utf-8")
@@ -623,6 +624,7 @@ class TestPipInstallChannel:
         assert core_mod._pip_install_channel_available() is True
 
     def test_ordinary_venv_has_a_channel(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(shared_mod.importlib.util, "find_spec", lambda name: object())
         monkeypatch.setattr(shared_mod.sys, "prefix", shared_mod.sys.base_prefix)
         monkeypatch.setattr(shared_mod.sysconfig, "get_path", lambda name: str(tmp_path))
         assert core_mod._pip_install_channel_available() is True
@@ -1779,7 +1781,9 @@ class TestAgentSettingsPut:
         async with TestClient(TestServer(_agent_cfg_app())) as client:
             resp = await _put_agent(client, {"max_subagents": 0})
             assert resp.status == 200
-            assert (await resp.json())["restart_required"] is True
+            # The cap follows config live (SubagentManager.reconfigure), so the
+            # auto sentinel is applied at the next reload rather than at restart.
+            assert (await resp.json())["restart_required"] is False
         assert json.loads(seeded_config.read_text(encoding="utf-8"))["agent"]["max_subagents"] == 0
 
     @pytest.mark.asyncio

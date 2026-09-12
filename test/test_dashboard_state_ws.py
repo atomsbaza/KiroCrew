@@ -39,6 +39,30 @@ def state(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize("phase", ["preparing", "global_failed", "member_failed"])
+def test_status_remains_available_during_scoped_memory_recovery(
+    state: DashboardState, tmp_path, phase: str
+) -> None:
+    from kiro_crew.learn import Lesson, LessonStore
+    from kiro_crew.memory_startup import MemoryStartup
+
+    state.lessons = LessonStore(base_dir=tmp_path / "status-lessons")
+    state.lessons.save(Lesson("2026-09-08", "Keep the accepted decision", "knowledge"))
+    assert state._count_lessons() == 1  # Warm the real JSONL cache before recovery.
+    startup = MemoryStartup.begin()
+    try:
+        if phase != "preparing":
+            failed_store = "default" if phase == "global_failed" else "member-alice"
+            startup.fail_store(failed_store, ValueError("staged recovery failed"))
+            assert startup.complete()
+        snapshot = state.status_snapshot()
+        assert snapshot["sessions"] == 0
+        assert snapshot["lessons"] == (1 if phase == "member_failed" else None)
+    finally:
+        startup.stop()
+        startup.release()
+
+
 class TestSubagentSubscribers:
     def test_subscribe_and_unsubscribe(self, state: DashboardState) -> None:
         ws = MagicMock()
@@ -685,6 +709,78 @@ class TestChatSlotStopState:
         d = slot.to_dict()
         assert d["stop_state"] == "soft_pending"
         assert d["stopping"] is True
+
+
+class TestSubagentProbeWiring:
+    """Tests for chat_utils.wire_session_subagent_probe.
+
+    The RSS ceiling in SessionManager consults this probe before recycling an
+    idle session; the probe must reach the dashboard's sub-agent registry and
+    the slot displaying the session, and both boot paths must install it.
+    """
+
+    def _installed_probe(self, state: DashboardState):
+        from kiro_crew.dashboard.chat_utils import wire_session_subagent_probe
+
+        wire_session_subagent_probe(state)
+        state.sessions.set_subagent_probe.assert_called_once()
+        probe = state.sessions.set_subagent_probe.call_args[0][0]
+        assert callable(probe)
+        return probe
+
+    def test_wire_installs_probe_on_sessions(self, state: DashboardState) -> None:
+        self._installed_probe(state)
+
+    def test_probe_reports_running_children(self, state: DashboardState) -> None:
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = [{"id": "a1"}]
+        state.subagents._queued_depth.return_value = 0
+        probe = self._installed_probe(state)
+
+        assert probe("dashboard:chat-1") is True
+        state.subagents.running_agents_for.assert_called_once_with("dashboard:chat-1")
+
+    def test_probe_without_a_tab_answers_from_the_registry(self, state: DashboardState) -> None:
+        """No open tab means no slot: the registry probes alone decide."""
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = []
+        state.subagents._queued_depth.return_value = 0
+        probe = self._installed_probe(state)
+
+        assert state.get_slot("chat-1") is None
+        assert probe("dashboard:chat-1") is False
+
+        state.subagents._queued_depth.return_value = 1
+        assert probe("dashboard:chat-1") is True
+
+    def test_probe_sees_in_flight_delivery_on_the_slot(self, state: DashboardState) -> None:
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = []
+        state.subagents._queued_depth.return_value = 0
+        slot = state.get_or_create_slot("chat-1")
+        probe = self._installed_probe(state)
+
+        assert probe("dashboard:chat-1") is False
+        slot._subagent_deliveries_inflight = 1
+        assert probe("dashboard:chat-1") is True
+
+    def test_probe_without_registry_reports_no_children(self, state: DashboardState) -> None:
+        state.subagents = None
+        probe = self._installed_probe(state)
+        assert probe("dashboard:chat-1") is False
+
+    def test_both_boot_paths_install_the_probe(self) -> None:
+        """start_dashboard AND start_api_server wire the probe after the state exists."""
+        import inspect
+
+        from kiro_crew.dashboard import server
+
+        for fn in (server.start_dashboard, server.start_api_server):
+            src = inspect.getsource(fn)
+            assert "wire_session_subagent_probe(state)" in src, fn.__name__
+            assert src.index("state = DashboardState(") < src.index(
+                "wire_session_subagent_probe(state)"
+            ), fn.__name__
 
 
 class TestCompactCallbackWiring:

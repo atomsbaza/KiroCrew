@@ -46,8 +46,13 @@ from kiro_crew.mcp_grant import grant_observed
 from kiro_crew.mcp_provenance import ABSENT, resolve_write
 from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes, mcp_server_alias
 from kiro_crew.sandbox import (
+    CANONICAL_TEMP_KEYS,
     SandboxUnavailableError,
+    classify_declared_temp_env,
+    classify_declared_temp_path,
     create_subprocess_limited,
+    declared_temp_refusal_reasons,
+    format_declared_temp_refusals,
     sandboxed_spawn_argv,
     sandboxed_spawn_argv_async,
 )
@@ -439,20 +444,54 @@ def _cache_probe(server: McpServerInfo) -> None:
     built from the CURRENT config, so redacting only at serialization time
     would mask a rotated credential's NEW value while the cached error still
     carries the OLD one.
+
+    A failed probe (``server.status in {"error", "needs_auth"}``) still
+    overwrites ``status``/``error`` — a server that just failed to answer
+    IS currently failing, and ``mcp_gateway.shareability`` correctly reads a
+    fresh "error" as UNKNOWN via ``probe_ok``. What it must NOT overwrite is
+    the server's descriptive shape from its last successful handshake:
+    ``tools``, ``tool_annotations``, ``capabilities``, ``protocol_version``,
+    ``server_info``, and ``probed_at_wall``. Without this, a single transient
+    timeout on an otherwise-healthy server collapses its tool count to zero
+    for the probe that failed, discarding both lists together even though
+    each is only ever populated from that same successful handshake —
+    resetting one without the other would leave a caller reading tool
+    metadata that does not match the tools actually being reported. ``probed_at_wall`` travels with the preserved shape rather
+    than the failed probe's own timestamp, so an "as of" display next to
+    the preserved tools points to when they were actually observed, not to
+    the unrelated timeout that came later. A server that has never had a
+    successful probe has no prior shape to fall back to, so it gets the
+    failure's own (empty) shape — there is nothing stale to protect.
     """
     server.probed_at = time.time()
+    prior = _probe_cache.get(server.name)
+    probe_failed = server.status in ("error", "needs_auth")
+    if probe_failed and prior is not None:
+        tools = list(prior.tools)
+        tool_annotations = [dict(a) for a in prior.tool_annotations]
+        capabilities = dict(prior.capabilities) if isinstance(prior.capabilities, dict) else None
+        protocol_version = prior.protocol_version
+        server_info = dict(prior.server_info)
+        probed_at_wall = prior.probed_at_wall
+    else:
+        tools = list(server.tools)
+        tool_annotations = [dict(a) for a in server.tool_annotations]
+        capabilities = dict(server.capabilities) if isinstance(server.capabilities, dict) else None
+        protocol_version = server.protocol_version
+        server_info = dict(server.server_info)
+        probed_at_wall = server.probed_at
     _probe_cache[server.name] = _ProbeResult(
         status=server.status,
-        tools=list(server.tools),
+        tools=tools,
         error=redact_mcp_error(
             server.error, server.redaction_headers, server.resolved_header_values or ()
         ),
         probed_at=time.monotonic(),
-        capabilities=(dict(server.capabilities) if isinstance(server.capabilities, dict) else None),
-        protocol_version=server.protocol_version,
-        server_info=dict(server.server_info),
-        tool_annotations=[dict(a) for a in server.tool_annotations],
-        probed_at_wall=server.probed_at,
+        capabilities=capabilities,
+        protocol_version=protocol_version,
+        server_info=server_info,
+        tool_annotations=tool_annotations,
+        probed_at_wall=probed_at_wall,
         probe_mode=server.probe_mode,
         auth_challenge=server.auth_challenge,
         auth_grant_present=server.auth_grant_present,
@@ -1973,8 +2012,54 @@ async def probe_server(
         # case-insensitively (Windows env keys are case-insensitive and the
         # sanitized spec preserves the author's spelling).
         _declared_temp_upper = {
-            key.upper() for key in (server.env or {}) if key.upper() in ("TMPDIR", "TMP", "TEMP")
+            key.upper() for key in (server.env or {}) if key.upper() in CANONICAL_TEMP_KEYS
         }
+        # The spec's OWN spellings, kept beside the upper-cased set: the rewrite
+        # below has to tell the declaration apart from the ambient key of the
+        # same name, and only the exact spelling does that -- comparing
+        # upper-cased names alone lets BOTH survive.
+        _declared_temp_spelled = {
+            key for key in (server.env or {}) if key.upper() in CANONICAL_TEMP_KEYS
+        }
+        # ...but a declaration that lands inside the sealed runtime parent is
+        # REFUSED rather than honored. Both backends seal
+        # ``<data home>/run`` read-only, so honoring it hands the child a temp
+        # dir it cannot write -- the same Bun/Koffi extraction failure the
+        # managed temp root avoids, and silent because the probe still reports
+        # a green handshake for servers that never touch temp. Carving the
+        # declared path out of the seal is NOT the alternative: spec ``env`` is
+        # untrusted config text and ``extra_writable_dirs`` is validated for
+        # self-derived scratch only. The managed temp takes over instead, which
+        # keeps the operator's storage intent -- their path named the data-home
+        # volume, and so does the managed root. Refused as a WHOLE: ``tempfile``
+        # consults TMPDIR before TMP, so honoring a surviving sibling key would
+        # leave writability depending on which key the spec happened to spell.
+        _sealed_temp: dict[str, tuple[str, str]] = {}
+        failure = ""
+        if _declared_temp_upper:
+            accepted, _sealed_temp, failure = await asyncio.to_thread(
+                classify_declared_temp_env,
+                server.env or {},
+                classifier=classify_declared_temp_path,
+            )
+            _declared_temp_upper = set(accepted)
+            if _sealed_temp:
+                logger.warning(
+                    "MCP probe [%s]: ignoring spec-declared %s — %s; probing with the "
+                    "managed temp instead",
+                    server.name,
+                    format_declared_temp_refusals(
+                        _sealed_temp,
+                        redactor=lambda path: _sanitize_probe_error(ValueError(path)),
+                    ),
+                    "; ".join(
+                        declared_temp_refusal_reasons(
+                            _sealed_temp,
+                            failure,
+                            redactor=lambda text: _sanitize_probe_error(ValueError(text)),
+                        )
+                    ),
+                )
         probe_scratch: "Path | None" = None
         if not _declared_temp_upper:
             try:
@@ -2018,17 +2103,62 @@ async def probe_server(
 
                 # Merged AFTER the wrap so the managed triple lands on the
                 # SCRUBBED env the child actually receives.
+                #
+                # Every OTHER spelling of a temp key is dropped first, not just
+                # the three canonical names: spec env keys are matched
+                # case-insensitively here, so a stray ``tmpdir`` -- from the
+                # ambient env, or a declaration refused above -- would otherwise
+                # sit in the env beside the managed ``TMPDIR``. Where env names
+                # are case-insensitive the two are ONE variable and the survivor
+                # decides what the child reads; where they are distinct the child
+                # sees both. Either way the managed triple must be the only temp
+                # keys left.
+                env = {
+                    key: value
+                    for key, value in env.items()
+                    if key.upper() not in CANONICAL_TEMP_KEYS
+                }
                 env = {**env, **tmp_env(probe_scratch)}
             elif _declared_temp_upper:
                 # Yielding alone is not enough: ambient temp keys are still in
                 # ``env`` and ``tempfile`` consults TMPDIR before TMP, so a
                 # spec declaring only TMP would silently write through the
-                # inherited ambient TMPDIR. Strip the canonical keys the spec
-                # did NOT declare (mirrors the backend chokepoint).
+                # inherited ambient TMPDIR. Strip every canonical key the spec
+                # did NOT itself spell (mirrors the backend chokepoint) --
+                # matched case-insensitively, so an ambient ``TMPDIR`` cannot
+                # outrank a declared ``tmpdir`` in the child's lookup while both
+                # sit in the env.
+                # ...and re-emitted under the CANONICAL uppercase name: on
+                # POSIX ``tempfile`` reads only TMPDIR/TMP/TEMP as spelled, so
+                # a spec declaring ``tmpdir`` would otherwise keep its key, lose
+                # the ambient ones, and get the platform default -- the
+                # declaration silently not governing while no managed temp was
+                # allocated either. The spec spelling is dropped rather than
+                # kept beside the canonical one, since on Windows the two are
+                # ONE variable.
+                declared_values = {
+                    key.upper(): value
+                    for key, value in env.items()
+                    if key in _declared_temp_spelled
+                }
                 env = {
                     key: value
                     for key, value in env.items()
-                    if not (key in ("TMPDIR", "TMP", "TEMP") and key not in _declared_temp_upper)
+                    if key.upper() not in CANONICAL_TEMP_KEYS
+                }
+                env.update(declared_values)
+            elif _sealed_temp:
+                # The refusal above stands even though allocation failed, so
+                # there is no managed dir to point at: strip every temp key,
+                # the ambient ones included, so the child falls back to its
+                # platform default (``/tmp`` on POSIX, the ``tempfile``
+                # candidate list on Windows) instead of the refused path.
+                # Fail-open on containment, never onto a directory already
+                # known to be read-only.
+                env = {
+                    key: value
+                    for key, value in env.items()
+                    if key.upper() not in CANONICAL_TEMP_KEYS
                 }
         except Exception:
             logger.debug("probe temp containment unavailable", exc_info=True)

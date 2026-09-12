@@ -111,7 +111,7 @@ const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/
 // test_accept_list_covers_every_accepted_extension pins this set against the
 // server's, from the Python side, since a vitest cannot read the Python constant.
 const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.md,.json,.excalidraw,.har,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
@@ -576,7 +576,6 @@ interface ChatInputProps {
   projectGitAhead?: number
   projectGitBehind?: number
   memoryMode?: string
-  cleanMode?: boolean
   /** User-sent messages for ↑/↓ history navigation (oldest → newest). */
   sentMessages?: string[]
   /** Authoritative automation record for this slot (if any). */
@@ -927,7 +926,6 @@ function ChatInput({
   projectGitAhead,
   projectGitBehind,
   memoryMode,
-  cleanMode,
   sentMessages,
   onAutomationClick,
   automation,
@@ -1582,10 +1580,10 @@ function ChatInput({
   // claiming active work over a dead session.
   const resumeOffered = !!(continuable && onContinue && continueIsRecovery)
   const continuePlaceholder = resumeOffered
-    ? i18nT('components.chatInput.turn_interrupted_press_continue')
+    ? i18nT('components.chatInput.turn_interrupted_press_resume')
     : ''
   const continueLabel = i18nT(continueIsRecovery
-    ? 'components.chatInput.continue_interrupted_turn'
+    ? 'components.chatInput.resume_interrupted_turn'
     : 'components.chatInput.continue_thread')
   const [slashMenuOpen, setSlashMenuOpen] = useState(false)
   const [filePickerOpen, setFilePickerOpen] = useState(false)
@@ -3264,6 +3262,32 @@ function ChatInput({
     if (inputRef.current && !dragging.current) applyHeight(inputRef.current, manualHeight, prefillHint, textareaParked)
   }, [value, prefillHint, manualHeight, textareaParked])
 
+  // Re-measure when the textarea's WIDTH changes at an unchanged value: a window
+  // resize, a sibling column folding, the side panel docking. The wrapped
+  // placeholder or text needs a different height at the new column, and the
+  // effect above cannot know — none of its deps moved. Without this the box kept
+  // the height it had at the old width and clipped the placeholder's second
+  // line mid-glyph on the Members DM thread (issue #9979, finding 4).
+  // Width ONLY: the observer also fires for the height `applyHeight` itself
+  // writes, and re-running on that would measure for nothing (the memo makes it
+  // a no-op, but the guard makes the intent legible). `dragging` and `parked`
+  // are the same preconditions the two call sites above honour.
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let lastWidth = el.clientWidth
+    const ro = new ResizeObserver(() => {
+      const width = el.clientWidth
+      if (width === lastWidth) return
+      lastWidth = width
+      if (!dragging.current) applyHeight(el, manualHeight, prefillHint, parkedRef.current)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+    // `textareaParked` re-arms the observer on the way back from the sr-only box,
+    // where the 1px width must not be the baseline the next change is judged from.
+  }, [manualHeight, prefillHint, textareaParked])
+
   // Keep the paste-highlight mirror's scroll aligned with the textarea after
   // value/height changes (applyHeight mutates scrollTop programmatically, which
   // doesn't fire the textarea's onScroll). rAF lets layout settle first.
@@ -3848,7 +3872,7 @@ function ChatInput({
       <div
         data-testid="input-wrapper"
         ref={wrapperRef}
-        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(cleanMode || memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${cleanMode ? 'border-accent bg-bg-elevated' : memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
 
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}

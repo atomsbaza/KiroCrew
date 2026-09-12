@@ -8,6 +8,19 @@
 
 Slack's transport path is gated behind the `messaging.use_transport` config flag (default `true` in Kiro Crew, so the abstraction is the canonical path); when off, Slack's native `handle_message` path runs instead.
 
+A resumed or linked member conversation retains its recorded private memory
+identity on every channel. The shared pipeline and Slack, Discord and Telegram
+dispatchers validate and prepare that memory before provider acquisition. A
+missing, corrupt or unreadable member store displays its refusal reason; it
+cannot turn into a Global Memory V1 conversation. Unowned legacy conversations
+retain V1. Provider template names do not identify Crew Members.
+
+When dashboard metadata records a member alias as `agent`, resumed channels
+translate it through the private store's declared owner to the member's provider
+template. A recorded channel template override remains an override. An unowned
+V1 conversation with an identically spelled agent name keeps its existing
+template semantics.
+
 ## Architecture — the three layers
 
 ```
@@ -602,6 +615,131 @@ Session keys are namespaced as `f"{channel_type}:{conversation_id}"` (`session_k
 
 `MessagingConfig.use_transport` (`config/loader.py`, default `True` in Kiro Crew; exposed in `config.json` under `messaging`) is the single switch. `slack/events.py::_route_message` checks `orch._cfg.messaging.use_transport`; when `True` it creates a task on `handle_message_transport` and skips the native `handle_message` monolith. (There is no challenge-redirect in this fork — Slack messages are processed inline.) Approval mode is resolved by `_resolve_approval_mode(orch)` (respects configured mode + operator YOLO/SafetyOverride TTL), and the per-channel `slack.channels.<id>.agent` override is passed through.
 
+## Live configuration
+
+Every channel setting that CAN take effect in a running gateway does, from any
+writer — the dashboard save, `kirocrew config set`, or an `$EDITOR` edit of
+`config.json`. One shape covers all eleven channels, and the shape is the same
+whether the value is an authorization roster, a per-turn threshold, or a socket
+parameter.
+
+**One watcher.** `src/kiro_crew/config/live.py` owns the single process-wide
+`ConfigWatch`: one background task, one fingerprint check per tick off the loop,
+one `KiroCrewConfig.load()` when it moves, one diff flattened to dotted leaf
+paths, and one sequential dispatch to subscribers on the loop. No channel polls
+`config.json` itself. Each dispatcher registers in its `__init__` —
+`live.watch_section(self, "<channel>", "messaging", target="transport",
+name="<Channel>Dispatcher")` — and keeps the returned `Subscription` on `self`,
+because the watcher holds the owner WEAKLY so a dispatcher a test builds and
+drops does not pin itself into the registry. That one line carries the prefix
+gate, the not-yet-connected-transport no-op and the degraded-section refusal, so
+no dispatcher hand-writes them. Teams, Telegram and Discord pass no `target`:
+each keeps a roster of its OWN — the surfaces that bypass `transport.receive`
+(a Teams session list, a Telegram callback, a Discord interaction) re-check
+against it — so the dispatcher owns `reconfigure(section)`, updates its copies
+IN PLACE so a holder handed the same object follows, and then pushes at the
+transport. Discord additionally UNIONS the reloaded thread list with the ids this
+process promoted at runtime, tracking the last configured set so a thread an
+operator removes is still dropped.
+
+**Allow-lists are PUSHED, wholesale, and fail closed.** Each transport exposes
+`reconfigure(section)`: it rebuilds every authorization set with the SAME coercion
+its constructor applies (Telegram's user ids to strings and forum chat ids to
+ints, Discord's snowflake strings, Webex's lowercased emails, WeCom's
+`{userid, name}` flattening, Weixin's `_coerce_opaque_str_ids`, WhatsApp's
+`normalize_jid` and `_coerce_whatsapp_groups`, iMessage's `normalize_handle`,
+Teams' lowercased emails) and REPLACES the frozenset in one assignment, so an
+`authorize` running concurrently reads one consistent roster rather than a
+half-updated one. Discord's `_allowed_threads` is the one set that is UNIONED
+rather than replaced: a thread this process created at runtime is not in
+`config.json`, and dropping it would strand every follow-up the user sends into
+it, while a thread an operator REMOVES from the config is still dropped, so the
+reload narrows as intended. A field whose reloaded shape does not parse keeps the PREVIOUS
+value and logs at WARNING, and a `slack`/channel section the loader DISCARDED
+(`cfg.degraded_sections`) applies nothing under it: rebuilding a roster from a
+value the loader could not read would either lock out every intended sender or
+admit a room nobody approved. The skip is raised as `ConfigDeferred` so the
+watcher retries those paths once the file validates — a repair back to the
+defaults the degraded snapshot already held diffs empty, and the roster would
+otherwise never catch up (config spec, "deferred, never dropped"). An empty list is a real value on the channels whose
+gate denies on empty (iMessage, Webex), because empty there means deny-all rather
+than unreadable. Every roster change is SEL-audited by COUNT — added, removed,
+resulting size — never by id, since the per-message admission decision is already
+audited where it is made. The audit runs AFTER the roster is adopted, never
+before: `sel()` validates its trust root on first use and can raise, and an audit
+that ran first would leave a revoked id authorized until SEL recovered, with every
+watcher retry re-hitting the same failure. A `reconfigure` that adopts several
+sets adopts them all before auditing any (Feishu's `_reload_id_set` returns the
+set plus its delta for that reason), so a raise in the first audit cannot strand
+the second roster on its old value; the error still reaches the watcher, whose
+retry then finds nothing left to adopt. A transport that is not attached yet (`transport` is
+`None`, as in a dispatcher a test builds bare) makes the applier a no-op.
+
+**Per-turn values are read at the point of use.** Thresholds, `dm_scope`,
+`queue_mode`, `idle_reset_minutes`, `daily_reset_hour` and the render toggles are
+not pushed into anything: each dispatcher's `_live_cfg()` is
+`live.current(self.cfg, log_prefix=...)`, which returns `live.snapshot()` when
+the watcher is armed, else a fingerprint-cached `KiroCrewConfig.load()` (two
+stats on a hit), else the boot copy. Falling back to the boot copy rather than
+raising keeps a turn running when `config.json` is momentarily unreadable — a
+threshold is not an authorization decision, and the boot value is the one the
+operator last had in force. Thresholds re-run the loader's own
+`_normalize_threshold_pair`, so a reloaded soft value above the hard one cannot
+make the soft nudge unreachable. `dm_scope` is the exception among the messaging
+fields: it is `restart=True` and every dispatcher reads it from its boot copy.
+It chooses the session-key namespace, and each conversation's generation counter
+is seeded (`seed_fn`) from the namespace in force at boot — adopting a new value
+live, even at a generation boundary, would mint keys in the other namespace with
+a counter seeded for this one, and could resume a stale session persisted there.
+A restart re-seeds every counter from the new namespace, which is the only safe
+boundary.
+
+**Connection fields restart ONE channel, in process.** A socket, a bot token or a
+bridge path cannot be swapped under a live connection, so the gateway reconnects
+just that channel instead of asking the operator to restart the process. Each
+bootable `ChannelDescriptor` declares its `boot_keys` (`messaging/registry.py`);
+when a reload names one of them, `GatewayOrchestrator.restart_channel` closes the
+old handle, re-runs that channel's hoist against the new config and a fresh
+credential read, re-checks the `channels` governance gate and the readiness
+badge, and starts the transport again. The two halves run differently. The
+CLOSE is inline in the watcher's dispatch and bounded (2s per channel): a save
+that awaited `refresh_now` answers with inbound access already shut, the mirror
+registration gone and the legacy `_<channel>_client` cleared, so no queued
+inbound traffic reaches a transport whose config was just revoked. Only the
+RECONNECT runs as a tracked background task, because the applier is awaited
+under `ConfigWatch._cycle`'s lock, which every dashboard save also waits on, and
+a connect that hangs for its timeout must not stall every other applier and
+every save response. A reconnect always rebuilds from the watcher's current
+snapshot, never from the change that scheduled it. The connect itself runs
+outside `_channel_restart_lock` (the close before it and the publish after it
+hold the lock), so a newer close is never queued behind a slow connect; a
+per-channel restart generation (bumped by every close) makes a start that was
+still connecting when a newer close landed discard its client instead of
+storing a transport built from a superseded document. Shutdown cancels any reconnect still in flight
+before closing the handles. Slack is not in that loop — its socket is
+host-managed. See [slack-gateway](slack-gateway.md) § Live configuration.
+
+**`restart_required` is answered from schema metadata.** A channel save's
+response no longer guesses: `dashboard/channel_folders.py::channel_restart_required`
+asks `kiro_crew.config.schema.requires_restart(path)`, which reads the `restart`
+flag on that field's `_meta(...)` in `config/sections.py`. A field nothing marks
+is live, so the settings page tells the truth instead of promising a restart the
+user does not need — which is how a panel trains people to restart for
+everything. A `.env` write always reports `True`, because the credential file is
+not watched.
+
+**The exceptions**, and they are the whole list:
+
+- **`slack.command`** — the slash command is registered with Slack's app
+  manifest, so changing it here cannot re-register it. Marked `restart=True`.
+- **`whatsapp.db_path`** — the linked-device session store is opened once by the
+  `neonize` client. Marked `restart=True`.
+- **Credentials in `config_dir/.env`** — bot tokens, app passwords and secrets
+  are not in `config.json` and the watcher does not read that file, so a
+  credential save reports a restart even for a channel whose config fields are
+  all live. A channel whose token also lives in a legacy `config.json` fallback
+  restarts through `boot_keys` when that copy changes.
+
 ## Proactive sends (`send_message`'s `channel_type`)
 
 Everything above carries a REPLY: an inbound message arrives, a turn runs, its
@@ -802,7 +940,9 @@ Four properties are load-bearing:
   Topic inbound would refuse), **iMessage** (the handle IS the conversation,
   normalized both sides), **Weixin** (mirrors its `dm_policy`, and deliberately
   ignores the learned `_known_users` set so a peer who spoke once cannot outlive
-  its removal) and **WeCom** (defence in depth; it declares
+  its removal — `WeixinTransport.reconfigure` replaces `dm_policy` and
+  `allowed_user_ids` on a config reload, denying on an unknown policy value, so a
+  removal takes effect on the next send) and **WeCom** (defence in depth; it declares
   `supports_proactive_send=False`, so the ladder refuses it earlier). **Teams**
   reverse-maps through `_reachable_conversation`, the same predicate
   `resolve_configured_target` and `configured_targets` answer from, so "may I send
@@ -857,9 +997,9 @@ Four properties are load-bearing:
   **Webex** has the same two, and a group space is why: a **space** route is
   recognised by its conversation id being in `_allowed_rooms` while
   `allow_group_rooms` is still on — the same pair `room_permitted` gates inbound on,
-  so outbound is neither tighter nor looser. Both sets are frozen at construction
-  and the config PATCH reports `restart_required` for them, so flipping the switch
-  off or dropping a room revokes that space's proactive traffic from the next start —
+  so outbound is neither tighter nor looser. Both sets are replaced wholesale by
+  `WebexTransport.reconfigure` on a config reload, so flipping the switch
+  off or dropping a room revokes that space's proactive traffic on the next send —
   which is what matters, because a persisted link outlives the config that
   authorized it. This arm is load-bearing rather than a convenience: a space is keyed as a
   `forum` route on `(chat_id, thread_id)`, so `_session_principal` names nobody by
@@ -1802,7 +1942,7 @@ answer is not permission: a raised evaluation and a `Decision` without
 - **Attachment ingest belongs to the frame that awaits the turn**: download after the busy check, in the dispatcher, and unlink in that frame's `finally`. Ingesting at arrival and unlinking there leaves a QUEUED message's prompt naming files that were deleted minutes before the drained turn read them, and the encoder skips a missing path silently. It follows that an attachment-bearing message is never steered (a steer carries text only) and never read as a command (the caption lives in `text`); the queue entry carries RAW descriptors and the drained turn re-ingests them.
 - **An outbound refusal is never budget-dropped**: when extraction has already CUT a reference's markup, its refusal line is the only surviving trace of the file, so it is appended unconditionally and the caller chunks. Trading the line for staying inside one message is the one outcome that leaves the user with neither the picture nor a reason.
 - **A permanently undeliverable route is dropped, a transient failure is not**: `TeamsSendError` carries the Connector status and only `403`/`404` retire the persisted `serviceUrl`. Keeping a dead route turns every later cron result and mirror leg into a red badge nothing can clear; dropping one on a hiccup makes an outage look permanent.
-- **An SSRF vet checks the RESOLVED address, not only the name**: a name blocklist cannot see that a public name an attacker controls points at `127.0.0.1` or `169.254.169.254`, and a wildcard-DNS host needs no zone control at all. Resolution goes through one seam, refuses if ANY answer is private/loopback/link-local/reserved, refuses on failure, and runs on every redirect hop. The residual gap (rebinding between vet and connect) is stated rather than implied away.
+- **An SSRF vet checks the RESOLVED address, not only the name**: a name blocklist cannot see that a public name an attacker controls points at `127.0.0.1` or `169.254.169.254`, and a wildcard-DNS host needs no zone control at all. Resolution goes through one seam, refuses if ANY answer is private/loopback/link-local/reserved, refuses on failure, and runs on every redirect hop. **And the addresses it approved are the addresses that get dialed**: the vet returns EVERY address it checked and the caller opens its session on the connector `link_unfurl.pinned_connector` builds, so the client performs no second lookup for a rebinding answer to land in. **All of them, not just the first** — a client dials a resolver's answers in turn, so a one-address pin turns a dead CDN node, or an AAAA record on a host with no IPv6 route, into a failed fetch that worked before the pin existed; every entry passed the same check, so the whole set is as safe as its first element. The pin lives in `link_unfurl.py` beside the vet whose result it serves, because every caller of the vet needs it, and `limit=1` and `family=AF_UNSPEC` live in the factory because a caller that keeps the resolver and drops the family re-opens the window. Its consumers are the link-preview handler and `wecom/media.py`. `teams/client.py` and the meetings calendar provider pin through their own resolvers, deliberately: one keeps a bounded MULTI-HOST map for a long-lived connector that re-vets each redirect hop, the other is reached per calendar host, and a factory built for one URL and one session serves neither. The residual gap is now one case and is stated rather than implied away: **a fetch through a configured operator proxy**, where aiohttp hands the proxy the hostname and resolves nothing locally, so there is no lookup for a pin to answer and the proxy's own resolution is the one that reaches a socket.
 - **A routing reference is durable, and losing it never blocks delivery**: the Bot Framework exposes no lookup for a conversation's `serviceUrl`, so `teams/service_urls.py` persists it. Loading is lazy and off-loop (never the boot path), every read failure degrades to the in-memory map, a non-`https` row does not survive a reload, and an identity row whose conversation did not survive is dropped rather than advertising a target with no route to it.
 - **A turn that produced text but landed none of it is a FAILURE**: `DiscordRenderer.delivery_failed` is "seals were attempted AND none landed", and the dispatcher records `record_failure` rather than `record_success` when the turn accumulated text and that observable is true. A revoked token or a dropped network fails every send while the turn still returns its text, so filing it as a success hides the outage behind a healthy success rate and leaves the transcript claiming a reply the channel never carried. Deliberately not "any send failed": one failed length rotation whose retry succeeded still reached the user. A muted conversation runs a `SilentRenderer`, which attempts no send and so never reports one.
 - **A cron run notifies ONE surface**: a job belongs to the conversation that scheduled it, so when the job pins no `channel` and `_deliver_cron_to_channel` reports a DELIVERED send to the origin channel, the Slack owner-DM leg stands down. A pinned `job.channel` keeps its Slack delivery, and a Slack-origin, dashboard-origin or origin-less job keeps Slack too, which is every job an install carries today. The stand-down is gated on that send's own return value, never on a predicate answering whether it would have worked, so a governance refusal or a wire failure falls through to Slack instead of dropping the run.
@@ -1811,6 +1951,7 @@ answer is not permission: a raised evaluation and a `Decision` without
 - **A reconnect cannot hot-loop on an accept-then-close edge**: a connection must live at least `_MIN_HEALTHY_CONN_SECS` for its CLEAN close to reset the backoff counter, so a repeating immediate close stays on the exponential curve. Webex, WeCom and Discord all carry this guard. Without it a clean-disconnect branch that resets the attempt count makes the backoff curve unreachable and nothing bounds the request rate, and Discord bans an identity for 10 minutes after 10,000 invalid requests, so the cost is the channel, not just CPU.
 - **Session keys are namespaced**: every key is `channel_type:conversation_id`; only bare legacy Slack `thread_ts` keys are shimmed, via `canonical_key`/`legacy_key`.
 - **Runtime identity follows the current turn**: every channel dispatcher passes its trusted transport name as `runtime_source` to `ContextBuilder.build_message`; the shared `drive_turn` pipeline uses `ChannelTurn.channel_type`. A cross-surface resume keeps its original stable session key for conversation continuity, but `[RUNTIME]` names the interface carrying the current message. Follow-up turns refresh the marker because the one-time session context may describe an earlier surface.
+- **A turn reads the SESSION's memory silo, never the one its `agent` name suggests**: every channel turn resolves `memory_store=` through `context.session_store_for_turn(ctx_builder, session_key)`, which reads the session's own recorded binding and stands up that silo's vector tier before the build is offloaded. `drive_turn` does it on the shared seam for the same reason it owns `minimal_context`: every channel on the pipeline has the identical exposure, and one that forgot would read the operator's private memory for a crew bound elsewhere. **The store must not be derived from `agent`** — on every channel that field is a kiro-cli agent name, a namespace disjoint from `cfg.agents`, so a derivation resolves to `default` for exactly the crew that configured otherwise. A session with no recorded binding resolves `""` and runs the global path unchanged, which is nearly every channel conversation; one reaches a silo when it was taken over from, or resumed into, a crew-bound dashboard session. `scripts/check_memory_store_seam.py` gates the omission on any line a change touches; see [memory-skills-hooks](memory-skills-hooks.md#how-a-turn-running-surface-names-its-store).
 - **Channel dashboard visibility is immediate**: after the first successful turn of a Discord, Telegram, Webex, Teams, WeCom, Weixin, or Feishu-owned session is persisted, the dispatcher triggers the channel-slot reconciler immediately when `dashboard.surface_channel_sessions` is enabled. `DashboardState.register_channel_transport` injects the dashboard state into the bound dispatcher; the lifetime 30-second reconciler remains the recovery path, but the normal first-turn path does not wait for it. Turns that resume an existing `dashboard:` session skip this step because that session already owns a slot.
 - **An owner notification is not Slack-only**: `dashboard/server.py::_dm_owner` prefers the owner's Slack DM and falls back to registered channel transports (`_notify_owner_channels`). It used to no-op entirely without Slack, so an expiring unattended grant was invisible on a Teams-only, Discord-only or Telegram-only install — silence about a security grant lapsing is exactly what the notice exists to prevent. Fallback, not addition: an operator with Slack gets one notice, not one per channel. Reachability is the transport's OWN answer, so this can only reach a destination that channel already authorized. **And a channel must be able to NAME the owner: exactly one configured target, or nothing.** The notice carries the operator's own security state, while an allow-list is a list of people permitted to talk to the agent — not a claim that any one of them is the operator. With several configured targets there is no unambiguous owner, and sending to the first reachable one hands one allow-listed human another's auto-approve state; the count is over ALL configured targets, because a three-person allow-list with one learned route is still a guess. Same premise as `/sessions`' owner-only rule. Per-identity authority within an allow-list would let this deliver on a multi-person install; it does not exist yet on any channel.
 - **The proactive PRODUCERS started Slack-shaped, and the parity claim tracks how far that has moved**: `api_send_message` (the LLM-facing `send_message` tool) began with exactly two legs — the origin dashboard slot and `state.slack_client` — and `file_send` still posts to the Slack upload route. The tool's own explicit addressing now exists for every registered channel and does consult `state.channel_transports`: `channel_type` (+ optional `target_id`) for the conversation the session belongs to, and `session="<channel>"` for that channel's configured owner. See § Proactive sends. What remains Slack-only is the shape of `channel`/`user`/`thread_ts`/`unfurl_*`, whose allow-list, threading and unfurl semantics are Slack concepts, and `file_send`'s upload route. A cron result also still reaches a non-Slack channel when its origin slot is MIRRORED there (`/link`).
@@ -1864,8 +2005,10 @@ dashboard token auth.
   `verify_warning`. `<field>_clear` must be a strict boolean. Secrets land in
   `config_dir/.env` via atomic 0600 `mkstemp` + `os.replace`, and
   `os.environ` is synced afterward. Response `restart_required` is true for
-  actual env changes and boot-read config (`command`,
-  `allowed_enterprise_ids`); `reactions_enabled`/`show_thinking` apply live.
+  actual env changes and for `command`, the one Slack config field a running
+  gateway cannot apply (the slash command is registered with the app manifest);
+  every other field applies live, including `allowed_enterprise_ids`, which is
+  re-read through the validated `enterprise.reload_allowed_team_ids`.
   An empty `command` resets the slash command to the default.
 - `GET /api/slack/manifest` — public manifest template rendered with
   `?alias=` (default `kirocrew`, never `$USER`) plus Slack's one-click
@@ -2089,7 +2232,7 @@ An inbound resume binding lives on the bound session's `session_map.json` row. A
 
 **Store.** `$KIROCREW_HOME/trust/discord_resume_expectations.json` holds channel-id → `{key, title, version, retired}` rows under agent-blocked `trust/`, with an owner-only directory and `restrict_to_owner` file write because modes do not protect files on Windows. `retired` defaults false when loading an older row. Every filesystem step, including `config_dir()`, runs in a worker; an `asyncio.Lock` serializes read-modify-write without spanning Discord I/O.
 
-**Refuse before route.** `DiscordSessionResume.route` returns one `RoutingDecision` containing either the session key or a refusal. Plain turns and session-targeting commands use that decision once; drained turns keep their enqueue-time native decision. `!new`/`!unlink` release every exact-channel binding, `!sessions`/`!help` remain reachable for recovery, and tool approval dispatches no turn while retaining its nonce-keyed visible failure path. Four states run: no owner/no record; no owner/retired record; one owner/no record (bootstrap); one matching owner/active record. Four refuse: active record without owner (lost link, retire after notice), any owner different from the active record or present beside a retired record (announce and adopt after delivery), multiple owners, or a resolution that keeps changing.
+**Refuse before route.** `DiscordSessionResume.route` returns one `RoutingDecision` containing either the session key or a refusal. Plain turns and session-targeting commands use that decision once; drained turns keep their enqueue-time native decision. `!new`/`!unlink` release every exact-channel binding, `!sessions`/`!help` remain reachable for recovery, and tool approval dispatches no turn while retaining its nonce-keyed visible failure path. Four states run: no owner/no record; no owner/retired record; one owner/no record (bootstrap); one matching owner/active record. Four refuse: active record without owner (lost link, retire after notice), any owner different from the active record or present beside a retired record (announce and adopt after delivery), multiple owners, or a resolution that keeps changing. The owner it refuses against is the third copy of `discord.allowed_user_ids`: `DiscordDispatcher.reconfigure` calls `DiscordSessionResume.reconfigure(self._allowed)` on every reload, re-deriving `owner_id` by the same one-identity rule as construction, so an operator who adds a second identity loses `!sessions` on that reload rather than at the next restart (the Telegram sibling does the same).
 
 **Restricted resumed sessions.** Discord uses the same
 `upload_gate.session_is_restricted` decision as Telegram before both post-turn
@@ -2150,11 +2293,12 @@ like this transaction's own work.
   `show_thinking` are strict booleans. Secrets
   land in `config_dir/.env` (atomic 0600) with `os.environ`
   synced; non-secrets go to
-  `config.json` under `discord`. Every field except the two render toggles is
-  boot-read, so `restart_required` is true for any other actual change and
-  `_DISCORD_LIVE_FIELDS` holds those two out of it: the dispatcher re-reads them
-  per turn, and promising a restart the user does not need is how a settings page
-  trains people to restart for everything.
+  `config.json` under `discord`. Every field applies live, so
+  `restart_required` is false for a config-only save: the allow-lists are pushed
+  into the transport by `DiscordTransport.reconfigure` and the render toggles and
+  thresholds are re-read per turn, while a token change reconnects the Discord
+  channel alone rather than the gateway. Promising a restart the user does not
+  need is how a settings page trains people to restart for everything.
   Setting OR clearing the token also purges the legacy `discord.bot_token`
   field from `config.json`, and the commit order is config.json FIRST then
   `.env`, matching the Telegram and Webex saves: the gateway falls back to that
@@ -2399,9 +2543,11 @@ Slack settings API they are registered in the dashboard route block (NOT
   supergroup chat_ids are NEGATIVE (e.g. `-1001234567890`), so the validator
   accepts a leading minus (NOT the digits-only check used for
   `allowed_user_ids`) and rejects non-integer garbage.
-  Every Telegram field is boot-read (consumed in the orchestrator's
-  constructor), so `restart_required` is true for any actual change and only
-  for actual change.
+  Every Telegram config field applies live: `TelegramTransport.reconfigure`
+  replaces `allowed_user_ids` and `allowed_forum_chat_ids`, `allow_forum` and
+  `soft_threshold_pct` are read per turn, and a `bot_token` or `enabled` change
+  reconnects the Telegram channel alone. `restart_required` is therefore true
+  only for a `.env` credential write.
 
 ## Webex channel
 
@@ -2652,8 +2798,12 @@ neither interrupts a chunked reply.
   to `config.json` under `webex`, and any token set/clear purges the legacy
   `webex.bot_token` config fallback (config.json commits before .env so a
   crash between the two cannot resurrect the plaintext copy). Writes are
-  serialized under the repo-wide config lock. All fields are boot-read, so
-  `restart_required` is true on any actual change.
+  serialized under the repo-wide config lock. Every field applies live —
+  `WebexTransport.reconfigure` replaces `allowed_emails`, `allowed_room_ids` and
+  `allow_group_rooms`, the thresholds and `reply_in_thread` are read per turn,
+  `session_folder` is read where the session key is built, and a `bot_token` or
+  `enabled` change reconnects the Webex channel alone — so `restart_required` is
+  true only for a `.env` credential write.
 
 ## WeCom channel
 
@@ -3065,8 +3215,26 @@ what is read is ciphertext: PKCS#7 to a 32-byte multiple always adds 1–32 byte
 a file at exactly WeCom's 20 MB maximum arrives larger than it is and a cap set to
 the plaintext figure refused precisely the largest valid attachments, before
 decryption. `WECOM_MAX_PLAINTEXT_BYTES` is exported from `wecom/media.py` and the
-ingest limits take it from there, so the two cannot drift. `voice` is excluded from the download path on purpose: WeCom
-returns its OWN transcript in `voice.content`, so the text is the payload and no
+ingest limits take it from there, so the two cannot drift. The inbound `url` is platform-*supplied* but not
+platform-*guaranteed*, so it is vetted through `link_unfurl.vet_unfurl_url` (https
+only, port 443 only, and every resolved address checked) before any fetch — an
+unvetted fetch is a server-side request forgery read primitive whose response flows
+on into the attachment pipeline. **The fetch is then pinned to the address that vet
+approved**: with no operator `proxy`, `download_media` opens its own one-request
+session on the connector `link_unfurl.pinned_connector` builds, so the socket
+goes where the vet looked and a second DNS answer has nowhere to land. The pin
+serves every address the vet approved, so a multi-homed CDN host keeps the
+node-to-node fallback it had before the pin — the same
+mechanism `teams/client.py` and the link-preview handler use. No CDN host
+allow-list is applied, deliberately: WeCom documents no stable media-host set, so a
+list here would be a guess that silently drops real media, and the address vet
+closes the same class without naming hosts. The rebinding residual remains on
+exactly one path, a **configured proxy**, and by construction: aiohttp hands the
+proxy the hostname and performs no local lookup, so a pin would be unconsulted, and
+split-horizon DNS means our resolution may not even match the proxy's. A proxied
+deployment should read the vet as a scheme-and-destination soundness check rather
+than a guarantee about the egress path. `voice` is excluded from the download path
+on purpose: WeCom returns its OWN transcript in `voice.content`, so the text is the payload and no
 shipped backend decodes the codec — which is also why `WECOM_INGEST_LIMITS`
 budgets audio at the 20 MB **file** ceiling and not at WeCom's 2 MB voice-message
 limit: no voice bytes ever reach the ingest path, so the only audio that does is a
@@ -3130,8 +3298,11 @@ single-delivery window, so answering one is a feature with its own design.
   back to `config.json` under `wecom`. `allow_all_users` must be a strict
   boolean. Secrets land in `config_dir/.env`
   (atomic 0600) with `os.environ` synced. Writes are serialized under the
-  repo-wide config lock. All fields are boot-read, so `restart_required` is
-  true on any actual change.
+  repo-wide config lock. Every config field applies live —
+  `WeComTransport.reconfigure` replaces `allowed_users` and `allow_all_users`, the
+  reset windows and thresholds are read per turn, and an `enabled` or `ws_url`
+  change reconnects the WeCom channel alone — so `restart_required` is
+  true only for a `.env` credential write.
 
 ## Microsoft Teams channel
 
@@ -3269,7 +3440,11 @@ Two paths besides an ordinary message keep that map honest, one per direction:
 **Security model.** `authorize` is deny-by-default against
 `teams.allowed_emails` (matching the UPN/email when Teams supplies one, else the
 AAD object id, since activities carry that more reliably); an empty allow-list
-authorizes nobody. **Personal-scope only, fail closed:** any non-`personal`
+authorizes nobody. `TeamsTransport.reconfigure` adopts a reloaded roster and
+updates all THREE copies from one applier — the transport's own set, the
+dispatcher's, and `TeamsSessionResume`, whose `owner_id` is re-derived — because a
+roster that lives in three places and is refreshed in one is a roster with two
+stale copies. **Personal-scope only, fail closed:** any non-`personal`
 conversation type is denied and audited BEFORE authorization, because a reply in a
 channel or group chat would expose tool output to members who are not on the
 allow-list. `MICROSOFT_APP_ID` / `MICROSOFT_APP_PASSWORD` /
@@ -3833,9 +4008,12 @@ actual Messages.app and reply to real people.
   `db_path` reject line breaks and NULs: they become `argv` of a spawned child
   (via `create_subprocess_exec`, never a shell), where a newline would corrupt
   the argument rather than be quoted. Writes go to `config.json` under
-  `imessage`, serialized under the repo-wide config lock. Every field except
-  `session_folder` is boot-read, so `restart_required` is true on any other
-  change.
+  `imessage`, serialized under the repo-wide config lock. Every field applies
+  live, so `restart_required` is false for this channel: `allowed_handles` is
+  replaced by `IMessageTransport.reconfigure` (an EMPTY list IS adopted — empty is
+  this transport's deny-all, not an unreadable value), the thresholds and
+  `session_folder` are read at the point of use, and a `db_path`, `cli_path`,
+  `service` or `enabled` change restarts the iMessage bridge alone.
 
 ## WhatsApp channel
 
@@ -3984,7 +4162,12 @@ its path only, because WhatsApp shows the recipient whatever `fileName` carries.
 (the default; only the linked account's own messages), `allowlist`, `open`, and
 `disabled`. An unrecognized value denies everyone. Groups are invisible
 unless configured per group, then gated by mode, mention and cooldown
-(`whatsapp/group_gate.py`).
+(`whatsapp/group_gate.py`). `WhatsAppTransport.reconfigure` adopts all three on a
+config reload: `dm_policy` (an unrecognized string is adopted, because
+`_dm_policy` denies what it does not recognize), `allowed_wa_ids`, and `groups`
+re-coerced through the loader's `_coerce_whatsapp_groups`. The `GroupGate` is
+rebuilt only when the coerced rules actually differ, because rebuilding it resets
+the unprompted-reply cooldown clock.
 
 **A stale group entry is reported once, at the first connect.** Groups are opt-in
 and matched by exact JID, so an entry the account cannot resolve (a hand-typed
@@ -4306,7 +4489,8 @@ lock: `receive` runs on the event loop (the WS thread hands off via
 by an `await`.
 
 **Security model.** `authorize` is deny-by-default against
-`feishu.allowed_open_ids` (frozen at construction); every denial is
+`feishu.allowed_open_ids`, which `FeishuTransport.reconfigure` replaces wholesale
+on a config reload (so does the group pair below); every denial is
 SEL-audited (`source="feishu"`). The Feishu app needs
 `im:message.p2p_msg:readonly` to receive direct-message events and
 `im:message:send_as_bot` to reply; enabling groups additionally needs

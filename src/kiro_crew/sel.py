@@ -69,6 +69,15 @@ def _default_dir() -> Path:
     import first loads this module. Resolving on each call is cheap: the first
     ``config_dir()`` of the process caches the resolved home.
     """
+    from kiro_crew.config.paths import private_runtime_log_dir
+
+    private_logs = private_runtime_log_dir()
+    if private_logs is not None:
+        # A separate process-local diagnostic chain never appends to, nor
+        # supplies authority for, the gateway's global audit chain.
+        directory = private_logs / f"audit-{os.getpid()}"
+        platform_compat.make_owner_only_dir(directory)
+        return directory
     return config_dir()
 
 
@@ -2391,6 +2400,18 @@ class SecurityEventLog:
         Pass ``critical=True`` for fail-closed audits (e.g. safety-override
         activation): the event is written synchronously and a filesystem
         failure is re-raised so the caller can refuse the audited action.
+
+        ``outcome`` is redacted and clipped like ``resources`` and ``error``,
+        even though it reads as a constrained vocabulary. It is not one at this
+        boundary: an installed app reaches this helper through ``ctx.audit``, so
+        the value can be caller text rather than an in-tree constant, and this
+        log is append-only and served over ``/api/sel/events`` -- a secret that
+        lands here has no recovery path. The pass is the identity function on
+        every spelling in-tree code writes (``ok``, ``denied``, ``completed``,
+        ``rejected``, ``allowed``), so no existing row changes; it is applied
+        here rather than in each caller so a new filler cannot miss it. The
+        writer's own pass is not the backstop: ``_REDACTED_TEXT_FIELDS`` omits
+        ``outcome`` because identity-shaped fields stay verbatim there.
         """
         self.log(
             SecurityEvent(
@@ -2401,7 +2422,7 @@ class SecurityEventLog:
                 agent="",
                 source=source,
                 operation=operation,
-                outcome=outcome,
+                outcome=_redact_and_clip(outcome) if outcome else "",
                 resources=_redact_and_clip(resources) if resources else "",
                 error=_redact_and_clip(error) if error else "",
             ),
@@ -3268,6 +3289,15 @@ def _infer_source(session_key: str) -> str:
     if session_key == "_host":
         return "host"
     if session_key.startswith("dashboard:"):
+        return "dashboard"
+    # The side chat (``dashboard/handlers/side.py``) runs its isolated LLM
+    # session under ``side:<slot>``. That IS a dashboard surface — the slot's
+    # own side panel — keyed apart from ``dashboard:<slot>`` only so the ACP
+    # session and its SEL rows stay separate from the parent slot's. Classifying
+    # it here keeps every consumer in step: a dashboard-bound governance profile
+    # (``governance_profiles.resolve_active_scope``) binds a side turn exactly as
+    # it binds the parent slot, and the ``slack`` fallback below never claims it.
+    if session_key.startswith("side:"):
         return "dashboard"
     if session_key.startswith("cron:"):
         return "cron"

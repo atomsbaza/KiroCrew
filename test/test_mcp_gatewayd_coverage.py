@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -1070,6 +1072,111 @@ class TestAcquireBackend:
         await pool.shutdown_all(timeout=0.1)
 
     @pytest.mark.asyncio
+    async def test_secret_temp_skips_raw_precheck_and_reaches_spawn_backend(
+        self, monkeypatch, caplog
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+
+        pool = BackendPool(max_backends=2)
+        key = _pool_key(server="secret-temp-mcp")
+        backend = _fake_backend(key)
+        captured: dict[str, Any] = {}
+
+        async def _spawn_backend(**kwargs: Any) -> Backend:
+            captured.update(kwargs)
+            captured["env"] = dict(kwargs["env"])
+            return backend
+
+        monkeypatch.setattr(gw, "spawn_backend", AsyncMock(side_effect=_spawn_backend))
+        raw_reference = "secret://../../../../run/x\nFORGED"
+        monkeypatch.setattr(
+            gw,
+            "_declared_env_to_forward",
+            lambda _key: {"TMPDIR": raw_reference},
+        )
+        classified: list[str] = []
+
+        def _sealed(path: str) -> str:
+            classified.append(path)
+            return "sealed"
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _sealed)
+
+        def _resolve(env: dict[str, str], _config: Path):
+            if "TMPDIR" not in env:
+                return dict(env), set()
+            return {**env, "TMPDIR": "/resolved/secret"}, {"TMPDIR"}
+
+        monkeypatch.setattr(gw, "resolve_secret_uris", _resolve)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.gatewayd"):
+            await gw._acquire_backend(
+                pool,
+                key,
+                lambda _key: ("demo-bin", [], {}, "/tmp/cov"),
+            )
+
+        assert classified == []
+        assert raw_reference not in caplog.text
+        assert captured["env"]["TMPDIR"] == "/resolved/secret"
+        assert captured["declared_temp_keys"] == ("TMPDIR",)
+        assert captured["secret_env_keys"] == ("TMPDIR",)
+        await _drain_task(backend._stdout_task)
+        await pool.shutdown_all(timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_sealed_declared_temp_is_removed_before_spawn(self, monkeypatch, caplog) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+
+        pool = BackendPool(max_backends=2)
+        key = _pool_key(server="sealed-temp-mcp")
+        backend = _fake_backend(key)
+        spawn = AsyncMock(return_value=backend)
+        monkeypatch.setattr(gw, "spawn_backend", spawn)
+        declared = "/sealed/runtime/tmp\nFORGED"
+        monkeypatch.setattr(
+            gw,
+            "_declared_env_to_forward",
+            lambda _key: {"TMPDIR": declared, "A": "declared"},
+        )
+        loop_thread = threading.get_ident()
+        classifier_threads: list[int] = []
+
+        def _sealed(_path: str) -> str:
+            classifier_threads.append(threading.get_ident())
+            return "sealed"
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _sealed)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.gatewayd"):
+            await gw._acquire_backend(
+                pool,
+                key,
+                lambda _key: (
+                    "demo-bin",
+                    [],
+                    {"TMPDIR": "/ambient/tmp", "A": "inherited"},
+                    "/tmp/cov",
+                ),
+            )
+
+        kwargs = _await_kwargs(spawn)
+        assert declared not in kwargs["env"].values()
+        assert not [key for key in kwargs["env"] if key.upper() in ("TMPDIR", "TMP", "TEMP")]
+        assert kwargs["declared_temp_keys"] == ()
+        assert classifier_threads and all(thread != loop_thread for thread in classifier_threads)
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "ignoring spec-declared" in record.getMessage()
+        )
+        assert f"TMPDIR={declared!r}" in warning
+        assert "\nFORGED" not in warning
+        assert "inside the sandbox-sealed runtime parent" in warning
+        await _drain_task(backend._stdout_task)
+        await pool.shutdown_all(timeout=0.1)
+
+    @pytest.mark.asyncio
     async def test_pool_reuse_reports_was_spawned_false(self, monkeypatch):
         pool = BackendPool(max_backends=2)
         key = _pool_key(server="reuse-mcp")
@@ -2005,10 +2112,34 @@ class TestZombieDiagnostic:
             return real_open(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "open", sharing_violation_open)
-        await asyncio.wait_for(
-            gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop),
-            timeout=5,
+        # Wait on the watchdog's own completion signal, not the coroutine: the
+        # watchdog swallows CancelledError, so on Python 3.11+ a timed-out
+        # ``asyncio.wait_for(coro, ...)`` cannot raise TimeoutError -- the
+        # cancellation never propagates, wait_for returns None, and the later
+        # assertions fail in misleading ways (FileNotFoundError on diag.jsonl
+        # or an unset stop event, depending on where the cancel landed). A
+        # genuinely slow runner now fails legibly at the bounded wait below.
+        task = asyncio.create_task(
+            gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop)
         )
+        stop_wait = asyncio.create_task(stop.wait())
+        try:
+            # Waiting on BOTH means a watchdog that raises before setting stop
+            # surfaces its exception immediately instead of hiding behind the
+            # full 30s budget.
+            done, _ = await asyncio.wait(
+                {task, stop_wait}, timeout=30, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert done, "watchdog neither set stop nor finished within 30s"
+            if task in done:
+                await task  # surface any exception the watchdog raised
+        finally:
+            # Never leak the watchdog past monkeypatch teardown: cancel and
+            # drain whatever is still pending (the watchdog swallows
+            # CancelledError, so the drain terminates promptly).
+            task.cancel()
+            stop_wait.cancel()
+            await asyncio.gather(task, stop_wait, return_exceptions=True)
 
         records = [json.loads(line) for line in diag.read_text().strip().splitlines()]
         tags = [record["tag"] for record in records]
