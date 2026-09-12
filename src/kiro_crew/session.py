@@ -112,7 +112,8 @@ from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
-from kiro_crew.config import KiroCrewConfig
+from kiro_crew.config import KiroCrewConfig, live
+from kiro_crew.config.live import ConfigChange
 from kiro_crew.config.loader import (
     AUTOCOMPACT_PCT_MAX,
     AUTOCOMPACT_PCT_MIN,
@@ -218,6 +219,21 @@ ClaudeCodeProvider = None  # type: ignore[assignment,misc]
 logger = logging.getLogger(__name__)
 
 
+def _watchdog_handle_of(provider: Any) -> Any | None:
+    """The live ACP session handle behind *provider*, if it can rebind its watchdog.
+
+    Two shapes carry one: ``AcpSessionProvider`` holds ``_handle`` directly, and
+    ``AcpProvider`` wraps one as ``_client`` once its runtime is up. Anything
+    else (a placeholder client, a fake provider in a test, a Claude driver) has
+    no windows to re-clamp and is skipped.
+    """
+    for candidate in (provider, getattr(provider, "_client", None)):
+        handle = getattr(candidate, "_handle", None)
+        if handle is not None and callable(getattr(handle, "rebind_watchdog", None)):
+            return handle
+    return None
+
+
 def _is_claude_backend(provider: Any) -> bool:
     """Check if a provider drives claude-agent-acp via the ACP adapter.
 
@@ -301,10 +317,15 @@ def _resolve_allocation_crew_identity(
     return resolve_crew_identity(cfg, agent, crew_agent)
 
 
-def _load_allocation_watchdog_settings(crew: str) -> object:
+def _load_allocation_watchdog_settings(crew: str, cfg: object = None) -> object:
+    """The one seam this module reaches the ACP watchdog through.
+
+    ``cfg`` is the already-loaded config the watcher hands to the hot-apply path
+    so the re-clamp runs on the loop without a file read; ``None`` loads.
+    """
     from kiro_crew.acp.session_handle import _load_watchdog_settings
 
-    return _load_watchdog_settings(crew)
+    return _load_watchdog_settings(crew, cfg=cfg)
 
 
 def _get_agent_model_cache() -> dict[str, tuple[str, float, float]]:
@@ -449,6 +470,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
         "miss_empty",
         "bypass_resume",
         "bypass_stateless",
+        "bypass_private_memory",
         "bypass_cwd",
         "bypass_effort",
         "bypass_env",
@@ -1163,6 +1185,9 @@ class SessionManager:
             get_stuck_turn_report_secs=lambda: _STUCK_TURN_REPORT_SECS,
             get_pycache_gc_interval_secs=lambda: PYCACHE_GC_INTERVAL_SECS,
             get_session_idle_expired_event=lambda: SESSION_IDLE_EXPIRED,
+            # Resolved per call, not captured: the dashboard installs the probe
+            # after this manager (and possibly its cleanup boundary) exists.
+            has_attached_subagents=lambda key: self._has_attached_subagents(key),
         )
 
     def _cleanup_boundary(self) -> SessionCleanup:
@@ -1510,6 +1535,22 @@ class SessionManager:
         """Return the live provider for a folded key."""
         return self._allocation_boundary().get_provider(key)
 
+    def session_generation(self, key: str) -> int:
+        """Capture the monotonic logical-key generation for conditional destruction."""
+        return self._allocation_boundary().session_generation(key)
+
+    def _advance_session_generation(self, key: str) -> int:
+        """Advance ownership generation after registry publication/removal."""
+        return self._allocation_boundary().advance_ownership_generation(key)
+
+    def session_keys(self) -> frozenset[str]:
+        """Snapshot current and in-flight registry keys for a same-tick fence."""
+        return self._allocation_boundary().session_keys()
+
+    def _has_allocation_reservation(self, key: str) -> bool:
+        """Return whether allocation/claim ownership is reserved for *key*."""
+        return self._allocation_boundary().has_allocation_reservation(key)
+
     async def try_acquire(self, key: str) -> bool:
         """Try to acquire an exact-key idle session."""
         return await self._allocation_boundary().try_acquire(key)
@@ -1539,6 +1580,9 @@ class SessionManager:
         # whatever the last load in this process happened to publish.
         self._adopted_autocompact_pct = published_autocompact_pct()
         self._provider_factory = provider_factory
+        # Installed by the dashboard once its state exists (set_subagent_probe);
+        # None means "no dashboard, so no children can be attached".
+        self._subagent_probe: Callable[[str], bool] | None = None
         self._allocation_state = SessionRegistryState(
             start_sem=asyncio.Semaphore(_MAX_CONCURRENT_COLD_STARTS)
         )
@@ -1625,14 +1669,117 @@ class SessionManager:
             rss_max_mb=max(0, _rss_cfg) if isinstance(_rss_cfg, int) else 0,
         )
         self._cleanup_boundary()
+        # The watcher holds the bound method weakly, so a manager that a test or
+        # a provider reload discards falls out of the registry on its own.
+        self._config_sub = live.subscribe(
+            *self._CONFIG_SECTIONS,
+            callback=self._on_config_change,
+            name="SessionManager",
+        )
 
     def _ensure_cleanup_task(self) -> None:
         """Start the one cleanup loop at the allocation registration point."""
         self._cleanup_boundary().start_cleanup()
 
-    async def refresh_defaults(self) -> None:
-        """Adopt changed defaults for new sessions without touching live sessions."""
-        await self._lifecycle_boundary().refresh_defaults()
+    # Paths whose new value is only honoured by a rebuilt provider factory or a
+    # re-derived warm pool. Anything else under ``session``/``agent`` is read
+    # off ``_cfg`` (or fresh from the loader) at its point of use, so adopting
+    # the new config object is the whole apply.
+    # The sections this manager subscribes to; a degraded one defers the apply.
+    _CONFIG_SECTIONS: tuple[str, ...] = (
+        "session",
+        "agent",
+        "watchdog",
+        "agents",
+        "workspaces",
+        "default_workspace",
+    )
+    _FACTORY_CONFIG_PATHS: tuple[str, ...] = (
+        "agent.model",
+        "agent.reasoning_effort",
+        "agent.acp_backend",
+        "agent.role_efforts",
+        "agent.tool_search",
+        "agent.tool_search_min_pct",
+        "agent.tool_search_min_tokens",
+        "agent.sandbox",
+        "agent.sandbox_allow_no_isolation",
+        "agent.sandbox_allow_unsandboxed_exec",
+        "agent.member_acp_backend",
+        # The warm pool's agent is `session.pool_agent or agent.default_agent`, and
+        # WarmPoolState.agent is captured once, so the default is a factory input.
+        "agent.default_agent",
+        "session.pool_size",
+        "session.pool_agent",
+        "session.pool_ttl_secs",
+        # The warm pool's cwd is `default_project_dir()`, resolved from these two
+        # and captured into WarmPoolState, so a workspace edit must re-derive the
+        # pool or a cwd-less subagent keeps inheriting the previous directory.
+        "workspaces",
+        "default_workspace",
+    )
+
+    async def _on_config_change(self, change: ConfigChange) -> None:
+        """Hot-apply a ``config.json`` write observed by the config watcher.
+
+        Every writer -- dashboard, ``kirocrew config set``, ``$EDITOR`` -- lands
+        here, so nothing below depends on which one wrote. The new config is
+        adopted as ``_cfg`` unconditionally: the cleanup loop re-reads its idle
+        timeout and RSS ceiling from it every tick, and the soft-stop budget is
+        read from it per stop. A change to a factory-bound default goes through
+        ``refresh_defaults`` so live sessions keep running while new ones spawn
+        on the new defaults. A ``watchdog.*`` or per-crew ``watchdog_*`` change
+        re-clamps the windows on every live handle.
+
+        Fails closed like the owned appliers: while any watched section is
+        degraded the document holds DEFAULTS for it, and adopting those would
+        rebuild the provider factory on the default model and backend and drain
+        the warm pool. The manager keeps what is in force and the watcher retries
+        each tick until the document validates.
+        """
+        if change.new.degraded_sections.intersection(self._CONFIG_SECTIONS):
+            raise live.ConfigDeferred(change.changed)
+        if change.touched(*self._FACTORY_CONFIG_PATHS):
+            await self.refresh_defaults(cfg=change.new)
+        else:
+            async with self._lock:
+                self._cfg = change.new
+        if change.touched("watchdog", "agent.chat_turn_timeout_secs") or any(
+            path.rsplit(".", 1)[-1].startswith("watchdog_") for path in change.under("agents")
+        ):
+            await self._rebind_live_watchdogs(change.new)
+
+    async def _rebind_live_watchdogs(self, cfg: KiroCrewConfig) -> None:
+        """Re-snapshot ``watchdog.*`` on every live session handle.
+
+        New sessions resolve the windows at spawn; a live handle keeps the
+        snapshot it was built with. The rebind runs ``_load_watchdog_settings``
+        again for the handle's own crew identity -- override overlay and
+        prompt-ceiling clamp included -- rather than copying raw values, and it
+        reads the config the watcher already loaded, so nothing touches disk on
+        the loop. The dispatch loop reads the snapshot every tick, so the new
+        windows govern the next check.
+        """
+        async with self._lock:
+            handles = [
+                handle
+                for handle in (_watchdog_handle_of(s.provider) for s in self._sessions.values())
+                if handle is not None
+            ]
+        for handle in handles:
+            try:
+                crew = getattr(handle, "_crew_agent", "") or ""
+                handle.rebind_watchdog(crew, _load_allocation_watchdog_settings(crew, cfg))
+            except Exception:
+                logger.debug("watchdog rebind failed for a live handle", exc_info=True)
+
+    async def refresh_defaults(self, cfg: KiroCrewConfig | None = None) -> None:
+        """Adopt changed defaults for new sessions without touching live sessions.
+
+        ``cfg`` is an already-loaded config (the watcher's); ``None`` loads one
+        off-loop.
+        """
+        await self._lifecycle_boundary().refresh_defaults(cfg)
 
     def _sync_autocompact_pct(self) -> None:
         """Adopt a newly published compaction threshold, if one arrived.
@@ -1659,9 +1806,12 @@ class SessionManager:
             self._adopted_autocompact_pct = published
             self._cfg.session.autocompact_pct = published
 
-    async def reload_provider_factory(self) -> None:
-        """Rebuild the provider factory and retire sessions created by the old one."""
-        await self._lifecycle_boundary().reload_provider_factory()
+    async def reload_provider_factory(self, cfg: KiroCrewConfig | None = None) -> None:
+        """Rebuild the provider factory and retire sessions created by the old one.
+
+        ``cfg`` is the config the live applier already holds; ``None`` loads.
+        """
+        await self._lifecycle_boundary().reload_provider_factory(cfg=cfg)
 
     # ── Background Session ──
 
@@ -1905,10 +2055,6 @@ class SessionManager:
         """Append background and subagent runtime process rows."""
         self._allocation_boundary()._append_companion_runtime_rows(rows)
 
-    def context_info(self) -> list[dict[str, object]]:
-        """Return the dashboard-facing live context snapshot."""
-        return self._allocation_boundary().context_info()
-
     @staticmethod
     def _resolve_agent_model(agent: str) -> str:
         """Resolve model from agent config file. Cached at class level with
@@ -2044,16 +2190,6 @@ class SessionManager:
                 return
         self._compaction.set_autocompact_pct(key, pct)
 
-    def drop_autocompact_overrides_matching(
-        self, exact_keys: set[str], folded_keys: set[str], fold: Callable[[str], str]
-    ) -> int:
-        """Drop threshold overrides for permanently deleted, slotless sessions.
-
-        The slotless complement of ``destroy()``'s override clear — see the
-        coordinator method for the matching contract.
-        """
-        return self._compaction.drop_autocompact_overrides_matching(exact_keys, folded_keys, fold)
-
     async def compact_if_needed(self, key: str) -> str:
         """Delegate awaited between-turn compaction."""
         return await self._compaction.compact_if_needed(key)
@@ -2092,6 +2228,27 @@ class SessionManager:
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the lifecycle recycle callback."""
         self._lifecycle_boundary().set_recycle_callback(cb)
+
+    def set_subagent_probe(self, fn: Callable[[str], bool] | None) -> None:
+        """Install the "does *key* have sub-agent work attached?" predicate.
+
+        The RSS ceiling consults it before recycling an idle session: with
+        session sharing on, a parent's sub-agents run on the parent's runtime
+        after its own turn ends, so the busy semaphore alone cannot see them.
+        ``None`` uninstalls the probe (no dashboard, no children).
+        """
+        self._subagent_probe = fn
+
+    def _has_attached_subagents(self, key: str) -> bool:
+        """Answer the installed sub-agent probe, or False when none is installed.
+
+        A raising probe propagates: the cleanup boundary treats that as
+        "attached" so the session is kept.
+        """
+        probe = self._subagent_probe
+        if probe is None:
+            return False
+        return bool(probe(key))
 
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Delegate the ordered compaction gate ladder."""
@@ -2170,6 +2327,22 @@ class SessionManager:
     async def destroy(self, key: str) -> None:
         """Permanently destroy a session and its persistence entry."""
         await self._lifecycle_boundary().destroy(key)
+
+    async def destroy_if(
+        self,
+        key: str,
+        expected_generation: int,
+        should_destroy: Callable[[], bool],
+        *,
+        preserve_autocompact_override: bool = False,
+    ) -> bool:
+        """Destroy the captured idle generation if its slot guard stays true."""
+        return await self._lifecycle_boundary().destroy_if(
+            key,
+            expected_generation,
+            should_destroy,
+            preserve_autocompact_override=preserve_autocompact_override,
+        )
 
     async def discard_conversation(
         self, key: str, *, replay: bool = True, skip_if_busy: bool = False

@@ -79,6 +79,7 @@ _BASELINE_REDACTORS = frozenset(
         "redact_credentials",
         "redact_exfiltration_urls",
         "redact_and_truncate",
+        "redact_with_findings",
     }
 )
 
@@ -111,16 +112,22 @@ def _is_log_write(call: ast.Call) -> bool:
 
 
 def _wraps_baseline_call(node: ast.AST | None) -> bool:
-    """True when *node* is, or contains, a call to a baseline redactor."""
+    """True when *node* invokes or passes a baseline redactor callback."""
+
     if node is None:
         return False
-    return any(
-        isinstance(sub, ast.Call)
-        and isinstance(sub.func, (ast.Name, ast.Attribute))
-        and (sub.func.id if isinstance(sub.func, ast.Name) else sub.func.attr)
-        in _BASELINE_REDACTORS
-        for sub in ast.walk(node)
-    )
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, (ast.Name, ast.Attribute)):
+            name = sub.func.id if isinstance(sub.func, ast.Name) else sub.func.attr
+            if name in _BASELINE_REDACTORS:
+                return True
+        if isinstance(sub, ast.keyword) and sub.arg == "redactor":
+            value = sub.value
+            if isinstance(value, (ast.Name, ast.Attribute)):
+                name = value.id if isinstance(value, ast.Name) else value.attr
+                if name in _BASELINE_REDACTORS:
+                    return True
+    return False
 
 
 def _scope_body(scope: ast.AST):
@@ -264,7 +271,10 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "dashboard/state.py": 1,
     "knowledge/agent_fetch.py": 1,
     "mcp_cron.py": 1,
-    "mcp_gateway/backend.py": 2,
+    # The pooled-backend daemon never composes a companion context. Its
+    # declared-temp warnings therefore use the baseline pass deliberately.
+    "mcp_gateway/backend.py": 3,
+    "mcp_gateway/gatewayd.py": 1,
     "mcp_tools/knowledge.py": 5,
     "mcp_tools/messaging.py": 1,
     "mcp_tools/skills.py": 2,
@@ -953,7 +963,9 @@ class TestRedactionSinkRegistry:
         pkg = Path(security_posture.__file__).resolve().parent
         # Wrappers that run BOTH scanners internally, so a sink using one is fully
         # covered: StreamRedactor (rolling dual-pass), redact() (the dual-pass
-        # helper), redact_and_truncate() (redact-then-slice, so a credential cannot
+        # helper), redact_with_findings() (the same two passes in the same order,
+        # returning each one's warnings), redact_and_truncate() (redact-then-slice,
+        # so a credential cannot
         # straddle the truncation boundary), redact_via_context() (routes to
         # CredentialPolicy.redact, whose Default delegates to security.redact), and
         # display_safe() (redact_for_display with the exfil+credential redactor,
@@ -961,10 +973,14 @@ class TestRedactionSinkRegistry:
         dual_pass = (
             "StreamRedactor",
             "redact(",
+            "redact_with_findings",
             "redact_tree",
             "redact_and_truncate",
             "redact_via_context",
             "display_safe",
+            # The shared dashboard memory helper recursively runs the exfil
+            # scanner followed by the credential scanner for every text value.
+            "_redact_memory_field(",
             # redact_mcp_error runs redact_exfiltration_urls THEN redact_credentials
             # (mcp_discovery.py) and then scrubs the exact configured header values
             # the generic scanners cannot know about — strictly more than either
@@ -1108,8 +1124,12 @@ class TestGateSideLogRedactorSpelling:
             "def apply(stderr):\n"
             "    logger.error('install failed: %s', redact(stderr.decode()))\n"
         )
+        callback_in_logger = (
+            "def apply(value):\n" "    logger.warning('%s', format_field(value, redactor=redact))\n"
+        )
         assert len(_gate_side_baseline_log_sites(pair_into_audit)) == 1
         assert len(_gate_side_baseline_log_sites(nested_in_logger)) == 1
+        assert len(_gate_side_baseline_log_sites(callback_in_logger)) == 1
 
         converged_pair = (
             "def log_decline(title):\n"

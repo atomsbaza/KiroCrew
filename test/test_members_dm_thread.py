@@ -15,6 +15,7 @@ Covers spec task 2 of the Crew Members page:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -46,6 +47,9 @@ def _fake_config(names, default=CREW):
     return SimpleNamespace(
         agents={name: KiroCrewAgentConfig(kiro_agent=name) for name in names},
         default_agent=default,
+        memory_stores={},
+        workspaces={"default": SimpleNamespace(dir="workspace")},
+        default_workspace="default",
     )
 
 
@@ -322,6 +326,101 @@ class TestMemberRoutes:
         assert slot.mode == DM_SLOT_MODE
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("workspace", ["team-a", "missing"])
+    async def test_thread_create_honors_member_workspace_and_project(
+        self, tmp_path, monkeypatch, private, workspace
+    ):
+        """A new member DM uses the configured workspace for cwd and project guides."""
+        from member_memory_helpers import patch_private_memory_supported
+
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.config.sections import WorkspaceConfig
+        from kiro_crew.memory_stores import provision_member_memory
+
+        team_dir = tmp_path / "team-a-workspace"
+        team_dir.mkdir()
+        cfg = KiroCrewConfig.load()
+        cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW, workspace=workspace)
+        cfg.workspaces["team-a"] = WorkspaceConfig(dir=str(team_dir))
+        cfg.default_workspace = "team-a"
+        if private:
+            patch_private_memory_supported(monkeypatch)
+            await asyncio.to_thread(provision_member_memory, cfg, CREW)
+        await asyncio.to_thread(cfg.save)
+        state = _make_state(tmp_path)
+        frames = []
+        monkeypatch.setattr(state, "_slots_broadcast_lock", None)
+        monkeypatch.setattr(
+            state,
+            "_do_slots_broadcast",
+            lambda: frames.append(
+                [(slot.workspace, slot.project) for slot in state._slots.values()]
+            ),
+        )
+        async with TestClient(TestServer(_make_members_app(state))) as client:
+            resp = await client.post(f"/api/members/{CREW}/thread")
+            assert resp.status == 200, await resp.text()
+            data = await resp.json()
+        slot = state._slots[data["slot_key"]]
+        assert slot.workspace == "team-a"
+        assert slot.project == str(team_dir.resolve())
+        assert frames and frames[0] == [("team-a", str(team_dir.resolve()))]
+        if private:
+            assert slot.memory_store == cfg.agents[CREW].memory_store
+
+    @pytest.mark.asyncio
+    async def test_workspace_resolution_does_not_overwrite_a_concurrent_opener(self, tmp_path):
+        state = _make_state(tmp_path)
+        entered, release = threading.Event(), threading.Event()
+
+        def resolve(workspace):
+            entered.set()
+            assert release.wait(timeout=5)
+            return str(tmp_path / "resolved")
+
+        with (
+            _patched_config([CREW]),
+            patch("kiro_crew.dashboard.handlers.members.default_project_dir", resolve),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                pending = asyncio.create_task(client.post(f"/api/members/{CREW}/thread"))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    slot = state.get_or_create_slot(
+                        member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
+                    )
+                    slot.project = str(tmp_path / "chosen")
+                finally:
+                    release.set()
+                    response = await asyncio.wait_for(pending, timeout=5)
+                assert response.status == 200
+        assert state._slots[member_slot_key(CREW)] is slot
+        assert slot.project == str(tmp_path / "chosen")
+        assert slot.workspace == "chosen"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("project", ["", "chosen-project"])
+    async def test_reopening_live_member_preserves_explicit_project(self, tmp_path, project):
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot(
+            member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
+        )
+        slot.project = project
+        with (
+            _patched_config([CREW]),
+            patch(
+                "kiro_crew.dashboard.handlers.members.default_project_dir",
+                side_effect=AssertionError("existing project was re-resolved"),
+            ),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                response = await client.post(f"/api/members/{CREW}/thread")
+                assert response.status == 200
+        assert slot.workspace == "chosen"
+        assert slot.project == project
+
+    @pytest.mark.asyncio
     async def test_thread_reopen_rehydrates_dormant_history(self, tmp_path):
         """A dormant thread's transcript comes back when the thread reopens.
 
@@ -419,6 +518,26 @@ class TestMemberRoutes:
         assert second["member"] == "Review_Agent"
         bound_rows = [r for r in roster["members"] if r["slot_key"]]
         assert [r["name"] for r in bound_rows] == ["Review_Agent"]
+
+    @pytest.mark.asyncio
+    async def test_colliding_slug_honors_a_binding_naming_the_later_crew(self, tmp_path):
+        """A corroborated binding OUTRANKS config order, it does not tie it.
+
+        Binding the second of two colliding names is the only case where the
+        bound member and the config-order fallback differ, so it is the only
+        case that can observe which of the two the handler picks. Every other
+        binding in this suite names the sole owner, where both answers agree.
+        """
+        state = _make_state(tmp_path)
+        write_dm_binding(
+            "review-agent", member="review-agent", slot_key=member_slot_key("review-agent")
+        )
+        with _patched_config(["Review_Agent", "review-agent"], default="Review_Agent"):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                opened = await (await client.post("/api/members/review-agent/thread")).json()
+        # Config order answers Review_Agent; the binding answers review-agent.
+        assert opened["member"] == "review-agent"
+        assert read_dm_binding("review-agent")["member"] == "review-agent"
 
     @pytest.mark.asyncio
     async def test_app_tokens_are_denied(self, tmp_path):
@@ -563,10 +682,31 @@ class TestPinEnforcement:
                 assert (await resp.json())["code"] == "member_pin_mismatch"
         assert slot.agent == CREW
 
-    def _runner_harness(self, tmp_path, *, mode):
+    def _runner_harness(self, tmp_path, monkeypatch, *, mode, private=True, switch_to=OTHER):
+        from kiro_crew.config.loader import KiroCrewConfig
         from kiro_crew.dashboard.chat_runner import _run_chat
+        from kiro_crew.memory_stores import provision_member_memory
 
-        state = _make_state(tmp_path)
+        cfg = KiroCrewConfig.load()
+        cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent="kirocrew")
+        provision_member_memory(cfg, CREW)
+        cfg.save()
+        # No real provider or embedding process runs in this stream harness.
+        # Keep private ownership and the protected session binding real.
+        monkeypatch.setattr(
+            "kiro_crew.member_memory_auth.private_memory_execution_supported",
+            lambda **kwargs: True,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._maybe_auto_title", AsyncMock())
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.generate_session_summary", AsyncMock())
+        context = SimpleNamespace(
+            ensure_store=AsyncMock(return_value=object()),
+            build_message=lambda text, *args, **kwargs: (text, None),
+            conversation_log=None,
+            hooks=SimpleNamespace(auto_approve_subagent_tools=False),
+        )
+
+        state = _make_state(tmp_path, context_builder=context)
         state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
         state.sessions.release = MagicMock()
         state.sessions.reset = AsyncMock()
@@ -581,7 +721,8 @@ class TestPinEnforcement:
         # Ordinary-mode control runs on an ordinary key: the constructor's
         # member-* reservation (correctly) refuses a bare member key.
         slot_key = "member-code-reviewer" if mode == DM_SLOT_MODE else "chat-1-100"
-        slot = state.get_or_create_slot(slot_key, agent=CREW, mode=mode)
+        agent = CREW if private else "default"
+        slot = state.get_or_create_slot(slot_key, agent=agent, mode=mode)
         slot.append("user", "hello", "msg msg-u")
 
         client = state.sessions.get_or_create.return_value[0]
@@ -595,7 +736,7 @@ class TestPinEnforcement:
         )
 
         async def _stream(msg):
-            yield LLMEvent(kind=EVENT_AGENT_SWITCHED, text=OTHER)
+            yield LLMEvent(kind=EVENT_AGENT_SWITCHED, text=switch_to)
             # Anything after the switch executes as the FOREIGN agent — the
             # veto must stop consumption here, so this text must never land.
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="foreign agent output after switch")
@@ -606,10 +747,17 @@ class TestPinEnforcement:
         return state, slot, _run_chat
 
     @pytest.mark.asyncio
-    async def test_mid_turn_agent_switch_is_vetoed_on_member_threads(self, tmp_path):
-        state, slot, _run_chat = self._runner_harness(tmp_path, mode=DM_SLOT_MODE)
+    @pytest.mark.parametrize("mode", [DM_SLOT_MODE, ""], ids=["member-dm", "ordinary-v2"])
+    @pytest.mark.parametrize("switch_to", [OTHER, CREW], ids=["other-agent", "alias-collision"])
+    async def test_mid_turn_agent_switch_is_vetoed_on_member_threads(
+        self, tmp_path, monkeypatch, mode, switch_to
+    ):
+        state, slot, _run_chat = self._runner_harness(
+            tmp_path, monkeypatch, mode=mode, switch_to=switch_to
+        )
 
         await _run_chat(state, slot, "test message")
+        await asyncio.gather(*state._background_tasks)
 
         # The pin held: agent unchanged, no switch advertised to the UI.
         assert slot.agent == CREW
@@ -644,15 +792,17 @@ class TestPinEnforcement:
         )
 
     @pytest.mark.asyncio
-    async def test_mid_turn_agent_switch_still_lands_on_ordinary_slots(self, tmp_path):
+    async def test_mid_turn_agent_switch_still_lands_on_ordinary_slots(self, tmp_path, monkeypatch):
         """Control for the veto: the same event MOVES a non-member slot.
 
         Proves the event path executes in this harness, so the member test
         above passes because of the veto, not because the event never ran.
         """
-        state, slot, _run_chat = self._runner_harness(tmp_path, mode="")
+        state, slot, _run_chat = self._runner_harness(tmp_path, monkeypatch, mode="", private=False)
+        assert slot.agent == "default"
 
         await _run_chat(state, slot, "test message")
+        await asyncio.gather(*state._background_tasks)
 
         assert slot.agent == OTHER
         switch_broadcasts = [

@@ -28,6 +28,7 @@ from kiro_crew.atomic_write import (
     open_access_control_source,
     pinned_parent_replace_supported,
 )
+from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.cron import referenced_skill_names
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
@@ -48,12 +49,16 @@ from kiro_crew.security import (
 from kiro_crew.sel import sel
 from kiro_crew.skill_usage import SKILL_USAGE_FILENAME, SkillUsageLedger
 from kiro_crew.skills_script_validator import validate_scripts
+from kiro_crew.trigger_match import MIN_TRIGGER_OVERLAP, trigger_score, words_of
 
 logger = logging.getLogger(__name__)
 
 
 SKILLS_DIR_NAME = "skills"
-_MIN_TRIGGER_OVERLAP = 0.7
+#: Re-exported from ``trigger_match``, which owns the value and the grammar
+#: it belongs to. Kept as a module name because tests and call sites here
+#: reference it.
+_MIN_TRIGGER_OVERLAP = MIN_TRIGGER_OVERLAP
 
 # Whether skill CRUD can address the skill directory and its SKILL.md relative to
 # a pinned parent descriptor. supports_pinned_walk covers the openat capability
@@ -1783,19 +1788,21 @@ class SkillsLoader:
         self._audited_projects: set[tuple[str, bool]] = set()
         # Extra skill paths from config (config injectable for testing)
         cfg = config or KiroCrewConfig.load()
-        # Snapshot the per-message trigger cap here so get_triggered_skills (the
-        # only caller, run on EVERY message) doesn't re-load + re-validate the
-        # whole config just to read one int. Matches the eventual-consistency of
-        # _extra_paths below — both are resolved once from the construction-time
-        # config and refreshed when the loader is rebuilt (per gateway).
+        # The per-message trigger cap is resolved at USE from the live snapshot
+        # (see _max_triggered_now), so `kirocrew config set skills.max_triggered`
+        # applies to the next message without rebuilding the loader. The
+        # construction-time value stays as the fallback for a loader built from an
+        # explicitly injected config, before any snapshot exists.
         self._max_triggered = cfg.skills.max_triggered
         self._extra_paths: list[Path] = []
+        self._configured_extra_paths: list[Path] = []
         for p in cfg.skills.extra_paths:
             resolved = Path(p).expanduser().resolve()
             if is_sensitive_path(str(resolved)):
                 logger.warning("Skipping sensitive extra skill path: %s", p)
             elif resolved.is_dir():
                 self._extra_paths.append(resolved)
+                self._configured_extra_paths.append(resolved)
             else:
                 logger.debug("Extra skill path does not exist: %s", p)
 
@@ -1814,6 +1821,7 @@ class SkillsLoader:
             fallback_factory=list,
             log_message="extra_skills lookup failed; using none",
         )
+        self._edition_extra_paths: list[Path] = []
         for edition_path in edition_skill_paths:
             resolved = Path(edition_path).expanduser().resolve()
             if resolved in self._extra_paths:
@@ -1822,6 +1830,7 @@ class SkillsLoader:
                 logger.warning("Skipping sensitive edition skill path: %s", edition_path)
             elif resolved.is_dir():
                 self._extra_paths.append(resolved)
+                self._edition_extra_paths.append(resolved)
             else:
                 logger.debug("Edition skill path does not exist: %s", edition_path)
 
@@ -1838,6 +1847,94 @@ class SkillsLoader:
                 exc_info=True,
             )
             self._usage = None
+        # `skills.extra_paths` is a set of source ROOTS, so it is pushed rather than
+        # read at use: re-resolving every root (a realpath plus a sensitivity check
+        # per entry) on every message is exactly the cost the iter-cache exists to
+        # avoid. `max_triggered` is a single int and IS read at use, so it needs no
+        # subscription. Held on self because the watcher keeps a bound method weakly.
+        self._config_sub = live.subscribe(
+            "skills.extra_paths", callback=self._on_config_change, name="SkillsLoader"
+        )
+
+    async def _on_config_change(self, change: "live.ConfigChange") -> None:
+        # The screening stats every configured root (resolve + is_dir), and a root
+        # on a slow or network mount would stall the loop, so it runs off-loop;
+        # only the adoption of the screened list happens here.
+        screened = await asyncio.to_thread(self._screen_extra_paths, change.new)
+        self._adopt_extra_paths(screened)
+
+    def reconfigure(self, cfg: KiroCrewConfig) -> None:
+        """Re-resolve the configured extra skill roots from *cfg* (synchronously).
+
+        The watcher path splits this into :meth:`_screen_extra_paths` off the loop
+        and :meth:`_adopt_extra_paths` on it; this method is the one-call form for
+        a caller that is not on the event loop.
+        """
+        self._adopt_extra_paths(self._screen_extra_paths(cfg))
+
+    @staticmethod
+    def _screen_extra_paths(cfg: KiroCrewConfig) -> list[Path]:
+        """Resolve and screen ``skills.extra_paths`` -- filesystem work, no state.
+
+        Runs the SAME screening as construction -- expanduser, resolve,
+        ``is_sensitive_path`` reject, existence check -- so a root added by hand to
+        ``config.json`` can no more reach a credential directory than one present at
+        boot. Fails closed per entry: a rejected or missing root is dropped with the
+        same log line rather than admitted.
+        """
+        resolved_paths: list[Path] = []
+        # Logged by position, not value: a rejected entry is by definition a path
+        # under a credential home, and a reloaded config is an untrusted document,
+        # so the string itself never reaches the log.
+        for index, p in enumerate(cfg.skills.extra_paths):
+            resolved = Path(p).expanduser().resolve()
+            if is_sensitive_path(str(resolved)):
+                logger.warning("Skipping sensitive skills.extra_paths[%d] on reload", index)
+            elif resolved.is_dir():
+                resolved_paths.append(resolved)
+            else:
+                logger.debug("skills.extra_paths[%d] does not exist; skipped on reload", index)
+        return resolved_paths
+
+    def _adopt_extra_paths(self, resolved_paths: list[Path]) -> None:
+        """Install screened roots.
+
+        Edition-contributed roots are preserved and stay LAST (lowest precedence);
+        they come from the platform context, not config, so a config write must not
+        drop them. The discovery cache is cleared so the next listing walks the new
+        roots instead of serving the old set for the rest of the TTL.
+        """
+        self._configured_extra_paths = resolved_paths
+        merged = list(resolved_paths)
+        for edition_path in self._edition_extra_paths:
+            if edition_path not in merged:
+                merged.append(edition_path)
+        self._extra_paths = merged
+        self._iter_cache.clear()
+
+    def _max_triggered_now(self) -> int:
+        """The per-message trigger cap, read live.
+
+        Read from the watcher's snapshot rather than the boot copy, so
+        ``kirocrew config set skills.max_triggered`` applies to the very next
+        message from any writer. The snapshot is a plain attribute read, which is
+        what keeps this off the disk on a path that runs once per message --
+        loading here would put two stats and a deepcopy in front of every message.
+
+        Falls back to the construction-time value when there is no snapshot: a
+        loader built from an explicitly injected config (tests, and any caller that
+        already holds one) must honour that config rather than resolve a cap the
+        injected document never carried, and the absent-key default is 0, which
+        would suppress every skill.
+        """
+        cfg = live.snapshot()
+        if cfg is None:
+            return self._max_triggered
+        try:
+            return int(cfg.skills.max_triggered)
+        except (AttributeError, TypeError, ValueError):
+            logger.debug("skills.max_triggered read failed; using boot value", exc_info=True)
+            return self._max_triggered
 
     def _trusted_project_key(self, project_dir: str | Path | None) -> str:
         """Canonical key of *project_dir* when its skills may load, else ``""``.
@@ -4651,7 +4748,7 @@ class SkillsLoader:
 
         Returns up to ``max_triggered`` skills sorted by best overlap score.
         """
-        text_words = set(re.findall(r"\w+", text.lower()))
+        text_words = words_of(text)
         scored: list[tuple[str, float]] = []
         # Skills a negative trigger actively excluded — a permission DENY that
         # must still be audited (see the audit event below).
@@ -4672,29 +4769,12 @@ class SkillsLoader:
             if scope and not self._repo_scope_satisfied(scope, project_dir):
                 continue
 
-            # Split into positive and negative triggers
-            negated = False
-            best_overlap = 0.0
-            for trigger in triggers.split(","):
-                trigger = trigger.strip().lower()
-                if not trigger:
-                    continue
-                # Negative trigger: "!search" excludes if "search" words match.
-                # Don't break — keep scoring the remaining positive triggers so
-                # best_overlap is correct regardless of trigger order; the DENY
-                # audit below needs it to know the skill would otherwise have
-                # triggered (e.g. "!test, shorten url" must still compute the
-                # "shorten url" overlap).
-                if trigger.startswith("!"):
-                    neg_words = set(re.findall(r"\w+", trigger[1:]))
-                    if neg_words and neg_words <= text_words:
-                        negated = True
-                else:
-                    trigger_words = set(re.findall(r"\w+", trigger))
-                    if not trigger_words:
-                        continue
-                    overlap = len(trigger_words & text_words) / len(trigger_words)
-                    best_overlap = max(best_overlap, overlap)
+            # Scored by the shared primitive, not here: crew routing scores the
+            # same trigger grammar, and two implementations would agree on the
+            # easy cases and diverge on the ones that matter. `negated` stays
+            # separate from the score because the DENY audit below has to tell
+            # "scored nothing" apart from "scored well and was vetoed".
+            best_overlap, negated = trigger_score(triggers, text_words)
 
             # Only record a negation as a DENY when the skill would otherwise
             # have triggered (positive overlap met the threshold) — that's the
@@ -4705,7 +4785,7 @@ class SkillsLoader:
                 scored.append((name, best_overlap))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        triggered = [name for name, _ in scored[: self._max_triggered]]
+        triggered = [name for name, _ in scored[: self._max_triggered_now()]]
 
         # Emit ONE audit event for the matched + denied sets rather than one per
         # skill. A SEL entry per skill (incl. every non-match) on every message

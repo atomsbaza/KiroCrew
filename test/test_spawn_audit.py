@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -120,9 +121,19 @@ _SPAWN_ATTRS = {
     "create_subprocess_exec",
     "create_subprocess_shell",
 }
-# Only calls whose receiver is one of these modules count (excludes e.g.
-# ``proc.communicate`` or ``pool.run``).
-_SPAWN_BASES = {"subprocess", "asyncio"}
+# The modules whose attributes actually spawn a child. Only calls whose receiver
+# resolves to one of these count, which excludes e.g. ``proc.communicate`` or
+# ``pool.run``.
+#
+# These are the CANONICAL names. The receiver a call site actually spells is
+# whatever that file bound the module to, so it is derived per file by
+# :func:`_spawn_module_bindings` rather than enumerated here. Naming aliases in a
+# literal set is what made this audit blind: ``acp/client.py`` imports
+# ``subprocess as subprocess_mod`` and five spawns in it were invisible, while
+# ``sp``, ``_sp`` and ``_asyncio`` were live aliases in other scanned files at the
+# same time. A scanner that has to be TOLD each alias is a scanner that is blind by
+# default, and its greenness says nothing.
+_SPAWN_MODULES = {"subprocess", "asyncio"}
 
 # Spawn helpers called as a BARE NAME rather than ``module.attr`` -- they are
 # imported directly, so the receiver check above cannot see them. Without this
@@ -213,6 +224,65 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
+        # Eight pre-existing spawns in one app's own test module, invisible to this
+        # audit until receivers were derived from each file's imports: they are
+        # reached through a function-local ``import subprocess as sp``. Every one is
+        # a fixed ``git`` argv (``init``, ``config``, ``add``, ``commit``,
+        # ``worktree add``, ``rev-parse``) against a repository the test just created
+        # under ``tmp_path``; nothing is agent-influenced and no shell is used. They
+        # are tests of the dogfood spine's own refusals -- a planted pre-commit hook,
+        # a planted clean filter, a repointed worktree gitdir -- so the git repo IS
+        # the fixture, and routing them through the agent sandbox would sandbox the
+        # fixture rather than the thing under test. Same class as the Ops Mission
+        # Control ledger-sync tests below.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_a_planted_clean_filter_does_not_run",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_a_planted_clean_filter_does_not_run_in_a_linked_worktree",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_a_planted_pre_commit_hook_does_not_run",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_a_repointed_worktree_gitdir_is_refused",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_clone_setup_checkout_pins_the_attributes",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_red_base_staging_does_not_dereference_a_credential_symlink",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_the_pin_refuses_a_symlink_and_fails_closed",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_the_pin_survives_a_normal_repo",
+        # Four pre-existing spawns in ``acp/client.py`` that the scan could not see
+        # until receivers were derived from each file's imports (it binds the module
+        # as ``subprocess_mod``). None is
+        # agent-influenced and each is a fixed argv with a bounded timeout and no
+        # shell: ``mise which <tool>`` where the tool is a module-level binary-name
+        # constant; ``pgrep -P <pid>``, ``ps -o lstart= -p <pid>`` and
+        # ``ps -o comm= -p <pid>``, all against a pid this core is already managing,
+        # with ``ps`` resolved through ``platform_compat.trusted_system_bin`` rather
+        # than PATH. They are listed rather than routed for the same reason the rest
+        # of this group is: they are how process management and toolchain discovery
+        # observe the machine, and the sandbox they would route through is a thing
+        # they run underneath.
+        "acp/client.py::_mise_which",
+        "acp/client.py::_direct_children",
+        "acp/client.py::_get_start_time",
+        "acp/client.py::_read_basename",
+        # The opencode routing read-back. ONE fixed argv -- the resolved harness
+        # binary plus the two literal words in ``_OPENCODE_CONFIG_READBACK_ARGS``
+        # (``debug config``) -- with no shell, a 30s timeout, and a cwd that is the
+        # session work dir rather than anything the agent names in a turn. The only
+        # variable input is the child's ``OPENCODE_CONFIG_CONTENT``, which this core
+        # composes from its own permission-setting table (see
+        # ``AcpClient._opencode_routing_config``); the agent supplies nothing to it.
+        # Stdout is read and nothing else: the JSON document is parsed for one key,
+        # the harness's resolved ``permission``, which decides whether the session
+        # may start at all.
+        #
+        # It is SANDBOX-WRAPPED before it is spawned: the caller runs the floor
+        # check first, then hands this function an argv already through
+        # ``wrap_argv_async`` with the same ``extra_hidden_dirs`` credential mask the
+        # session spawn gets. That matters because the child is the harness's own
+        # binary resolving config out of the work dir, which can load a project's
+        # plugins -- unwrapped, it would read the credential homes the mask exists to
+        # deny it. It is listed here rather than routed through
+        # ``sandboxed_spawn_argv`` because that wrapper is for agent-INFLUENCED argv,
+        # and nothing about this one comes from a turn.
+        # Called from a worker thread, never the event loop --
+        # ``test_the_routing_read_back_runs_off_the_event_loop`` in
+        # ``test/test_acp_opencode_backend.py`` pins that.
+        "acp/client.py::_verify_opencode_routing",
         # The shadow-venv update engine's four spawns. None is agent-influenced
         # and none can route through sandboxed_spawn_argv, because the engine's
         # whole job is to build the NEXT gateway install outside the agent
@@ -798,6 +868,17 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "dep_sync.py::_probe_interpreter",
         "dep_sync.py::sync",
         "dep_sync.py::sync_or_reinstall",
+        # _git_blob_text is the pre-mutation interpreter-floor gate's one read:
+        # `<git> show <ref>:<fixed filename>` (pyproject.toml / setup.cfg) in the
+        # operator-configured checkout, so an update can refuse a revision the
+        # venv cannot import BEFORE the pull/reset moves the tree to it. Nothing
+        # in the argv is agent-influenced: the ref is either the literal `@{u}`
+        # or the OID the auto-apply already resolved and is about to reset to,
+        # the filenames are fixed, and the git binary is whatever the calling
+        # update path already uses for its own pull/reset (the trusted pinned
+        # binary on the unattended path). Same read shape and grounds as
+        # npm_preflight._extract above.
+        "dep_sync.py::_git_blob_text",
         # npm_preflight is the sync's pre-merge installability probe, and like
         # dep_sync it runs AS one of the sync steps -- which server.py already
         # wrapped through sandboxed_spawn_argv before handing it to the runner.
@@ -891,10 +972,21 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # ``view.py::stop`` spawns nothing: it reaps its own child's process
         # group rather than issuing a global ``show --kill``, which would take
         # an operator's independent session down with ours.
+        #   * ``launcher.py::_run_cli`` runs ``playwright-cli --json list`` and ``-s=panel-<8hex>
+        #     goto|open <url>`` (and ``close`` at shutdown) for the Browser
+        #     panel's address bar. The ONE free argv element is a URL the
+        #     dashboard OWNER typed: the route is owner-only, refuses
+        #     internal-secret (agent) callers, and ``validate_url`` admits only
+        #     http(s) with a host and no credentials before it reaches argv.
+        #     The session name is hex derived from the slot key. Not sandboxed
+        #     for the same reason ``show`` is not: the CLI launches the
+        #     operator's real browser daemon, which needs the real cache and
+        #     network, and the human at the dashboard is the approval.
         # The agent's OWN browser commands are not spawned by us at all -- it
         # runs them as ordinary shell tool calls through the standard approval
         # path.
         "browser_cli/install.py::_run",
+        "browser_cli/launcher.py::_run_cli",
         "browser_cli/view.py::_spawn",
         "cli.py::_consolidate_cmd",
         "cli.py::_ensure_node",
@@ -969,6 +1061,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # fetch, no mutation. Same classification as the other fixed-argv
         # doctor probes (``_detect_userspace_oom_killer``, ``_detect_linger``).
         "cli_doctor.py::_git_line",
+        # Read-only system-metrics probe for the Memory section on macOS, where
+        # the ``platform_compat`` shim has no ctypes-only per-pid RSS path:
+        # ``ps -o rss= -p <pid>`` with a hardcoded argv whose only variable is
+        # the gateway pid read from our own lock file (never agent-supplied).
+        # The binary is pinned via ``platform_compat.trusted_system_bin("ps")``;
+        # a miss means no spawn at all. Operator-invoked doctor, 2s-capped, no
+        # shell. Same classification as the ``ps``-based probe in
+        # ``acp/runtime.py::_get_rss_mb``.
+        "cli_doctor.py::_gateway_rss_bytes",
         # ``<kiro-cli> acp --help`` readiness probe for the KAS backend: fixed
         # argv (subcommand and flag are module constants), 15s-capped, no shell,
         # no agent-influenced arguments, and no credential involved — it reads
@@ -1246,6 +1347,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "platform_compat.py::open_with_default_app",
         "platform_compat.py::_posix_process_parent_map",
         "platform_compat.py::find_port_listeners",
+        # Read-only kernel socket attribution: trusted absolute lsof binary,
+        # fixed flags and a validated numeric port, no shell/user command.
+        "platform_compat.py::_macos_tcp_peer_pid",
         "platform_compat.py::find_python_interpreter",
         "platform_compat.py::kill_pid",
         "platform_compat.py::kill_process_tree",
@@ -1285,6 +1389,28 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "pod/runtime.py::_git_worktrees",
         "pod/runtime.py::_run",
         "pod/runtime.py::recent_journal",
+        # Task Scheduler twin of launchctl above: the single chokepoint for
+        # `schtasks.exe /<verb> /TN KiroCrewPod-<name> ...`. Argv is a fixed verb
+        # set plus a task name built from a validate_name-checked pod name and a
+        # script path under the pod dir. `schtasks()` routes through it, and the
+        # gate's own create-and-delete probe of a throwaway task calls it
+        # directly. Not agent-influenced.
+        "pod/windows.py::_schtasks_raw",
+        # The refusal report's process description: `tasklist /FI "PID eq <n>"
+        # /NH /FO CSV`, one call per pid, best-effort and its output only ever
+        # rendered into a message. Every argument is fixed except the pid, which
+        # is an integer this module read from the OS parent map -- never a caller
+        # value, let alone an agent one -- and the binary comes from
+        # `trusted_system_bin`, not from PATH. Not agent-influenced.
+        "pod/windows.py::_describe_processes",
+        # The pod's own gateway. On Linux and macOS the service manager execs
+        # it; Windows has no exec, so the task's wrapper spawns
+        # `<python> -m kiro_crew gateway ...` itself and supervises it. Argv is
+        # the interpreter plus a fixed module and flags from the pod's config,
+        # created CREATE_SUSPENDED so the Job object ceiling is applied before
+        # the first instruction. It IS the product, not an agent subprocess; the
+        # agent-facing spawns inside it go through the normal chokepoints.
+        "pod/windows.py::supervise_gateway",
         "sandbox.py::_probe_sandbox_exec",
         "sandbox.py::_ssh_supports_accept_new",
         # The aggregate slice-ceiling apply: `systemctl --user set-property
@@ -1468,6 +1594,33 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Fixed argv + trusted-directory binary + read-only output ⇒ benign, not
         # routed.
         "voice_reply.py::list_system_voices",
+        # TEST-ONLY, and the spawn IS the thing under test: the crew bundle
+        # curator's contract (PACKAGING-CONTRACT T1) is a COMMAND -- `python -m
+        # packaging.build ... ` printing `SMC_BUNDLE_JSON=<path>` as its last
+        # stdout line -- and the deploy driver invokes it exactly that way. An
+        # in-process call would prove the function works and leave the contract
+        # the driver actually depends on untested. Fixed argv (`sys.executable
+        # -m packaging.build`), no shell=True, cwd is the crew root (which is the
+        # driver's own cwd, and what makes this tree's `packaging` win over the
+        # PyPA distribution for that child), and every path argument is a
+        # tmp_path. Nothing here is agent-derived.
+        "apps/builtins/aws_control/crew/packaging/tests/test_producer.py"
+        "::test_cli_build_prints_bundle_json_last_line",
+        "apps/builtins/aws_control/crew/packaging/tests/test_producer.py"
+        "::test_cli_plan_writes_template_without_bundle",
+        # TEST-ONLY, and the spawn is the same fixed `sys.executable -m
+        # packaging.build` CLI invocation as its two siblings above — this one
+        # proves the COLD-CACHE property that the child writes no __pycache__
+        # beside the module it imports (nor into the real checkout). No
+        # shell=True; cwd is the test's own tmp_path; the module is made
+        # importable through PYTHONPATH pointing at a `tmp_path` copy of the
+        # package plus CREW_ROOT (via `_child_env`), and every path argument
+        # (--out, --source, the copy root) is a tmp_path. Nothing here is
+        # agent-derived. Sandbox-routing would defeat the test: it exists to
+        # observe where a real interpreter drops bytecode on a real cold cache,
+        # which a scrubbed-env/filesystem-scoped wrapper would move or forbid.
+        "apps/builtins/aws_control/crew/packaging/tests/test_producer.py"
+        "::test_cli_subprocess_leaves_no_pycache_in_the_source_tree",
     }
 )
 
@@ -1597,6 +1750,72 @@ def test_first_party_allowlist_has_no_stale_entries():
     )
 
 
+def _spawn_module_bindings(tree: ast.Module) -> set[str]:
+    """Every local name in one file that refers to a spawn-capable module.
+
+    Reads the file's OWN import statements -- including function-local ones, which
+    is where an alias most often hides -- so a receiver is recognized by what it
+    BINDS rather than by what it happens to be called. ``import subprocess`` binds
+    ``subprocess``; ``import subprocess as sp`` binds ``sp``; ``from concurrent
+    import futures`` binds neither.
+
+    The canonical names are always included, so a file that imports nothing under an
+    alias is scanned exactly as before.
+    """
+    bound = set(_SPAWN_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            # ``from x import subprocess as y`` is rare but binds a name that
+            # spawns, and skipping it would leave the same shape of hole this
+            # function exists to close.
+            for alias in node.names:
+                if alias.name in _SPAWN_MODULES:
+                    bound.add(alias.asname or alias.name)
+    return bound
+
+
+def test_a_spawn_module_alias_is_derived_not_enumerated() -> None:
+    """The scanner must recognize a receiver it has never been told about.
+
+    This is the general form of a hole this audit shipped with: it matched receivers
+    against a hardcoded name set, so ``import subprocess as subprocess_mod`` hid five
+    spawns in ``acp/client.py`` and a function-local ``import subprocess as sp`` hid
+    eight more in an app's test module -- while the audit stayed green, because it was
+    not finding them and accepting them, it was not finding them at all.
+
+    Naming each alias as it is discovered cannot fix that: the next alias is invisible
+    again. So bindings are derived from each file's own imports, and this pins that a
+    NAME nobody has ever written down is still recognized.
+    """
+    tree = ast.parse(textwrap.dedent("""
+            import asyncio as _never_seen_before
+            import subprocess as _also_novel
+
+            def f():
+                import subprocess as _function_local
+
+                _function_local.run(["true"])
+            """))
+    bound = _spawn_module_bindings(tree)
+    assert {"_never_seen_before", "_also_novel", "_function_local"} <= bound
+    assert _SPAWN_MODULES <= bound, "the canonical names must always be recognized"
+
+
+def test_an_unrelated_import_binds_no_spawn_receiver() -> None:
+    """Derivation must not widen the scan to modules that do not spawn.
+
+    A receiver set that grew on every import would flag ``pool.run`` and
+    ``proc.communicate``, and an audit that cries wolf gets its findings dismissed.
+    """
+    tree = ast.parse(textwrap.dedent("""
+            import json as subprocess_lookalike
+            from concurrent import futures as pool
+            """))
+    bound = _spawn_module_bindings(tree)
+    assert "subprocess_lookalike" not in bound
+    assert "pool" not in bound
+
+
 @functools.lru_cache(maxsize=1)
 def _collect_spawn_functions() -> dict[str, str]:
     """Map ``<relpath>::<func>`` -> the enclosing function's source, for every
@@ -1622,6 +1841,7 @@ def _collect_spawn_functions() -> dict[str, str]:
         if _is_bundled_skill_asset(path):
             continue
         tree = ast.parse(source, str(path))
+        spawn_bases = _spawn_module_bindings(tree)
         funcs = [
             n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
@@ -1643,7 +1863,7 @@ def _collect_spawn_functions() -> dict[str, str]:
                         if isinstance(base, ast.Name)
                         else base.attr if isinstance(base, ast.Attribute) else ""
                     )
-                    if base_name not in _SPAWN_BASES:
+                    if base_name not in spawn_bases:
                         continue
                 else:
                     continue

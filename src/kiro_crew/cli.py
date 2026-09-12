@@ -264,7 +264,24 @@ def _project_dir_file() -> Path:
 
 
 def _ensure_node(proj_dir: str = "") -> bool:
-    """Run ensure-node.sh to guarantee a supported Node. Returns True if node is OK."""
+    """Run ensure-node.sh to guarantee a supported Node. Returns True if node is OK.
+
+    Skipped on Windows, where it is not merely unhelpful but actively harmful.
+    ``ensure-node.sh`` is a POSIX shell script and the repo ships no Windows
+    equivalent, so the spawn resolves ``bash`` through ``PATH`` -- and on Windows
+    ``C:\\Windows\\System32\\bash.exe`` is WSL's launcher, so the call prints a
+    UTF-16 "Windows Subsystem for Linux has no installed distributions" banner into
+    whatever stdout it inherited and installs nothing. A pod gateway inherits its
+    wrapper's redirected stdout, so that banner lands in the pod's own log and
+    reads as pod output. ``env.ensure_node`` already returns None here for the same
+    reason; this is the second caller of the same script.
+
+    A Windows host gets its Node from the platform installer or a version manager,
+    which ``_node_ok`` already sees, so returning that answer is the whole
+    behaviour rather than a degraded one.
+    """
+    if platform_compat.IS_WINDOWS:
+        return _node_ok()
     script = None
     env_dir = os.environ.get("KIROCREW_PROJECT_DIR")
     for candidate in [
@@ -295,7 +312,16 @@ def _node_ok() -> bool:
         return False
     try:
         node_ver = subprocess.run(
-            ["node", "-v"],
+            # The RESOLVED path, not the bare name. ``shutil.which`` is PATHEXT-aware
+            # and can answer ``node.CMD`` on Windows (nvm-windows, volta and corepack
+            # all install shims), while ``CreateProcess`` extends a bare name with
+            # ``.exe`` only -- so on such a host spawning "node" raises
+            # ``FileNotFoundError`` and this returns False while node works. A host
+            # whose node resolves to ``node.EXE`` is unaffected either way, which is
+            # why the bug is invisible on most machines and total on some. Harmless
+            # on POSIX, where the resolved path is what the bare name would have
+            # found anyway.
+            [node, "-v"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1003,7 +1029,17 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     else:
         level = logging.WARNING
 
-    log_file = config_dir() / "gateway.log"
+    from kiro_crew.config.paths import private_runtime_log_dir
+
+    log_home = config_dir()
+    private_logs = private_runtime_log_dir()
+    if private_logs is not None:
+        # A private namespace deliberately seals loose data-home files. Keep
+        # durable rotating logs in the live directory prepared by its launcher;
+        # never reopen the root or silently drop MCP diagnostics.
+        log_file = private_logs / f"member-{os.getpid()}.log"
+    else:
+        log_file = log_home / "gateway.log"
     # Detect BEFORE the boot rotation below: rotation renames the file, and
     # the inode comparison must see the file stderr actually inherited.
     detached = _fd_targets_file(2, log_file)
@@ -2532,6 +2568,71 @@ Examples:
         help="Also include the markdown layer (preferences, projects, daily history)",
     )
     mem_sub.add_parser("migrate", help="Migrate legacy markdown memory to vector store")
+    mem_backup = mem_sub.add_parser("backup", help="Back up active memory stores now")
+    mem_backup.add_argument(
+        "--keep", type=int, default=None, help="How many backups to keep per store"
+    )
+    mem_backups = mem_sub.add_parser("backups", help="List memory backups, newest first")
+    mem_backups.add_argument("--store", default=None, help="Only this store")
+    mem_restore = mem_sub.add_parser("restore", help="Restore a memory store from a backup")
+    mem_restore.add_argument(
+        "--store", default=None, help="Store to restore (default: the default store)"
+    )
+    mem_restore_choice = mem_restore.add_mutually_exclusive_group()
+    mem_restore_choice.add_argument(
+        "--from",
+        dest="from_backup",
+        default=None,
+        help="Backup file to restore (default: the newest for that store)",
+    )
+    mem_restore_choice.add_argument(
+        "--cancel-pending",
+        action="store_true",
+        help="Cancel a staged memory restore without changing active memory",
+    )
+    mem_carve = mem_sub.add_parser(
+        "carve", help="Filter or count a crew store's memory by its carve facets"
+    )
+    mem_carve.add_argument(
+        "--store",
+        default=None,
+        help="Memory store to read (default: the default store, which carries no facets)",
+    )
+    # One flag per field of memory_schema.MemoryFacets, and each argparse dest IS the
+    # column name, so `_memory_carve` reads them by facet name instead of restating the
+    # list. The flag spellings and the two closed choice sets are LITERAL here rather
+    # than derived from memory_schema: this parser is built on `kirocrew gateway`'s
+    # boot path, where an import of the schema module is work every launch pays for
+    # a verb it never runs. Drift is caught instead, not prevented -- the rendered
+    # `memory carve --help` is checked against memory_schema.ALL_KINDS and
+    # GROUPABLE_COLUMNS, so a sixth axis added to the dataclass without a flag or a
+    # choice here fails that check rather than silently going unfilterable.
+    mem_carve.add_argument("--scope", default=None, help="Only rows carved to this repo scope")
+    mem_carve.add_argument("--surface", default=None, help="Only rows from this surface")
+    mem_carve.add_argument("--crew", default=None, help="Only rows this crew produced")
+    mem_carve.add_argument("--session-key", default=None, help="Only rows from this conversation")
+    mem_carve.add_argument(
+        "--derived-from", default=None, help="Only rows synthesized from this item id"
+    )
+    mem_carve.add_argument(
+        "--kind",
+        default=None,
+        choices=["directive", "fact", "episode"],
+        help="Only rows of this kind",
+    )
+    mem_carve.add_argument(
+        "--count-by",
+        default=None,
+        choices=["scope", "surface", "crew", "session_key", "derived_from", "kind"],
+        help="Report counts grouped by this axis instead of listing rows",
+    )
+    mem_carve.add_argument("--limit", type=int, default=50, help="How many rows to list")
+    mem_carve.add_argument("--offset", type=int, default=0, help="Rows to skip when listing")
+    mem_retired = mem_sub.add_parser(
+        "retired", help="List episodes a semantic write superseded, and restore one"
+    )
+    mem_retired.add_argument("--restore", dest="restore_id", default=None, help="Restore this id")
+    mem_retired.add_argument("--limit", type=int, default=20, help="How many to list")
     mem_import = mem_sub.add_parser("import", help="Import memory from JSON file")
     mem_import.add_argument("file", help="Path to JSON file (export format)")
 
@@ -2543,12 +2644,23 @@ Examples:
     agent_create.add_argument("--name", required=True, help="Agent name")
     agent_create.add_argument("--kiro-agent", default="kirocrew", help="Kiro agent name")
     agent_create.add_argument("--workspace", default="default", help="Workspace name")
-    agent_create.add_argument("--memory-store", default="default", help="Memory store name")
+    agent_create.add_argument(
+        "--memory-store",
+        default="default",
+        help="Compatibility flag; private memory is allocated automatically",
+    )
     agent_update = agent_sub.add_parser("update", help="Update a Kiro Crew agent")
     agent_update.add_argument("name", help="Agent name to update")
     agent_update.add_argument("--kiro-agent", help="New kiro agent name")
     agent_update.add_argument("--workspace", help="New workspace name")
-    agent_update.add_argument("--memory-store", help="New memory store name")
+    agent_update.add_argument(
+        "--memory-store", help="Existing memory store identity (cannot be changed)"
+    )
+    agent_update.add_argument(
+        "--provision-memory",
+        action="store_true",
+        help="Initialize empty private V2 memory for a legacy member; never copies V1",
+    )
     agent_delete = agent_sub.add_parser("delete", help="Delete a Kiro Crew agent")
     agent_delete.add_argument("name", help="Agent name to delete")
     agent_reset_model = agent_sub.add_parser(

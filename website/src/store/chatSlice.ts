@@ -1,5 +1,6 @@
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
 import { whenScrollQuiet } from '../lib/scrollQuiet'
+import { emitSlotRead } from '../lib/slotReadRelay'
 import { api } from '../api/client'
 import { resolveDefaultMemoryMode } from '../api/queryClient'
 import { devLog, inspectorOn } from '../dev/scrollInspector'
@@ -24,6 +25,8 @@ import { secureRandomId } from '../utils/secureId'
 import { mergeIntoDraft } from '../utils/chatDrafts'
 import { isRejectedDecision } from '../utils/approvalDecision'
 import { automationForSlot, type AutomationRecord } from '../monitoring/automation'
+import { findReport, parseErrorCode } from '../utils/errorReport'
+import type { HistoryDeleteRefusal } from '../utils/historyDeleteRefusal'
 
 const SKIP_ROLES = new Set(['chunk', 'done'])
 const filterMessages = (msgs: ChatMessage[]) => msgs.filter(m => !SKIP_ROLES.has(m.role))
@@ -195,34 +198,39 @@ function reconcileOptimisticEcho(
 
 /** Frame roles that retire a slot's pending STATELESS question card.
  *
- *  Deliberately NARROWER than "every role that starts a turn". The card's
- *  contract is "the user's answer arrives as the next message", and the roles
- *  here are the ones where that answer channel is genuinely gone:
+ *  Exactly one role, `user`, and the narrowness is the whole rule. The card's
+ *  contract is "the user's answer arrives as the next message", so the only
+ *  frame that consumes that channel is one the HUMAN sent: they answered in the
+ *  composer, or said something else, and either way spent their next message.
  *
- *  - `user` — the human spoke (composer answer, or something else entirely);
- *    either way the next-message channel was consumed by its owner.
- *  - `nudge` — an auto-nudge cycle deliberately moved the session on past the
- *    question; the loop's instruction, not the answer, became the next turn.
+ *  `nudge` was in this set (PR #2131) on the theory that an auto-nudge cycle
+ *  moves the session past the question. It does not consume the answer channel:
+ *  a nudge wakes the SAME agent in the SAME conversation, so a message the user
+ *  sends ten cycles later still lands on the agent that asked. Retiring on it
+ *  deleted the user's only affordance for a question nobody had answered —
+ *  observed on a monitored conductor session, where the card was gone by the
+ *  time the user came back to it, and the server record went with it so a reload
+ *  had nothing to rehydrate. An unanswered card now stays until it is answered
+ *  or explicitly DISMISSED; dismissal is a server round-trip that retires the
+ *  record too, and it is the control that keeps a genuinely stale card from
+ *  lingering — the auto-retire was covering for a control that now exists.
  *
  *  `inject` (cron notifications, recovery resumes) and `subagent` (completion
- *  events) also start turns, but they interleave with a question the agent may
- *  STILL be waiting on: an agent that spawns work, asks the user a question,
- *  and ends its turn will absorb completion events while the question remains
- *  genuinely open — clearing the card on those frames would delete the user's
- *  only UI for answering a live question. If a session moves on for real, its
- *  next user/nudge frame still retires the card. Extending coverage is a data
- *  edit here, not a code change (per Design Review on PR #2131). */
-const QUESTION_RETIRING_ROLES = new Set(['user', 'nudge'])
+ *  events) also start turns and are out for the same reason they always were:
+ *  they interleave with a question the agent may STILL be waiting on. Extending
+ *  coverage is a data edit here, not a code change (per Design Review on PR
+ *  #2131), and the backend's `_QUESTION_RETIRING_ROLES` must be edited with it
+ *  (parity is pinned by test_slot_needs_input_status.py). */
+const QUESTION_RETIRING_ROLES = new Set(['user'])
 
-/** Drop a slot's pending STATELESS question card (no ``ask_id``) when a
- *  turn-consuming frame lands on that slot.
+/** Drop a slot's pending STATELESS question card (no ``ask_id``) when the user's
+ *  own frame lands on that slot.
  *
  *  A stateless card's contract is "the user's answer arrives as the next
  *  message" (the agent ended its turn on it — `post_question_card`, no
- *  server-side wait). So the frame that STARTS the slot's next turn consumes
- *  the card's answer channel and makes it stale. Without this, a monitored
- *  session that asked a question and was then nudged onward parks the card
- *  above the composer FOREVER — it invites an answer no turn is waiting for.
+ *  server-side wait). A `user` row IS that next message, so the card it was
+ *  waiting for has arrived and the card is spent. Nothing else retires it —
+ *  see `QUESTION_RETIRING_ROLES` for why a nudge does not.
  *
  *  Server-owned cards (with `ask_id`) are exempt: their lifecycle is the
  *  `question_card_resolved` broadcast (answered / timed out / cancelled /
@@ -808,6 +816,14 @@ interface ChatState {
    *  sequence ref, which could only order ITS OWN clicks -- a palette resume
    *  racing a sidebar resume was unordered before. */
   lastResumeRequestId: string | null
+  /** A history delete the gateway REFUSED (409 with a `code`), sibling of
+   *  `unresumableResume` above and rendered at the same site. The row is still
+   *  in `history` -- nothing was deleted -- so without this the click looked
+   *  dead: `api.deleteSession` throws on any non-2xx and nothing narrated it.
+   *  Raw facts, not a sentence: the render site localizes from `code` (see
+   *  utils/historyDeleteRefusal) while `report` keeps the API journal context
+   *  for ErrorNotice's agent hand-off. Cleared on dismiss or on the next attempt. */
+  undeletableHistory: HistoryDeleteRefusal | null
   pendingInput: string | null
   /** Transient feedback for agent-rebind failures shared by the picker and
    *  global cycle shortcuts. The App shell owns rendering and expiry. */
@@ -1035,6 +1051,7 @@ const initialState: ChatState = {
   historyOffset: 0,
   unresumableResume: null,
   lastResumeRequestId: null,
+  undeletableHistory: null,
   pendingInput: null,
   agentSwitchNotice: null,
   creatingSlot: false,
@@ -1995,6 +2012,23 @@ export const switchSlot = createAsyncThunk<
     // any older page still in flight is superseded even when the key is unchanged.
     _abortLoadOlder?.()
     dispatch(markSlotRead(key))
+    // Opening a session is the canonical read gesture: relay it so every
+    // other open dashboard window retires this slot's unread bubble too —
+    // but only AFTER the transcript fetch succeeds (see the emits by the
+    // return paths below). A failed load displays no transcript, and a
+    // pre-fetch relay would clear sibling badges for messages this window
+    // never showed. Watermark = the slot's server-minted last_ts when
+    // known, read AT EMIT TIME — after the fetch — so messages that arrived
+    // while the transcript loaded (a reconnect window) are covered by the
+    // relayed watermark instead of a stale pre-fetch capture. When none is
+    // known the relay goes out with NO watermark — receivers then keep any
+    // badge that recorded a watermark of its own (covering nothing is the
+    // conservative default). Client time is never minted here: windows
+    // disagreeing about the same message would strand badges against valid
+    // relays. Optional-chained like the slotRun guard below: a partial
+    // preloaded test state can omit the dashboard slice, and throwing here
+    // would abort the switch fetch itself.
+    const _newestSlotTs = () => (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.last_ts
     // Bounded to the page size so opening a long session costs one page, not the
     // whole chained transcript; `loadOlderMessages` walks back from the cursor
     // this fetch returns. Unbounded while the slot is streaming, for the same
@@ -2041,8 +2075,16 @@ export const switchSlot = createAsyncThunk<
         // the only one of the two in settled units, and returning only the retry threw
         // away the baseline the next switch needs.
         const wide = await fetchSlotDetail(key)
+        // Emit only while this request still owns the slot switch: a rapid
+        // A->B switch leaves A's fetch resolving after B took over, and A's
+        // transcript never rendered — relaying its read would clear sibling
+        // badges for messages nobody displayed. `pending` assigns activeSlot
+        // atomically before this thunk body runs, so a superseded request
+        // observes someone else's key here.
+        if ((getState() as { chat: ChatState }).chat.activeSlot === key) emitSlotRead(key, _newestSlotTs())
         return { ...wide, comparableTotal: first.total }
       }
+      if ((getState() as { chat: ChatState }).chat.activeSlot === key) emitSlotRead(key, _newestSlotTs())
       return first
     } catch (e) {
       // A thrown error crosses the thunk boundary as `miniSerializeError(e)`,
@@ -2377,7 +2419,7 @@ function mergePreservedThinking<M extends { role: string; content: string; cls?:
       // A PLAIN optimistic send is deliberately NOT resolved this way, even
       // though it carries a `sendId` too: for a non-steer send, "a persisted
       // row with this id exists" does not prove "the turn above this bubble is
-      // over" — crew mode persists the user row as a durable queue entry and
+      // over" — a durable-queue ingress (the retired Crew Mode was one) can persist the user row and
       // starts no turn at all — so recording a boundary there re-opens the
       // over-drop class the text heuristics were retired for. For a steer
       // bubble the inference is sound precisely because the row's own `steer`
@@ -2849,7 +2891,7 @@ export const warmSlotCache = createAsyncThunk(
 
 export const createSlot = createAsyncThunk<
   ChatSlot,
-  { agent?: string; model?: string; mode?: string; memory_mode?: string; clean_mode?: boolean; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean; instanceId?: string } | string | undefined,
+  { agent?: string; model?: string; mode?: string; memory_mode?: string; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean; instanceId?: string } | string | undefined,
   { fulfilledMeta: { originActiveSlot: string | null; activate: boolean } }
 >(
   'chat/createSlot',
@@ -2858,7 +2900,6 @@ export const createSlot = createAsyncThunk<
     const model = typeof opts === 'string' ? undefined : opts?.model
     const mode = typeof opts === 'string' ? undefined : opts?.mode
     const requestedMemoryMode = typeof opts === 'string' ? undefined : opts?.memory_mode
-    const clean_mode = typeof opts === 'string' ? undefined : opts?.clean_mode
     const folderId = typeof opts === 'string' ? undefined : opts?.folder_id
     // Title at BIRTH, for the same reason folder membership rides this payload:
     // the server pins it (locking the background auto-titler out) and the create
@@ -2888,7 +2929,7 @@ export const createSlot = createAsyncThunk<
     // entry points resolve the persisted preference here, before the first turn
     // can read or write memory.
     const memory_mode = requestedMemoryMode || await configuredDefaultMemoryMode()
-    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, clean_mode, undefined, folderId || undefined, instanceId)
+    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, undefined, folderId || undefined, instanceId)
     const dashState = (getState() as RootState).dashboard
     // An explicit color (e.g. carried from a slot being recreated on a
     // mode switch) wins; otherwise fall back to the default-color policy.
@@ -3038,7 +3079,7 @@ export const resumeFromHistory = createAsyncThunk(
     const cursor = typeof d.next_before === 'number' ? d.next_before : null
     // `surface` (falling back to `mode`) is returned so a caller resuming from
     // a surface that cannot display every slot (ChatPage's unified view only
-    // shows default/orchestrator/crew, see isChatPageSurface) can tell a
+    // shows default/orchestrator, see isChatPageSurface) can tell a
     // silently-unusable resume apart from a genuinely failed one (#3624) --
     // the request succeeds either way, so `ok` alone cannot distinguish them.
     return { ok: d.ok, key: d.key, surface: d.surface ?? d.mode, nextBefore: cursor ?? 0, messages: filterMessages(d.messages || []), hasMore: cursor !== null && (d.has_more || false), total: d.total || 0 }
@@ -3063,9 +3104,35 @@ export const forkSlot = createAsyncThunk(
   },
 )
 
-export const deleteHistorySession = createAsyncThunk(
+/** Delete a history row. A refusal REJECTS WITH A VALUE rather than throwing:
+ *  `api.deleteSession` throws an `ApiError` on any non-2xx, and the thunk
+ *  boundary's `miniSerializeError` keeps string fields only, so a rethrow
+ *  would reach the reducer as a bare message with the status and body gone
+ *  (see utils/thunkError). The payload carries what the notice renders from:
+ *  the row's key and title, plus the gateway's machine-readable `code` (`''`
+ *  when the body carried none -- a dropped connection, a 5xx). The title is
+ *  read from `history` HERE, while the row is still there to read. */
+export const deleteHistorySession = createAsyncThunk<
+  string,
+  string,
+  { rejectValue: HistoryDeleteRefusal }
+>(
   'chat/deleteHistorySession',
-  async (key: string) => { await api.deleteSession(key); return key },
+  async (key, { getState, rejectWithValue }) => {
+    try {
+      await api.deleteSession(key)
+      return key
+    } catch (e) {
+      // Duck-typed on `body`, not `instanceof ApiError`, so a mocked transport
+      // (`Object.assign(new Error(), { status, body })`) reads the same way.
+      const body = (e as { body?: unknown } | null)?.body
+      const title = (getState() as { chat: ChatState }).chat.history.find(s => s.key === key)?.title ?? ''
+      const code = parseErrorCode(typeof body === 'string' ? body : undefined) ?? ''
+      const report = findReport(e instanceof Error ? e.message : '')
+      const refusal: HistoryDeleteRefusal = { key, title, code }
+      return rejectWithValue(report ? { ...refusal, report } : refusal)
+    }
+  },
 )
 
 /** Abort any in-flight older-page fetch. Wired to transcript MOTION: the
@@ -3480,7 +3547,8 @@ const CONTINUE_SCAN_SKIP = new Set(['queued', 'tool_call', 'tool_result', 'injec
  * True when the active slot can be handed back to the agent — i.e. Continue is
  * worth offering on an empty composer.
  *
- * The rule is simply "the slot is idle and has a conversation under it". It is
+ * The rule is "the slot is idle and has a conversation under it", except for
+ * a current typed member-memory setup refusal that requires the owner editor. It is
  * NOT limited to turns that visibly died, because a transcript cannot reliably
  * show that they did: a force-quit or force-exit runs no cleanup, so no error
  * row is ever written and a killed turn reads exactly like a finished one (see
@@ -3538,6 +3606,19 @@ export const selectContinuable = (state: RootState): boolean => {
   return false
 }
 
+/** The characters Python's no-argument `str.split()` splits on. JS `\s` is NOT
+ *  the same set: it adds U+FEFF and lacks U+0085 and U+001C-001F, so a `\s`
+ *  scan of the same content can produce a different first token than the
+ *  backend's `content.split()[0]` -- the rule `is_turn_interrupted` and the
+ *  runner's `user_requested_compaction` key on. */
+const PYTHON_WHITESPACE_RE = /[\t\n\v\f\r\u001c-\u001f \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/
+
+/** First whitespace-separated token by PYTHON's splitting rule, or undefined
+ *  for all-whitespace content. Mirrors `content.split()[:1]` in
+ *  `src/kiro_crew/dashboard/state.py`. */
+const firstPythonToken = (content: string): string | undefined =>
+  content.split(PYTHON_WHITESPACE_RE).find(Boolean)
+
 /**
  * True when the transcript SHOWS the last turn ending without the assistant
  * handing the floor back — the user's row is last, or an `error` row trails the
@@ -3550,10 +3631,19 @@ export const selectContinuable = (state: RootState): boolean => {
  *
  * A false result means "nothing in the transcript proves an interruption", never
  * "the turn definitely finished": the force-quit case leaves no evidence.
+ *
+ * A `/compact` answered by its compaction notice (the assistant row tagged
+ * `meta.kind="compaction"`) reads as FINISHED: the slash command IS the whole
+ * request and the notice IS its result. The tag alone cannot decide -- an
+ * automatic compaction can write the same tagged row inside an ordinary turn
+ * whose real reply never arrived, and that tail is a genuine interruption --
+ * so the rule needs BOTH halves, matching `is_turn_interrupted` in
+ * `src/kiro_crew/dashboard/state.py`.
  */
 export const selectTurnInterrupted = (state: RootState): boolean => {
   const msgs = state.chat.messages
   let sawTrailingError = false
+  let sawCompactionResult = false
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
     // A deliberate Stop ENDS the turn; it does not interrupt it. This must be
@@ -3571,8 +3661,25 @@ export const selectTurnInterrupted = (state: RootState): boolean => {
     if (m.role === 'error') { sawTrailingError = true; continue }
     if (CONTINUE_SCAN_SKIP.has(m.role)) continue
     if ((m.role === 'user' || m.role === 'assistant') && m.content) {
-      if (m.role === 'assistant' && isSystemNoticeKind((m.meta as { kind?: string } | undefined)?.kind)) continue
-      return m.role === 'user' ? true : sawTrailingError
+      const meta = m.meta as { kind?: string; notice?: string } | undefined
+      if (m.role === 'assistant' && isSystemNoticeKind(meta?.kind)) {
+        // Remember a compaction RESULT row on the newest turn; whether it
+        // completes the turn depends on the user row it leads back to. The
+        // recycle and stuck-turn notices borrow `kind="compaction"` and mark
+        // themselves with `meta.notice`; they report no compaction, so they
+        // must not complete one.
+        if (meta?.kind === 'compaction' && !meta?.notice) sawCompactionResult = true
+        continue
+      }
+      if (m.role !== 'user') return sawTrailingError
+      // A `/compact` answered by its compaction notice is a FINISHED turn --
+      // unless an error row trails the notice, the same evidence the
+      // plain-assistant branch honors. First-whitespace-token match using
+      // PYTHON's whitespace set (the backend rule is `content.split()`, and
+      // JS `\s` / `trim()` disagree with it on U+FEFF and U+0085), so the two
+      // mirrors cannot split the same content differently.
+      if (sawCompactionResult && firstPythonToken(m.content) === '/compact') return sawTrailingError
+      return true
     }
   }
   return false
@@ -3617,6 +3724,9 @@ const chatSlice = createSlice({
      *  in flight, and forgetting it would let an older resume's late answer
      *  re-open a notice the user just closed. */
     clearUnresumableResume(state) { state.unresumableResume = null },
+    /** Dismiss the refused-delete notice. The row stays in `history`: nothing
+     *  was deleted, and the user retries from the sidebar as before. */
+    clearUndeletableHistory(state) { state.undeletableHistory = null },
     setQuestionCard(state, action: PayloadAction<{ slot: string; ask_id?: string; card_id?: string; questions: ChatState['pendingQuestions'][string]['questions']; fresh?: boolean }>) {
       // Defensive init: existing test fixtures build partial preloaded state
       // without this key.
@@ -4503,7 +4613,7 @@ const chatSlice = createSlice({
       state.selectedSubagentId = action.payload
     },
     /** "Dismiss done": drop terminal cards for a slot (backend clear is the
-     *  caller's job via DELETE /api/spawn; this trims the local view). */
+     *  caller's job via per-id DELETE /api/spawn/{id}; this trims the local view). */
     clearTerminalSubagents(state, action: PayloadAction<{ slot: string }>) {
       const slot = action.payload.slot
       if (isUnsafeKey(slot)) return
@@ -6266,6 +6376,16 @@ const chatSlice = createSlice({
       .addCase(deleteHistorySession.fulfilled, (state, action) => {
         state.history = state.history.filter(s => s.key !== action.payload)
       })
+      .addCase(deleteHistorySession.pending, (state) => {
+        // A fresh attempt supersedes the last refusal's notice, whichever row it
+        // named: the outcome of THIS click is what the user is now waiting on.
+        state.undeletableHistory = null
+      })
+      .addCase(deleteHistorySession.rejected, (state, action) => {
+        // The row is deliberately NOT filtered out: the gateway kept the file,
+        // so the sidebar must keep the row. Only the notice changes.
+        if (action.payload) state.undeletableHistory = action.payload
+      })
       .addCase(loadOlderMessages.pending, (state) => {
         state.loadingOlder = true
         // A retry clears the red state without re-basing the cursor, so the helper cannot.
@@ -6304,7 +6424,7 @@ const chatSlice = createSlice({
 })
 
 export const {
-  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearUnresumableResume, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,

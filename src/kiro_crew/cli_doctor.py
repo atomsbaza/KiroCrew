@@ -37,6 +37,7 @@ from kiro_crew.agent_discovery import (
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.cli_perf import _read_gateway_pid
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     CRED_DISCORD_BOT_TOKEN,
@@ -99,7 +100,7 @@ from kiro_crew.platform import (
 from kiro_crew.platform.capability_bound import bind_capability_manager
 from kiro_crew.platform.defaults import DefaultCapabilityManager
 from kiro_crew.platform.governance import CU_MCP_SERVER, may_skip_gate_now
-from kiro_crew.sandbox import warm_backend
+from kiro_crew.sandbox import _MOUNT_SOURCE_PREFIX, warm_backend
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 from kiro_crew.service import apparmor
@@ -137,6 +138,24 @@ def _safe_display(value: object) -> str:
     terminal controls or spoofing the surrounding diagnostic lines.
     """
     return repr(value)
+
+
+def _doctor_member_memory_bindings(cfg: KiroCrewConfig, issues: list[str]) -> None:
+    """Check every configured member's existing binding without initializing memory."""
+    from kiro_crew.memory_stores import require_member_memory_store
+
+    print("\nMember Memory Bindings")
+    if not cfg.agents:
+        print("  (no configured members)")
+    for name, member in cfg.agents.items():
+        binding = f"{_safe_display(name)} -> {_safe_display(getattr(member, 'memory_store', None))}"
+        try:
+            require_member_memory_store(cfg, name, require_directory=True)
+        except Exception as exc:  # noqa: BLE001 -- one broken member must not hide healthy peers
+            print(f"  {binding}: unavailable ({_safe_display(str(exc))})")
+            issues.append(f"member memory binding unavailable: {binding}")
+        else:
+            print(f"  {binding}: valid binding")
 
 
 def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[str]) -> None:
@@ -207,7 +226,10 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
         bindings = resolve_agent_bindings(cfg)
         override = normalize_agent_model(bindings.model)
         bound = bindings.kiro_agent or "kirocrew"
-    except Exception:  # noqa: BLE001 -- a broken alias must not kill the report
+    except Exception as exc:  # noqa: BLE001 -- a broken alias must not kill the report
+        print(f"  binding:     unavailable ({_safe_display(str(exc))})")
+        print("               See the member memory binding diagnostics below.")
+        issues.append("default agent binding unavailable")
         override = ""
         bound = "kirocrew"
     # kiro_agent is free text in config.json and this name reaches a path join.
@@ -776,6 +798,8 @@ def _doctor_mcp_tools(
     if not probe_targets:
         return
 
+    print("  MCP host probe — session tool loading is not verified by this check.")
+
     # Every probe below spawns its server through the sandbox chokepoint, and
     # asyncio.gather releases them together. On a cold cache the first arrivals
     # therefore land on the on-loop deferral path simultaneously and each logs a
@@ -1135,6 +1159,157 @@ def _doctor_claude_backend() -> None:
         print("  claude-acp:  ⚠️  could not check")
 
 
+#: The managed default agent, whose spec is the one a stock install runs.
+#: Mirrors ``agent._MAIN_AGENT_NAME``, which is private; the doctor row below
+#: reports on that spec because it is the one every default session resolves.
+_MAIN_AGENT_NAME = "kirocrew"
+
+
+def _doctor_unresolved_mcp_refs() -> None:
+    """One row per selectable harness: would the default spec's ``@server`` refs
+    resolve on it?
+
+    The static half of the runtime detector in
+    :mod:`kiro_crew.acp.mcp_ref_guard`, answering the same question before a
+    session rather than during one. The defect it names has shipped on three
+    harnesses (``providers/mirrors/README.md``): a session comes up with
+    ``tools: ["@kirocrew-core", ...]`` and nothing defining ``kirocrew-core``, so
+    every Crew tool is absent while the harness works and nothing anywhere is red.
+    A row here is the answer to "my agent has no tools on this backend" that
+    otherwise takes a diagnosis.
+
+    Reports only, and appends NO entry to ``issues``, on the terms
+    :func:`_doctor_strict_identity` sets: a harness the operator has not adopted
+    having no projection yet is a known state of the tree, not a broken install,
+    and failing doctor's exit code on it would make every stock host red for a
+    backend nobody selected.
+
+    Asks ``agent_sdk`` rather than assembling the answer here. The refs need the
+    agent spec and each backend's spec projection, both of which live below the
+    boundary, so reaching them from this module would take three new ACP /
+    providers edges the agent-sdk-boundary gate refuses -- and correctly: which
+    file a harness reads its servers from is exactly the knowledge a consumer is
+    not supposed to hold. ``agent_spec_mcp_refs`` reads the mirror seam, so a
+    backend projecting outside ``providers/mirrors/`` (KAS) reads as unprojected;
+    ``has_mirror`` is what lets the row say which case it is.
+
+    kiro-cli resolves its refs against the spec it is handed, so a healthy install
+    prints a clean row there rather than every ref it declares -- the resolver keys
+    that on the backend id, not on this function.
+    """
+    from kiro_crew.agent_sdk.drivers.acp import agent_spec_mcp_refs
+
+    try:
+        spec_found, rows = agent_spec_mcp_refs(_MAIN_AGENT_NAME)
+    except Exception:
+        # Triage must survive an unreadable spec or registry; the rows are advisory.
+        return
+    if not spec_found:
+        print("  mcp tool refs: \u23f9 no default agent spec on disk yet")
+        return
+
+    for backend, unresolved, has_mirror in rows:
+        label = _backend_policy_label(backend)
+        if not unresolved:
+            print(f"  mcp tool refs: \u2705 {label} \u2014 every @server ref resolves")
+            continue
+        # Read off a hand-editable spec a cloned repo or an installed app can
+        # author, so it can carry OSC/ANSI sequences that spoof the lines around
+        # it -- the same reason every other spec-derived value in this report is
+        # printed through _safe_display.
+        refs = ", ".join(_safe_display(ref) for ref in unresolved)
+        if not has_mirror:
+            print(f"  mcp tool refs: \u23f9 {label} has no mirror; unprojected: {refs}")
+            _print_wrapped(
+                "Those refs name no server this backend would be handed, so the "
+                "tools behind them are absent from its sessions with nothing to "
+                "say so. The shared MCP gateway can still deliver a server it "
+                "wrapped as a broker stub, which this row does not model. "
+                "Which of those it is -- a decided no-channel harness or a "
+                "projection that lives outside providers/mirrors/ -- is the KIND "
+                "on that backend's entry in providers/mirrors/registry.py "
+                "(PROJECTIONS); a backend that projects elsewhere reads as "
+                "unprojected here."
+            )
+            continue
+        print(f"  mcp tool refs: \u26a0 {label} projects a spec that still misses: {refs}")
+        _print_wrapped(
+            "This backend HAS a mirror and its projection dropped these refs "
+            "anyway -- a registry-marked entry, an entry with no usable "
+            "transport, or a name the spec references but never defines. Compare "
+            "the agent spec's mcpServers against its tools list."
+        )
+
+
+def _doctor_selected_backend_projection(cfg: KiroCrewConfig) -> None:
+    """One row for the SELECTED backend when its declaration says ``no-channel``.
+
+    :func:`_doctor_unresolved_mcp_refs` answers this per selectable harness, off
+    the default spec's own refs. This answers a different question, about the one
+    harness the operator actually configured, and it answers it for a spec that
+    references no server at all: a ``no-channel`` backend has no transport that
+    can carry Crew's servers, so every Crew tool is absent from its sessions
+    whatever the spec says. That is a property of the harness, not of the spec,
+    and a spec with an empty ``tools`` list produces no unresolved ref to hang it
+    off.
+
+    Prints only for that one kind. ``native``, ``mirror`` and ``external`` all
+    mean the servers do reach the session, so a row there would be noise on every
+    stock install — and the refs row already speaks when a projection drops
+    something.
+
+    Reports only, and appends NO entry to ``issues``, on the terms
+    :func:`_doctor_strict_identity` and :func:`_doctor_unresolved_mcp_refs` both
+    set: choosing a harness whose transport cannot carry Crew's tools is a
+    supported configuration with a declared reason, not a broken install, and
+    failing doctor's exit code on it would make a deliberate choice read as a
+    fault.
+
+    Asks ``agent_sdk`` rather than reading the declaration here, for the reason
+    every other backend question in this module does: the record lives in
+    ``providers/mirrors`` and reaching it from a consumer would take a boundary
+    edge the agent-sdk-boundary gate refuses.
+    """
+    from kiro_crew.agent_sdk.drivers.acp import backend_mcp_projection
+
+    try:
+        backend = cfg.agent.acp_backend
+    except Exception:
+        return
+    declared = backend_mcp_projection(backend)
+    if declared is None:
+        return
+    kind, channel, tracking = declared
+    if kind != "no-channel":
+        return
+    label = _backend_policy_label(backend)
+    print(f"  mcp projection: \u23f9 {label} carries none of Kiro Crew's own tools")
+    _print_wrapped(
+        "This harness advertises no transport the session MCP array can use, so "
+        "Crew's servers are absent by declaration rather than by a "
+        "misconfiguration. The shared MCP gateway does not change that: a broker "
+        "stub is shaped as a stdio element too, so it lands in the same array. "
+        "Switching agent.acp_backend is the operator-side remedy; the line below "
+        "is what would have to be built instead."
+    )
+    # Read off a declaration a plugin-registered backend can author, so it is
+    # printed through the same display guard as every other value in this report.
+    _print_wrapped(f"Would need: {_safe_display(channel)}")
+    _print_wrapped(f"Tracked at: {_safe_display(tracking)}")
+
+
+def _backend_policy_label(backend: str) -> str:
+    """The human spelling of *backend*, matching the refs row's own labels.
+
+    ``ACP_BACKEND_KIRO`` is the empty string, so a bare id renders as nothing;
+    the policy mapping is the one place that already owns a printable name for
+    every id this build can spell.
+    """
+    from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+
+    return POLICY_ID_BY_BACKEND.get(backend, backend) or backend
+
+
 def _doctor_agent_auth() -> None:
     """One sign-in row per selectable harness, projected from its declaration.
 
@@ -1365,7 +1540,7 @@ def _doctor_mcp_gateway_daemon(issues: list[str]) -> None:
 
 
 def _doctor_strict_identity(cfg: KiroCrewConfig) -> None:
-    """Report whether strict-identity tools have a working identity channel.
+    """Report configured routing, not proof of a live session's identity channel.
 
     On the kiro backend a session's process is an ``AcpRuntime``, which is
     session-UNBOUND by design (one process multiplexes N sessions, so it cannot
@@ -1395,7 +1570,12 @@ def _doctor_strict_identity(cfg: KiroCrewConfig) -> None:
         routed = set()
     unrouted = [s for s in _STRICT_IDENTITY_SERVERS if s not in routed]
     if not unrouted:
-        print("  strict identity: ✅ routed — the gateway injects a per-call caller")
+        print("  strict identity: ⏹ routing configured — live session identity not verified")
+        _print_wrapped(
+            "This checks mcp_gateway.stub_servers, not the running session's "
+            "launch command or per-call caller injection. Confirm a strict-identity "
+            "tool succeeds in the affected dashboard session."
+        )
         return
     names = ", ".join(unrouted)
     print(f"  strict identity: ⏹ no identity channel for {names}")
@@ -1954,6 +2134,70 @@ def _detect_userspace_oom_killer() -> str | bool | None:
     return False if determined else None
 
 
+def _gateway_rss_bytes(pid: int) -> int | None:
+    """Resident set size of *pid* in bytes, or None when no route can read it.
+
+    ``platform_compat.proc_rss_bytes_for_pid`` serves Linux (``/proc``) and
+    Windows (``GetProcessMemoryInfo``) but has no ctypes-only path on macOS and
+    answers None there, so this falls through to ``ps -o rss=`` resolved via
+    ``trusted_system_bin`` (ps reports KiB). Without the fallback the doctor
+    line reads "RSS unreadable" on every Mac.
+    """
+    rss = platform_compat.proc_rss_bytes_for_pid(pid)
+    if rss is not None or platform_compat.IS_WINDOWS:
+        return rss
+    ps_bin = platform_compat.trusted_system_bin("ps")
+    if ps_bin is None:
+        return None
+    try:
+        out = subprocess.check_output([ps_bin, "-o", "rss=", "-p", str(pid)], timeout=2)
+        return int(out.decode().strip()) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _gateway_memory_lines() -> list[str]:
+    """The ``session ceiling`` and ``gateway rss`` lines of the Memory Pressure section.
+
+    The ceiling is ``session.watchdog_rss_max_mb`` from the loaded config (``0``
+    = disabled, called out as such because an operator reading this section is
+    usually asking "what stops a runaway session tree?"). The RSS is read from
+    the live gateway's pid via the lock-holder oracle ``cli_perf`` already uses,
+    so a stale recorded pid can never be reported as the gateway's memory; no
+    live gateway prints "not running". Every failure degrades to a line saying
+    so — this is advisory and must never abort doctor.
+    """
+    lines: list[str] = []
+    try:
+        ceiling = int(KiroCrewConfig.load().session.watchdog_rss_max_mb)
+    except Exception:
+        lines.append("  session ceiling: ⚠️  could not read session.watchdog_rss_max_mb")
+    else:
+        if ceiling > 0:
+            lines.append(
+                f"  session ceiling: ✅ {ceiling} MiB per session process tree "
+                "(session.watchdog_rss_max_mb; idle sessions above it are recycled)"
+            )
+        else:
+            lines.append(
+                "  session ceiling: ⏹ disabled (session.watchdog_rss_max_mb = 0) — "
+                "nothing bounds a runaway session tree"
+            )
+    try:
+        pid = _read_gateway_pid()
+        if pid is None:
+            lines.append("  gateway rss:     ⏹ not running")
+        else:
+            rss = _gateway_rss_bytes(pid)
+            if rss is None:
+                lines.append(f"  gateway rss:     ⚠️  pid {pid} alive but RSS unreadable")
+            else:
+                lines.append(f"  gateway rss:     {rss // (1024 * 1024)} MiB (pid {pid})")
+    except Exception:
+        lines.append("  gateway rss:     ⚠️  could not determine (probe failed)")
+    return lines
+
+
 def _doctor_memory_pressure(issues: list[str]) -> None:
     """Report whether the host can degrade gracefully under memory pressure.
 
@@ -1973,6 +2217,12 @@ def _doctor_memory_pressure(issues: list[str]) -> None:
     """
     del issues  # advisory-only diagnostic; keeps the call-site signature uniform
     print("\nMemory Pressure")
+    # What is bounding memory right now, on every platform: the gateway's own
+    # resident set and the per-session tree ceiling the cleanup watchdog
+    # recycles at. Printed before the Linux-only freeze check so a Windows or
+    # macOS operator still sees the numbers that matter for a runaway tree.
+    for line in _gateway_memory_lines():
+        print(line)
     if not sys.platform.startswith("linux"):
         print(
             f"  freeze risk: ⏹ not applicable ({sys.platform} — the swap/OOM-killer "
@@ -2009,6 +2259,106 @@ def _doctor_memory_pressure(issues: list[str]) -> None:
     print("               thrashes file-backed pages and the host can livelock before")
     print("               the kernel OOM killer intervenes.")
     print("               Fix: add swap, enable systemd-oomd, or install earlyoom.")
+
+
+# ── Runtime tmpfs headroom (sandbox mount-source roots) ──────────────────────
+# Warn thresholds for the tmpfs roots the sandbox launcher stages bind-mount
+# sources on. Leaked ``tmp*`` mount dirs once filled ``/run/user/$UID`` until its
+# inodes ran out, at which point every tool spawn failed with a bare ``rc=1``.
+# Inode exhaustion is the more likely face on a tmpfs (each leaked dir is tiny
+# but costs an inode), so both free-space and free-inode fractions are checked,
+# plus an absolute inode floor: a small tmpfs at 11% free inodes can still be a
+# few hundred dirs from failure.
+_TMPFS_FREE_PCT_WARN = 10.0
+_TMPFS_FREE_INODES_FLOOR = 1000
+
+
+def _runtime_tmpfs_roots() -> list[str]:
+    """The roots the sandbox would stage mount sources on, in launcher order.
+
+    Reuses the sandbox's own chooser rather than hardcoding ``/run/user`` so a
+    change to the launcher's fallback chain moves this check with it.
+    """
+    return sandbox._mount_source_candidate_roots()
+
+
+def _tmpfs_usage(root: str) -> tuple[float, float, int, int] | None:
+    """``(free_space_pct, free_inode_pct, free_inodes, tmp_entries)`` for *root*.
+
+    ``None`` when the root does not exist or cannot be measured, or when the
+    platform has no ``os.statvfs`` (Windows; the doctor section that calls this
+    is Linux-only, so this is belt-and-braces for direct callers). ``tmp_entries``
+    counts the names carrying the sandbox launcher's mount-source prefix
+    (``kirocrew_sb_<pid>_``), so a warning can say how much of the pressure is
+    Kiro Crew's own; every other temporary entry belongs to somebody else and
+    is deliberately not counted, so the cleanup advice never points at it. A
+    filesystem that reports no inode accounting (``f_files == 0``) reads as
+    100% free inodes rather than as exhausted.
+    """
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is None:
+        return None
+    try:
+        st = statvfs(root)
+    except OSError:
+        return None
+    free_space_pct = 100.0 * st.f_bavail / st.f_blocks if st.f_blocks else 100.0
+    if st.f_files:
+        free_inode_pct = 100.0 * st.f_favail / st.f_files
+        free_inodes = int(st.f_favail)
+    else:
+        # No inode accounting (btrfs, some FUSE mounts): both readings say
+        # "not a constraint" so neither the percentage nor the absolute floor
+        # below can fire on a filesystem that cannot run out of inodes.
+        free_inode_pct = 100.0
+        free_inodes = _TMPFS_FREE_INODES_FLOOR
+    try:
+        with os.scandir(root) as it:
+            tmp_entries = sum(1 for e in it if e.name.startswith(_MOUNT_SOURCE_PREFIX))
+    except OSError:
+        tmp_entries = 0
+    return free_space_pct, free_inode_pct, free_inodes, tmp_entries
+
+
+def _doctor_runtime_tmpfs(issues: list[str]) -> None:
+    """Warn when a sandbox tmp root is close to running out of space or inodes.
+
+    The failure this pre-empts is silent until total: leaked mount-source dirs
+    accumulate in the runtime tmpfs, and once its inodes are gone every sandboxed
+    tool spawn fails with nothing more than ``rc=1``. Reclaim runs on the
+    gateway, but an operator looking at a wall of ``rc=1`` needs somewhere that
+    names the disk. Appended to *issues*: a full tmp root breaks every tool, so
+    it is a fault, not host trivia. Linux only -- the launcher is.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    print("\nRuntime tmpfs")
+    for root in _runtime_tmpfs_roots():
+        usage = _tmpfs_usage(root)
+        if usage is None:
+            print(f"  {root}: ⏭  not present or unreadable")
+            continue
+        free_space_pct, free_inode_pct, free_inodes, tmp_entries = usage
+        detail = (
+            f"{free_space_pct:.0f}% space free, {free_inode_pct:.0f}% inodes free "
+            f"({free_inodes} inodes), {tmp_entries} {_MOUNT_SOURCE_PREFIX}* entries"
+        )
+        low_space = free_space_pct < _TMPFS_FREE_PCT_WARN
+        low_inodes = free_inode_pct < _TMPFS_FREE_PCT_WARN or free_inodes < _TMPFS_FREE_INODES_FLOOR
+        if low_space or low_inodes:
+            what = "inodes" if low_inodes and not low_space else "space"
+            if low_space and low_inodes:
+                what = "space and inodes"
+            print(f"  {root}: ⚠️  low on {what} — {detail}")
+            print(
+                "               Sandboxed tool spawns fail with rc=1 once this fills. "
+                f"Kiro Crew's own leaked mount dirs are the {_MOUNT_SOURCE_PREFIX}* "
+                "entries; a gateway restart reclaims them. Other entries there "
+                "belong to other applications: leave them alone."
+            )
+            issues.append(f"runtime tmpfs {root} low on {what} ({detail})")
+        else:
+            print(f"  {root}: ✅ {detail}")
 
 
 # ── kiro-cli installer residue ────────────────────────────────────────────────
@@ -3203,6 +3553,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # agent.model, and the whole point here is that the global is not
     # necessarily what a new session gets.
     _doctor_effective_model(cfg, proj, issues)
+    _doctor_member_memory_bindings(cfg, issues)
 
     # ── Stored defaults a release has since changed ──
     render_doctor_section(issues)
@@ -3217,6 +3568,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     _doctor_trust_root()
     _doctor_strict_identity(cfg)
     _doctor_mcp_gateway_daemon(issues)
+    _doctor_unresolved_mcp_refs()
+    _doctor_selected_backend_projection(cfg)
 
     # ── Credentials (AWS / credential-vending MCP) ──
     # After identity, before the agent-facing sections: this is the answer to
@@ -3240,6 +3593,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Memory pressure preparedness (swap / userspace OOM killer) ──
     _doctor_memory_pressure(issues)
+
+    # ── Runtime tmpfs headroom (sandbox mount-source roots; Linux only) ──
+    _doctor_runtime_tmpfs(issues)
 
     # ── kiro-cli installer residue (silent unless residue is on disk) ──
     _doctor_cli_installer_residue(issues)

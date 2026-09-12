@@ -2,7 +2,7 @@ import React, { createContext, useContext, memo, useEffect, useMemo, useRef, use
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare } from 'lucide-react'
+import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
 import { copyCode, copyToClipboard } from '../utils/clipboard'
 import { canonicalChatHref, sessionKeyFrom, sessionKeyFromChatHref } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
@@ -47,6 +47,7 @@ import { LinkChip, LinkCard } from './LinkPreview'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
+import { wholeMatchAutolinkHref, rearmConfigScanBudget } from '../utils/autolinkRules'
 import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
@@ -864,9 +865,22 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       sessionCandidate = decodeURIComponent(href)
     } catch { /* keep it a normal link */ }
   }
+  // Whether this href NAMES a same-origin chat session at all, independent of
+  // whether that session is currently reachable (open). A closed/unknown key is
+  // still a chat-session href — it just does not resolve in the open-tabs roster.
+  const sessionHrefKey = sessionCandidate ? sessionKeyFromChatHref(sessionCandidate) : null
+  // Whether this renderer is wired to route sessions at all — the SAME predicate
+  // `resolveSessionChip` guards on (`onSessionOpen` AND `sessions`), so the link
+  // affordance and the click handler can never disagree. Both must be present:
+  // `ChatPage` keeps `onSessionOpen` wired but WITHHOLDS `sessions` while offline
+  // (`sessions={connected ? sessionTitles : undefined}`), and a no-controller
+  // render (e.g. an SDK `user` message row) has neither. In either case there is
+  // nothing that could switch sessions, so a `?sid=` link must stay an ordinary
+  // navigating link rather than be swallowed.
+  const sessionRouting = !!(sessionActions.onSessionOpen && sessionActions.sessions)
   // Same gate as the inline chip, so a link and a bare key naming one session
   // cannot disagree about whether it is reachable.
-  const sessionLink = sessionCandidate ? resolveSessionChip(sessionKeyFromChatHref(sessionCandidate) ?? '', sessionActions) : null
+  const sessionLink = sessionHrefKey ? resolveSessionChip(sessionHrefKey, sessionActions) : null
   // The attribute carries the canonical key: a modified click goes to the browser,
   // and an authored `dashboard_…` sid would open a session `?sid=` cannot resolve.
   const sessionHref = sessionLink && sessionCandidate ? canonicalChatHref(sessionCandidate, sessionLink.key) : null
@@ -874,9 +888,28 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     // Only the PLAIN click is reinterpreted; the href stays real so Cmd+click
     // still opens the session in its own tab.
     const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
-    if (!sessionLink || !plainPrimaryClick) return
-    e.preventDefault()
-    sessionActions.onSessionOpen!(sessionLink.key)
+    if (!plainPrimaryClick) return
+    // A resolvable session opens in place. A chat-session href that does NOT
+    // resolve is swallowed rather than left to the browser. `resolveSessionChip`
+    // returns null in two cases, both correctly declined here:
+    //   - a closed / unknown key — its raw `?sid=` would navigate to a session
+    //     the controller cannot load, landing on a dead/blank view (#9914);
+    //   - the ACTIVE session's own key (`resolveSessionChip` rejects
+    //     `key === activeSession`) — a plain click is a no-op on the session you
+    //     are already in, matching the backtick chip, which renders the active
+    //     key as inert. Cmd/Ctrl/middle-click still opens the real href for
+    //     anyone who actually wants a duplicate tab.
+    //
+    // Both branches require `sessionRouting` — the renderer must actually be
+    // able to route sessions. When it cannot (offline: `sessions` withheld; or a
+    // no-controller render: neither wired), a `?sid=` link is an ordinary
+    // external link and keeps navigating as before, never a dead no-op.
+    if (sessionLink) {
+      e.preventDefault()
+      sessionActions.onSessionOpen!(sessionLink.key)
+    } else if (sessionHrefKey && sessionRouting) {
+      e.preventDefault()
+    }
   }
   const pathResolution = usePathResolution(
     localHref ?? '',
@@ -972,7 +1005,11 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       {...sp(node)}
       href={sessionHref ?? href}
       // A `/chat?sid=` href is never a path, so the session branch wins outright.
-      onClick={sessionLink ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
+      // `sessionHrefKey` (not `sessionLink`) gates the handler so a session link
+      // that does not resolve — a closed/unknown key, or the active session's own
+      // key — is still intercepted and declined rather than left to navigate the
+      // browser to a dead `?sid=` view (#9914) or a duplicate tab.
+      onClick={sessionHrefKey ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
       title={sessionLink
         ? `${sessionLink.title}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}`
         : undefined}
@@ -1387,6 +1424,31 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
           safeProps={safeProps}
           onOpen={sessionActions.onSessionOpen!}
         >{children}</SessionChip>
+      )
+    }
+    // A span whose WHOLE text matches an operator-configured autolink rule is
+    // that work item (`PROJ-123`), so it links out
+    // instead of only copying. `inlineCode` is opaque to `remarkAutolinkRules`
+    // by design; whole-match keeps the chip atomic — `npm PROJ-123 run` stays a
+    // plain copyable span — and the session chip wins first: in-app navigation
+    // over an external link for a text both recognize. The native title
+    // discloses the real target, same disclosure discipline as the path chip
+    // below.
+    const patternHref = wholeMatchAutolinkHref(raw)
+    if (patternHref) {
+      return (
+        <a
+          href={patternHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={patternHref}
+          className="no-underline focus-ring"
+        >
+          {/* The glyph is what tells this chip apart from a copy chip at
+              rest: without it the two are pixel-identical and the click
+              outcome (open a tab vs copy) is a surprise. */}
+          <code className={`${CHIP_BASE} cursor-pointer hover:underline`} {...safeProps}>{reserve}{children}<ExternalLink className="lucide-inline ml-1" aria-hidden /></code>
+        </a>
       )
     }
     return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{reserve}{children}</CopyableCode>
@@ -3929,6 +3991,15 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
 export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
+  // One message = one config-rule scan pool. The blocks below each mount their
+  // OWN remark tree, so the rearm cannot live at the plugin's tree entry — a
+  // fence-heavy message would restore the pool once per block and multiply the
+  // 50ms ceiling by the block count. Render-phase on purpose (same discipline
+  // as ChatPage's registry write): the pool must be full before the first
+  // block's synchronous remark pass, and parent-then-children render order
+  // guarantees exactly that. Double-invoke under StrictMode is harmless — the
+  // pool is refilled before any drain either way.
+  rearmConfigScanBudget()
 
   /** Chip activation lives on the chip itself (see InlineCode); this handler is
    *  only the artifact-link delegation it has always been. */

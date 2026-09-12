@@ -53,6 +53,7 @@ from kiro_crew.identity_stores import (
     AUTH_SQLITE_SIDECAR_SUFFIXES,
     fenced_home_dirs,
 )
+from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME
 
 from .diagnostics import annotate_refusal, refusal_diagnostic
 
@@ -75,11 +76,6 @@ _LEAF_SEPARATOR = "/"
 def _leaf_segments(spec: str) -> list[str]:
     """Path segments of a ``/``-authored leaf spec, for ``os.path.join``."""
     return spec.split(_LEAF_SEPARATOR)
-
-
-def _leaf_basename(spec: str) -> str:
-    """Final segment of a ``/``-authored leaf spec."""
-    return _leaf_segments(spec)[-1]
 
 
 _SENSITIVE_HOME_DIRS: list[str] = [
@@ -341,6 +337,11 @@ _CREW_SECRET_LEAVES: list[str] = [
     # operator's logged-in browser without them seeing a prompt. The gateway hands
     # it to the CLI through the environment, so nothing legitimate opens the file.
     "playwright-extension-token",
+    # Gateway-executed browser launcher and its vendored package tree. Agent
+    # subprocesses receive a READONLY sandbox view so their browser commands can
+    # run it; file tools must not inspect or replace the executable the
+    # unsandboxed gateway later uses for startup cleanup and owner launches.
+    "playwright-cli",
     # Legacy SEL HMAC key location (pre-``trust/`` installs, and any stale file
     # a backup restore resurrects). Kept alongside the ``trust``
     # directory entry below so the key is gated at BOTH locations.
@@ -360,6 +361,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
     # path directly (as keystone writers must), so it would have followed the link.
     "trust",
+    "member-memory-bindings",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
     # it into this directory, so a segment holds exactly the same audit records
@@ -673,6 +675,33 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``identity_stores`` and opens it directly, not through this gate.
     AUTH_SQLITE_DB,
     *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
+    # Named memory stores. Each subdirectory is ONE crew's private memory silo --
+    # its markdown tree, its FTS index and its vector-store SQLite file -- and the
+    # whole point of a named store is that a crew reaches only its own. Agent file
+    # tools run as the same UID as every store on disk, so owner-only modes decide
+    # nothing here: without this entry any crew's agent could read another crew's
+    # preferences and lessons straight off disk, or rewrite them, which is the
+    # boundary the split exists to draw. Read AND write, because reading another
+    # crew's memory is the primary harm and writing it is steering that crew's
+    # future turns.
+    #
+    # A DIRECTORY entry, for the reason ``routing`` and ``webhooks`` above are:
+    # markdown files are published through ``atomic_write``'s ``mkstemp`` sibling,
+    # so fencing final names only would leave a writable path to the same bytes
+    # under a random temp name.
+    #
+    # DELIBERATE ASYMMETRY, do not "tidy" it: the DEFAULT store's own ``memory.db``
+    # and ``workspace/memory/`` stay readable, because that is the agent's own
+    # memory and reading it is the product working. Fencing them would be a
+    # default-path behaviour change, which the coexistence constraint forbids. So
+    # ``is_sensitive_path(<home>/memory.db)`` is False and
+    # ``is_sensitive_path(<home>/memory_stores/work/memory.db)`` is True, on
+    # purpose. Full reasoning: docs/system-specs/modules/security.md.
+    #
+    # Every legitimate reader opens a store path DIRECTLY rather than through this
+    # gate -- the established keystone-reader pattern -- so the memory subsystem is
+    # unaffected.
+    MEMORY_STORES_DIR_NAME,
 ]
 _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
@@ -1261,13 +1290,15 @@ def _load_arm_budget_spent(prefix: str) -> bool:
 def _mark_stalled(prefix: str, budget: float) -> None:
     """Record an OBSERVED stall under *prefix*: back off exponentially on repeats.
 
-    Only a resolution that actually timed out is recorded.  A refusal issued
-    because every worker was already pinned costs nothing (nothing is
-    submitted) and must not charge the refused prefix -- often the local
-    workspace -- a backoff it never earned, or a transient dual-mount outage
-    would keep refusing healthy paths for the accrued window after the mounts
-    recover.  The log line deliberately omits the path: the token is
-    agent-supplied and is what the gates exist to keep out of clear-text logs.
+    Only a resolution that actually RAN and timed out is recorded.  A refusal
+    issued because every worker was already pinned (nothing is submitted), or
+    because a submitted resolution never left the queue (its future cancelled
+    on timeout), says nothing about the filesystem and must not charge the
+    refused prefix -- often the local workspace -- a backoff it never earned,
+    or a transient dual-mount outage would keep refusing healthy paths for the
+    accrued window after the mounts recover.  The log line deliberately omits
+    the path: the token is agent-supplied and is what the gates exist to keep
+    out of clear-text logs.
     """
     now = _path_resolve_clock()
     with _path_resolve_lock:
@@ -1340,6 +1371,15 @@ def _run_resolution_bounded(
     rarely and can never pin the whole pool.  Never blocks the caller for longer
     than ``_PATH_RESOLVE_TIMEOUT_SECS``.
 
+    A stall is charged only to a resolution that RAN.  A future that times out
+    still QUEUED (the pool saturated by concurrent callers, e.g. simultaneous
+    cron fires) is cancelled and refuses this call alone: queue wait is
+    evidence about load, not about the mount, so it opens no cooldown and pins
+    no worker in :func:`_wedged_workers`.  A future claimed by a freeing worker
+    in the very instant the deadline fires is abandoned by handshake -- the
+    worker returns without entering the resolution -- so the never-ran
+    classification is binding, not a race.
+
     The UNC shortcut is NOT here: skipping a ``\\\\server\\share`` token is a
     stance about agent-supplied CANDIDATES (:func:`_resolved_forms_bounded`),
     whose fence targets a UNC realpath never produces.  The anchors are the
@@ -1371,12 +1411,21 @@ def _run_resolution_bounded(
         raise PathResolutionStalled(expanded, prefix)
     try:
         started = threading.Event()
+        abandoned = threading.Event()
+        handoff = threading.Lock()
         worker_tid: list[int] = []
 
         @functools.wraps(worker)
-        def _tracked(arg: str) -> _ResolvedT:
+        def _tracked(arg: str) -> _ResolvedT | None:
             worker_tid.append(threading.get_native_id())
-            started.set()
+            with handoff:
+                if abandoned.is_set():
+                    # The caller classified this future as never-run at its
+                    # deadline: return without touching the filesystem, so a
+                    # late claim can neither probe a wedged mount nor pin a
+                    # worker _wedged_workers() is not tracking.
+                    return None
+                started.set()
             return worker(arg)
 
         future = path_resolve_executor().submit(_tracked, expanded)
@@ -1386,9 +1435,28 @@ def _run_resolution_bounded(
     try:
         value = future.result(timeout=budget)
     except FutureTimeoutError:
-        if not started.is_set() and future.cancel():
-            # Only a future proven dead by cancel() may go untracked: one that refuses
-            # cancellation is running, and would pin a worker _wedged_workers() cannot see.
+        if future.cancel():
+            # Never claimed by a worker: the pool was saturated and the
+            # resolution never started -- evidence about load, not the mount.
+            logger.debug(
+                "sensitive-path symlink resolution refused: the resolver pool was "
+                "saturated and the resolution never started; prefix not charged"
+            )
+            raise PathResolutionStalled(expanded, prefix) from None
+        with handoff:
+            ran = started.is_set()
+            if not ran:
+                abandoned.set()
+        if not ran:
+            # Claimed by a freeing worker in the instant the deadline fired,
+            # before entering the resolution.  The handshake makes the
+            # classification binding: the worker sees ``abandoned`` and returns
+            # without probing, so it pins nothing and there is nothing to
+            # charge -- the same conclusion as the queued arm above.
+            logger.debug(
+                "sensitive-path symlink resolution refused: the resolver pool was "
+                "saturated and the resolution never started; prefix not charged"
+            )
             raise PathResolutionStalled(expanded, prefix) from None
         with _path_resolve_lock:
             _path_resolve_wedged.append(future)
@@ -1639,15 +1707,14 @@ def _home_dir_targets_uncached(
     # membership in *home_dirs* for the same reason as the agents dir above: a
     # write-tier build must not gain a read-tier target.
     _adapter_roots = dict(resolved.adapter_roots)
-    for _leaf, _root_envs in _OVERRIDE_ANCHORED_LEAVES:
+    for _leaf, _root_envs, _under_root in _OVERRIDE_ANCHORED_LEAVES:
         if _leaf not in home_dirs:
             continue
-        _basename = _leaf_basename(_leaf)
         for _env in _root_envs:
             _root = _adapter_roots.get(_env)
             if not _root:
                 continue
-            _full = os.path.join(_root, _basename)
+            _full = os.path.join(_root, *_leaf_segments(_under_root))
             sensitive_targets.add(_full.casefold())
             _full_real = _realpath_or_none(_full)
             if _full_real is not None:
@@ -1743,15 +1810,16 @@ class _ResolvedRoots(NamedTuple):
     # under this root. No host SSO cache contents are copied in; that staging was
     # removed. It is therefore anchored by re-anchoring EVERY ``home_dirs`` entry
     # in ``_home_dir_targets_uncached``, rather than through
-    # ``_OVERRIDE_ANCHORED_LEAVES``, which maps one leaf to the roots its parent
-    # can move to. Without it the relocated tree sits at a path no matcher
+    # ``_OVERRIDE_ANCHORED_LEAVES``, which maps one leaf to the roots that move
+    # it. Without it the relocated tree sits at a path no matcher
     # covers, so an agent inside a pod could read the operator's identity token
     # at the pod-path spelling while the identical bytes at ``~/.aws`` are
     # refused.
     os_home: str | None
 
 
-#: Sensitive leaf -> the ``$HOME``-override VARIABLES its parent can be moved by.
+#: Sensitive leaf -> the ``$HOME``-override VARIABLES that move it, and the
+#: spelling it takes under each of them.
 #:
 #: PROJECTED from the harness declarations, not enumerated: the pairing has to
 #: name the same leaf the list above fences and the same variable the resolver
@@ -1761,7 +1829,7 @@ class _ResolvedRoots(NamedTuple):
 #:
 #: Read once at import, like the leaf list itself: the declarations are static
 #: data, and re-projecting per gate call would put a table walk on the hot path.
-_OVERRIDE_ANCHORED_LEAVES: tuple[tuple[str, tuple[str, ...]], ...] = (
+_OVERRIDE_ANCHORED_LEAVES: tuple[tuple[str, tuple[str, ...], str], ...] = (
     host_auth.override_anchored_leaves()
 )
 
@@ -2281,14 +2349,13 @@ def sandbox_credential_targets(exclude_leaves: tuple[str, ...] = ()) -> tuple[st
                     break
     # An adapter's credential store follows that adapter's own home override.
     adapter_roots = dict(resolved.adapter_roots)
-    for leaf, root_envs in _OVERRIDE_ANCHORED_LEAVES:
+    for leaf, root_envs, under_root in _OVERRIDE_ANCHORED_LEAVES:
         if leaf in excluded or leaf not in _SENSITIVE_HOME_DIRS:
             continue
-        basename = _leaf_basename(leaf)
         for env in root_envs:
             root = adapter_roots.get(env)
             if root:
-                targets.add(os.path.join(root, basename))
+                targets.add(os.path.join(root, *_leaf_segments(under_root)))
     return tuple(sorted(targets))
 
 

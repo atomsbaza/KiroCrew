@@ -105,6 +105,27 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Memory recovery responses",
+        "dashboard/handlers/memory_admin.py",
+        "Retired episode text and supersession references, plus backup and restore "
+        "failure details served to the memory recovery panel. These fields pass "
+        "through the shared credential + exfiltration-URL chain before egress.",
+    ),
+    (
+        "Memory record editor responses",
+        "dashboard/handlers/memory_edit.py",
+        "Record detail, correction previews, and bulk operation results served to "
+        "the memory editor. Nested fields pass through the shared credential + "
+        "exfiltration-URL chain before reaching the browser.",
+    ),
+    (
+        "Member memory recall and copy responses",
+        "dashboard/handlers/memory_member.py",
+        "Selected facts, experiences, corrections, and owner-selected copy results "
+        "returned to the dashboard or the memory_recall tool. Nested fields pass "
+        "through the shared credential + exfiltration-URL chain before serialization.",
+    ),
+    (
         "CLI wheel-update failures",
         "cli_server.py",
         "The failure text `kirocrew update` prints when a managed-venv shadow "
@@ -184,6 +205,19 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "`*_TOKEN=` echo -- shapes the shared credential family does NOT match, so "
         "this sink adds its own npm patterns on top of the shared two-pass and "
         "redacts at the source rather than at either boundary.",
+    ),
+    (
+        "Browser panel launch failures",
+        "browser_cli/launcher.py",
+        "The CLI's own words when the Browser panel's address bar could not open a "
+        "page (`playwright-cli -s=panel-… open|goto` failing), shown VERBATIM in the "
+        "panel's failure card; the gateway log gets only the session name and the "
+        "exit code, never the text. The daemon's stack quotes its "
+        "environment and the URL the human typed, so the text can carry a "
+        "query-string credential or a `*_TOKEN=` echo; `_error_text` distills the "
+        "message and runs the shared credential + exfiltration-URL chain on the "
+        "kept lines BEFORE the cap, so a truncated head cannot leak what the tail "
+        "would have matched.",
     ),
     (
         "Azure DevOps comment bodies",
@@ -649,14 +683,6 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "passes the exfiltration-URL and credential scanners before dispatch.",
     ),
     (
-        "Crew Mode delivery",
-        "crew_chat.py",
-        "Every crew-slot post (`_post`): forwarded subagent summaries/errors, "
-        "decision-agent questions, and topic-meta renders — all LLM-authored — "
-        "written to the transcript, broadcast over WS, and persisted to the "
-        "conversation log.",
-    ),
-    (
         "Onboarding import",
         "onboarding_import.py",
         "Imported foreign-agent history and config before it enters Kiro Crew.",
@@ -668,7 +694,7 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "channel inherits redaction from this one egress.",
     ),
     (
-        "Hook auto-replies (shared channel pipeline)",
+        "Hook replies and memory refusals (shared channel pipeline)",
         "messaging/dispatch.py",
         "A user-defined `on_message` hook can answer a turn instead of the model, "
         "which SHORT-CIRCUITS the turn and so never reaches the redactor in "
@@ -680,12 +706,20 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "the session-directive consumer's confirmation log line, which scrubs the "
         "same LLM-derived text before it reaches the gateway log; it is named here "
         "rather than allowlisted separately because a module gets one "
-        "classification and the egress one is the load-bearing half.",
+        "classification and the egress one is the load-bearing half. Member-memory "
+        "refusals also remove local paths before truncation and channel delivery.",
     ),
     (
         "Outbound raster payloads",
         "messaging/outbound_files.py",
         "Exact raster bytes pass both credential and exfiltration-URL scanners " "before upload.",
+    ),
+    (
+        "Slack member-memory refusal",
+        "slack/transport_dispatch.py",
+        "Member-memory errors bypass the streamed response. Credentials, "
+        "exfiltration URLs and local paths are removed before the bounded "
+        "refusal is sent to the channel.",
     ),
     (
         "Discord direct send",
@@ -1322,6 +1356,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
         "apps/builtins/mochi/redact.py",
+        # Shared declared-temp warning-field formatter: applies a redactor the
+        # caller injects, then repr-escapes the result. It emits nothing; the
+        # probe and gateway logger modules that consume the returned string are
+        # the output boundaries.
+        "sandbox.py",
         # Shared model-fallback text builders (fallback_story_of /
         # annotate_model_fallback): scrub the chain-exhaustion story and the
         # fallback-served warning line ONCE, centrally, so every consumer gets
@@ -1330,6 +1369,17 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # paths in slack/gateway.py and the sub-agent completion path in
         # subagent.py), which are the registered sinks.
         "llm_helpers.py",
+        # The app-facing seam: it OWNS no output. It hands the redaction pass to
+        # an installed app so the app can scrub content at its own boundary, and
+        # the write that follows happens in app code this repo does not inventory.
+        # Registering it as a sink would count an egress path as covered on the
+        # strength of a call the app may never make, which is the overstatement
+        # the panel's count exists to avoid; the app's own boundary is the real
+        # one and is outside this list either way. Not a companion-blind site
+        # despite naming a baseline redactor: it takes the WARNINGS from the
+        # baseline pass and finishes the text through `redact_via_context`, so a
+        # loaded companion's patterns still apply to whatever the app publishes.
+        "apps/scrub_sdk.py",
         # Redacts artifact names/metadata at the point they are STAGED (the
         # pushable list and the S3 meta sidecar), before any response exists.
         # It owns no output of its own — every HTTP response carrying that data

@@ -85,6 +85,7 @@ from .shell_normalizer import (
     _REDIRECT_START_RE,
     _SHELL_WRAPPER_CHARS,
     _argv_programs,
+    _backtick_closer,
     _cut_at_operator,
     _data_consumer_exempt,
     _debracket,
@@ -774,8 +775,8 @@ def _python_reads_stdin(later_tokens: list[str]) -> bool:
 #     text, because empty-quote glue hides the verb exactly as it hides the
 #     name (`python -c "ex""ec(...)"` carries no name and no other machinery,
 #     yet the floor denies it);
-#   * the literal name after stripping quotes/backslashes (`k""iro""crew`,
-#     `ki\rocrew` — shlex removes those before the predicates compare).
+#   * the literal name once quotes, backslashes and a `\`+newline continuation
+#     come off (`k""iro""crew`, `ki\rocrew`, `kiro\`+nl+`_crew` — shlex folds them).
 # When none of these is present, no predicate can return True, so the descent
 # is skipped. False positives (e.g. any `$VAR` in a command) merely fall back
 # to the full scan — the safe direction.
@@ -808,7 +809,7 @@ def _self_floor_can_fire(text_lower: str) -> bool:
     # `k""iro""crew token`, `"kirocrew" token`, `python -c "ex""ec(...)"`.
     # Both must be re-checked here -- testing only the name would let a glued
     # `exec(` payload skip the descent while the floor still denies it.
-    stripped = _SELF_FLOOR_QUOTE_JUNK_RE.sub("", text_lower)
+    stripped = _SELF_FLOOR_QUOTE_JUNK_RE.sub("", _shell_join_continuations(text_lower))
     if _SELF_FLOOR_NAME_HINT_RE.search(stripped):
         return True
     return bool(_INLINE_DYNAMIC_EXEC_RE.search(stripped))
@@ -1221,30 +1222,6 @@ def _bare_kill_raw_bodies(source: str) -> "list[str]":
     return bodies
 
 
-def _backtick_closer(source: str, start: int) -> int:
-    """Index of the backtick that CLOSES a substitution opened before *start*.
-
-    Within backticks bash strips a backslash before ``$``, ``\\``` and ``\\\\``,
-    so an escaped backtick is data and must not be taken as the closer --
-    ``str.find`` did, and it truncated ``kill `printf '\\`' ; pgrep -f <name>```
-    one clause short of the target's name (found in pre-push review, bash-
-    measured: the inner command past the escaped backtick runs).  Quotes do NOT
-    protect a backtick from closing, so this scan honours backslashes only.
-
-    -1 when no unescaped closer exists before the text ends.
-    """
-    j = start
-    n = len(source)
-    while j < n:
-        if source[j] == "\\":
-            j += 2
-            continue
-        if source[j] == "`":
-            return j
-        j += 1
-    return -1
-
-
 def _is_self_kill(text_lower: str) -> bool:
     """True if *text_lower* terminates a Kiro Crew process.
 
@@ -1342,12 +1319,32 @@ def _is_self_kill(text_lower: str) -> bool:
         # DE-QUOTED tokens, so a quoted close-paren reads as a real closer and
         # closes the window early, dropping the clause that names the target
         # (``kill $(printf ')' ; pgrep -f kirocrew)``).  Re-derive the same
-        # window from the RAW text, where the quotes still exist.
+        # window from the RAW text, where the quotes still exist.  The counter
+        # also scores a ``case`` PATTERN's ``)`` as a closer, so a lookup placed
+        # after ``case ... esac`` in the body's list falls outside the token
+        # window too -- only this raw window reaches it.  Search each body raw,
+        # with parameter defaults resolved, AND per WORD of the ``_self_tokens``
+        # view (de-quoting only exists as a product of tokenization, and that
+        # view folds a ``backslash-newline`` split name whole and swallows an
+        # untokenizable body instead of raising out of the gate): each word
+        # searched bare AND through ``_resolved_word_view``.  Both members
+        # carry weight: the composed transform reaches what de-quoting leaves
+        # behind (``'kiro''[c]rew'``, ``kiro$()crew``, ``'kiro'${x:-crew}`` --
+        # a name needing TWO transforms sits in the seam between
+        # single-transform searches), while the bare search reaches a name the
+        # transform DESTROYS (``${PATH/usr/|'kiro''crew'|zz-}``; the ``pkill``
+        # leg's sibling seam is tracked in the module spec).  See the helper's docstring for
+        # why the transform is not ``_normalize_operand``.
         for body in _bare_kill_raw_bodies(source):
             if _SELF_NAME_RE.search(_debracket(body)) or _SELF_NAME_RE.search(
                 _resolve_param_defaults(body)
             ):
                 return True
+            for word in _shell_normalizer._self_tokens(body):
+                if _SELF_NAME_RE.search(_debracket(word)) or _SELF_NAME_RE.search(
+                    _shell_normalizer._resolved_word_view(word)
+                ):
+                    return True
     return False
 
 

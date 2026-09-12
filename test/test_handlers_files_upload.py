@@ -327,6 +327,60 @@ async def test_upload_har_is_accepted_as_plain_text(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("extension", [".text", ".xwiki"])
+async def test_upload_plain_text_alias_is_accepted(
+    upload_dir: Path,
+    mock_sel,
+    extension: str,
+) -> None:
+    payload = "Plain UTF-8 text\nUnicode: café 日本語\n".encode()
+    form = aiohttp.FormData()
+    form.add_field(
+        "file",
+        payload,
+        filename=f"notes{extension}",
+        content_type="text/plain",
+    )
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.post("/api/upload/file", data=form)
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+    saved = Path(body["paths"][0])
+    assert saved.name.endswith(f"_notes{extension}")
+    assert saved.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("table-export.tsv", b"Files\tRecords\tCodec\n51000\t204000\tsnappy\n"),
+        ("events.jsonl", b'{"event": "start"}\n{"event": "stop"}\n'),
+    ],
+)
+async def test_upload_tsv_and_jsonl_are_accepted(
+    upload_dir: Path,
+    mock_sel,
+    filename: str,
+    payload: bytes,
+) -> None:
+    form = aiohttp.FormData()
+    form.add_field(
+        "file",
+        payload,
+        filename=filename,
+        content_type="text/plain",
+    )
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.post("/api/upload/file", data=form)
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+    saved = Path(body["paths"][0])
+    assert saved.name.endswith(f"_{filename}")
+    assert saved.read_bytes() == payload
+
+
+@pytest.mark.asyncio
 async def test_upload_unrelated_extension_still_rejected(
     upload_dir: Path,
     mock_sel,

@@ -48,8 +48,7 @@ from kiro_crew.platform.context import current_context, safe_context_call
 from kiro_crew.security import (
     contains_injection,
     is_sensitive_path,
-    redact_credentials,
-    redact_exfiltration_urls,
+    redact_with_findings,
 )
 from kiro_crew.vector_memory import VectorMemoryStore
 
@@ -893,10 +892,8 @@ def _read_text(
 
 def _sanitize_text(text: str, scan: _Scan) -> str:
     bounded = text[:_MAX_TEXT_CHARS]
-    cleaned, warnings = redact_credentials(bounded)
-    scan.secret_count += len(warnings)
-    cleaned, url_warnings = redact_exfiltration_urls(cleaned)
-    scan.secret_count += len(url_warnings)
+    cleaned, credential_warnings, url_warnings = redact_with_findings(bounded)
+    scan.secret_count += len(credential_warnings) + len(url_warnings)
     return cleaned.strip()
 
 
@@ -1338,8 +1335,7 @@ def _skill_package(
         except UnicodeDecodeError:
             scan.diagnostic("skills", "binary_skill_asset_excluded", unsupported=True)
             return None
-        screened, credential_warnings = redact_credentials(text)
-        screened, url_warnings = redact_exfiltration_urls(screened)
+        screened, credential_warnings, url_warnings = redact_with_findings(text)
         scan.secret_count += len(credential_warnings) + len(url_warnings)
         if credential_warnings or url_warnings or screened != text:
             scan.diagnostic("skills", "credential_bearing_skill")
@@ -4219,9 +4215,16 @@ def _preserve_replaced_json(payload: Any, destination: Path) -> str:
 def _lessons_overlap(incoming: str, existing: str) -> bool:
     """Whether two lesson rules are close enough to treat as the same lesson.
 
-    Mirrors ``VectorMemoryStore.write_lesson``'s own dedupe (substring, then
-    >50% significant-word overlap) so import RECOGNIZES the same collisions --
-    but reports them instead of replacing, which is what that writer would do.
+    Tracks ``VectorMemoryStore.write_lesson``'s own dedupe (substring, then
+    significant-word overlap) so import RECOGNIZES the same collisions -- but
+    reports them instead of replacing, which is what that writer would do.
+
+    The overlap divisor is deliberately the SMALLER word set here, which is
+    stricter than the writer's (that one divides by the larger set, because a
+    false positive there DELETES the stored lesson). Import is merge-only, so a
+    false positive costs at most a skipped foreign directive that the user can
+    still teach by hand -- the conservative direction for a boundary that
+    ingests another agent's instructions.
     """
 
     left = incoming.lower().strip()

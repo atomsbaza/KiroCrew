@@ -65,6 +65,7 @@ from kiro_crew.cloud import ssm as cloud_ssm
 # remote token as the CSP frame-ancestor parent origin so the embedded pane can
 # be framed by this desktop app on whatever KIROCREW_PORT it runs on (no
 # hardcoded port, no wildcard). See server._extra_frame_ancestors.
+from kiro_crew.config import live
 from kiro_crew.config.loader import DASHBOARD_PORT as _LOCAL_DASHBOARD_PORT
 from kiro_crew.deploy.engine import aws_spawn_env
 from kiro_crew.instances.constants import CAPABILITY_REPLY_MAX_BYTES as _CAPABILITY_REPLY_MAX_BYTES
@@ -236,6 +237,51 @@ _BENIGN_SSH_STDERR_MARKERS = (
 )
 
 
+# Classification phrases for _exit_error / _ssm_exit_error, matched against the
+# lowercased noise-stripped stderr. The first hit ALSO anchors the sanitized
+# detail window (see _sanitize_banner) so the classified phrase survives the cap
+# even when arbitrary benign stderr (e.g. LocalCommand output) precedes it.
+_SSH_AUTH_SIGNALS = (
+    "permission denied",
+    "publickey",
+    "authentication failed",
+    "certificate has expired",
+    "certificate expired",
+)
+_SSH_TRANSPORT_DROP_SIGNALS = (
+    "timed out during banner exchange",
+    "session ended unexpectedly",
+    "connection timed out",
+    "connection reset",
+    "closed by remote host",
+    "connection refused",
+)
+_SSH_BIND_SIGNALS = ("address already in use", "cannot listen to port")
+_SSM_CREDENTIAL_SIGNALS = (
+    "expired",
+    "unable to locate credentials",
+    "no credentials",
+    "credentials not found",
+)
+_SSM_DENIAL_SIGNALS = ("accessdenied", "not authorized", "unauthorizedoperation")
+_SSM_PLUGIN_SIGNALS = ("sessionmanagerplugin", "session-manager-plugin")
+_SSM_TARGET_SIGNALS = (
+    "targetnotconnected",
+    "not connected",
+    "invalidinstanceid",
+    "invalidinstanceinformation",
+)
+_SSM_BIND_SIGNALS = ("address already in use", "bind")
+
+
+def _first_hit(low: str, phrases: tuple[str, ...]) -> str | None:
+    """Return the first of *phrases* present in *low* (already lowercased)."""
+    for phrase in phrases:
+        if phrase in low:
+            return phrase
+    return None
+
+
 def _recover_backoff_secs(attempt: int, cap: float = _RECOVER_BACKOFF_MAX_SECS) -> float:
     """Exponential backoff before a self-heal rebuild, capped at *cap*. *attempt* is 1-based."""
     base = _RECOVER_BACKOFF_BASE_SECS * (2 ** max(0, attempt - 1))
@@ -258,15 +304,38 @@ def _strip_benign_ssh_noise(text: str) -> str:
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-def _sanitize_banner(text: str) -> str:
+_BANNER_DETAIL_MAX_CHARS = 200
+
+
+def _sanitize_banner(text: str, *, anchor: str | None = None) -> str:
     """ANSI-strip + credential/exfil-redact untrusted ssh stderr before it is
-    surfaced in status/logs, capped at 200 chars. The banner is external,
-    proxy-controlled text, so it is a redacted secondary detail only — never a
-    classification signal."""
+    surfaced in status/logs, capped at ``_BANNER_DETAIL_MAX_CHARS``. The banner
+    is external, proxy-controlled text, so it is a redacted secondary detail
+    only -- never a classification signal.
+
+    When *anchor* names the lowercase classification phrase the exit-error
+    classifier matched, the fixed-width window is centered on the first
+    occurrence of that phrase instead of taken from the head, so benign stderr
+    written earlier (e.g. arbitrary ``LocalCommand`` output such as repeated
+    ``tput`` warnings under launchd/systemd where ``TERM`` is unset) cannot
+    consume the budget and truncate the classified reason out of the surfaced
+    detail. Centering on the phrase itself (never on its line, which the
+    proxy-controlled buffer can make arbitrarily long) keeps the phrase inside
+    the window unconditionally. Without an anchor, or when sanitization
+    removed the phrase, the head slice is unchanged.
+    """
     cleaned = _ANSI_CSI_RE.sub("", text)
     cleaned = redact_credentials(cleaned)[0]
     cleaned = redact_exfiltration_urls(cleaned)[0]
-    return cleaned[:200]
+    if len(cleaned) <= _BANNER_DETAIL_MAX_CHARS:
+        return cleaned
+    if anchor:
+        hit = cleaned.lower().find(anchor)
+        if hit >= 0:
+            start = hit + len(anchor) // 2 - _BANNER_DETAIL_MAX_CHARS // 2
+            start = max(0, min(start, len(cleaned) - _BANNER_DETAIL_MAX_CHARS))
+            return cleaned[start : start + _BANNER_DETAIL_MAX_CHARS]
+    return cleaned[:_BANNER_DETAIL_MAX_CHARS]
 
 
 class ProxyRequestError(Exception):
@@ -693,7 +762,9 @@ class _SshTunnel:
         (idle timeout, banner-exchange timeout, reset, refused) is reported as a
         transport drop — never as an auth verdict inferred from banner text. The
         raw banner is ANSI-stripped and credential-redacted before it is
-        surfaced as a secondary detail.
+        surfaced as a secondary detail, with the fixed-width detail window
+        centered on the matched classification phrase so preceding benign
+        noise (e.g. LocalCommand output) cannot truncate the real reason away.
 
         The SSM transport has an entirely different error vocabulary (IAM
         denials, a missing session-manager-plugin, an offline SSM agent), so it
@@ -709,33 +780,23 @@ class _SshTunnel:
         # failure (the loop symptom was this warning hiding "bind: ... in use").
         tail = _strip_benign_ssh_noise(self._stderr_buf)
         low = tail.lower()
-        detail = _sanitize_banner(tail)
         # Genuine ssh auth signals first, so a real auth failure is never masked
         # by a transport phrase that happens to co-occur in the same banner.
-        if (
-            "permission denied" in low
-            or "publickey" in low
-            or "authentication failed" in low
-            or "certificate has expired" in low
-            or "certificate expired" in low
-        ):
-            return f"ssh auth failed (check SSH access): {detail}"
+        hit = _first_hit(low, _SSH_AUTH_SIGNALS)
+        if hit is not None:
+            return f"ssh auth failed (check SSH access): {_sanitize_banner(tail, anchor=hit)}"
         # WSSH / transport session drops — not an auth problem. Worded neutrally
         # because this method is also used for the initial-connect failure path,
         # where no self-heal is armed yet (so it must not promise reconnection).
-        if (
-            "timed out during banner exchange" in low
-            or "session ended unexpectedly" in low
-            or "connection timed out" in low
-            or "connection reset" in low
-            or "closed by remote host" in low
-            or "connection refused" in low
-        ):
-            return f"ssh tunnel transport drop: {detail}"
-        if "address already in use" in low or "cannot listen to port" in low:
+        hit = _first_hit(low, _SSH_TRANSPORT_DROP_SIGNALS)
+        if hit is not None:
+            return f"ssh tunnel transport drop: {_sanitize_banner(tail, anchor=hit)}"
+        hit = _first_hit(low, _SSH_BIND_SIGNALS)
+        if hit is not None:
+            detail = _sanitize_banner(tail, anchor=hit)
             return f"ssh forward bind failed (local port already in use): {detail}"
         if tail:
-            return f"ssh exited {returncode}: {detail}"
+            return f"ssh exited {returncode}: {_sanitize_banner(tail)}"
         return f"ssh exited with code {returncode}"
 
     def _ssm_exit_error(self, returncode: int | None) -> str:
@@ -750,40 +811,37 @@ class _SshTunnel:
         """
         tail = self._stderr_buf.strip()
         low = tail.lower()
-        detail = _sanitize_banner(tail)
         # Credentials first: an expired/absent credential is the most common
         # cause and its message can also contain "not authorized"-adjacent text.
-        if (
-            "expired" in low
-            or "unable to locate credentials" in low
-            or "no credentials" in low
-            or "credentials not found" in low
-        ):
+        hit = _first_hit(low, _SSM_CREDENTIAL_SIGNALS)
+        if hit is not None:
             return (
                 "AWS credentials missing or expired (refresh them, e.g. "
-                f"`aws sso login --profile <name>`): {detail}"
+                f"`aws sso login --profile <name>`): {_sanitize_banner(tail, anchor=hit)}"
             )
-        if "accessdenied" in low or "not authorized" in low or "unauthorizedoperation" in low:
+        hit = _first_hit(low, _SSM_DENIAL_SIGNALS)
+        if hit is not None:
+            detail = _sanitize_banner(tail, anchor=hit)
             return f"IAM denied ssm:StartSession for this target: {detail}"
-        if "sessionmanagerplugin" in low or "session-manager-plugin" in low:
+        hit = _first_hit(low, _SSM_PLUGIN_SIGNALS)
+        if hit is not None:
             return (
                 "session-manager-plugin is not installed locally (install the AWS "
-                f"Session Manager plugin, then reconnect): {detail}"
+                f"Session Manager plugin, then reconnect): {_sanitize_banner(tail, anchor=hit)}"
             )
-        if (
-            "targetnotconnected" in low
-            or "not connected" in low
-            or "invalidinstanceid" in low
-            or "invalidinstanceinformation" in low
-        ):
+        hit = _first_hit(low, _SSM_TARGET_SIGNALS)
+        if hit is not None:
             return (
                 "the SSM target is not a connected managed node (is the instance "
-                f"running with the SSM agent online and an instance profile?): {detail}"
+                f"running with the SSM agent online and an instance profile?): "
+                f"{_sanitize_banner(tail, anchor=hit)}"
             )
-        if "address already in use" in low or "bind" in low:
+        hit = _first_hit(low, _SSM_BIND_SIGNALS)
+        if hit is not None:
+            detail = _sanitize_banner(tail, anchor=hit)
             return f"SSM forward bind failed (local port already in use): {detail}"
         if tail:
-            return f"SSM session exited {returncode}: {detail}"
+            return f"SSM session exited {returncode}: {_sanitize_banner(tail)}"
         return f"SSM session exited with code {returncode}"
 
     async def _capture_stderr(self) -> None:
@@ -1124,6 +1182,44 @@ class SshTunnelManager:
         self._refresh_tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self._token_minted_at: dict[str, float] = {}
         self._token_ttl_secs: dict[str, int] = {}
+        # The transport tunables above are copies of instances.*, so a config write
+        # reaches them only through apply_config(). Held on self because the watcher
+        # holds the owner weakly. ``fail_closed=False``: the section carries no
+        # authorization, so a degraded document's defaults are the right answer.
+        self._config_sub = live.watch_section(
+            self,
+            "instances",
+            method="apply_config",
+            fail_closed=False,
+            name="SshTunnelManager",
+        )
+
+    def apply_config(self, instances_cfg: object) -> None:
+        """Adopt new ``instances.*`` transport tunables.
+
+        Every value here is consulted per operation -- per connect, per mint, per
+        recovery attempt -- so pushing it onto the manager is a genuine hot apply
+        rather than a value that only matters at construction. The probe threshold
+        is additionally propagated into the tunnels ALREADY running, since each one
+        copied it when it was built and would otherwise keep tearing itself down on
+        the old count.
+
+        ``tunnel_base_port`` is deliberately left alone: the allocator has already
+        handed out ports from the old base and live tunnels hold them, so moving the
+        base mid-flight would only fragment the range. It applies to a manager built
+        after the change.
+        """
+        self._connect_timeout = getattr(instances_cfg, "connect_timeout_secs")
+        self._mint_timeout = getattr(instances_cfg, "mint_timeout_secs")
+        self._ssh_compression = bool(getattr(instances_cfg, "ssh_compression"))
+        self._max_recovery = int(getattr(instances_cfg, "max_recovery_attempts"))
+        self._recover_backoff_max = float(getattr(instances_cfg, "recover_backoff_max_secs"))
+        self._probe_fails = int(getattr(instances_cfg, "probe_failure_threshold"))
+        for tunnel in self._tunnels.values():
+            # Attribute-set on the live tunnel rather than a restart: the threshold
+            # is compared against a running counter, so the new value takes effect on
+            # the next probe without dropping a healthy forward.
+            tunnel._probe_fails = self._probe_fails
 
     async def _persist_hint(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         """Run a registry hint write in a worker thread; return only when it is DONE.

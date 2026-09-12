@@ -108,6 +108,13 @@ DEFAULT_POOL_SIZE = 0
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
 )
+# Per-session process-tree RSS ceiling (MiB) the cleanup watchdog recycles an
+# idle session at. Non-zero by default so a runaway session tree is bounded
+# out of the box: fleet gateways were observed at several hundred MB with
+# nothing bounding them. 1536 leaves a healthy kiro-cli plus its MCP servers
+# (typically 300-600 MiB) a wide margin while still catching a leak before
+# it takes the host with it. 0 disables.
+DEFAULT_WATCHDOG_RSS_MAX_MB = 1536
 
 
 def normalize_agent_model(model: object) -> str:
@@ -499,24 +506,38 @@ _AVATAR_FILE_PIN_RE = _re.compile(r"^[0-9a-f]{16}\.(?:png|jpg|webp)$")
 #: on one of these exactly; any other key is dropped, so a version-skewed or
 #: typo'd state name cannot smuggle an unbounded key set into config.json.
 _AVATAR_STATES = ("working", "done", "error")
-#: The only trait axes a per-state expression may move. The identity axes
-#: (brows/accessory/prop/tile/blush/flip) are deliberately excluded: a crew
-#: must stay recognisable as itself while its expression changes.
-_AVATAR_EXPRESSION_AXES = ("eyes", "mouth")
+#: Built-in reaction motions a GHOST may play, per state. The vocabulary is
+#: pinned here rather than left open like a trait value because a motion is a
+#: named animation the frontend implements: an unknown name has no rendering to
+#: resolve to, so it carries nothing and is dropped. ``"none"`` is a real value
+#: (explicit stillness), distinct from an absent state, so one state can opt out
+#: of a motion the others use. ``working`` has no entry -- the ghost's working
+#: animation is its idle breathing, and a reaction fires on a transition.
+_AVATAR_MOTIONS: dict[str, tuple[str, ...]] = {
+    "done": ("none", "bounce", "nod", "sparkle"),
+    "error": ("none", "shake", "cross-eyes", "droop"),
+}
 #: Preset cue names a per-state sound may select. `"none"` is a real value
 #: (explicit silence), distinct from an absent state (the default, also
 #: silent) -- so a crew can opt one state out of a fleet-wide cue.
 _AVATAR_SOUNDS = ("none", "chime", "ding", "blip", "pop", "pulse")
 
 
-def _safe_expressions(value: object) -> dict:
-    """Return validated per-state expression overrides, or ``{}``.
+#: The only trait axes a per-state ghost expression may move. The identity axes
+#: (brows/accessory/prop/tile/blush/flip) are excluded: a crew must stay
+#: recognisable as itself while its expression changes.
+_AVATAR_EXPRESSION_AXES = ("eyes", "mouth")
 
-    Same forgiveness as the trait coercer: junk is dropped silently rather
-    than refused, because config.json is hand-editable and a malformed
-    expression must never cost the crew its otherwise-valid avatar. A state
-    whose axes all drop out is omitted, so the record never stores an empty
-    per-state dict.
+
+def _safe_expressions(value: object) -> dict:
+    """Return validated per-state ghost eyes/mouth picks, or ``{}``.
+
+    The key ``motions`` supersedes, kept round-tripping for exactly as long as the
+    shipped renderer still draws it: the frontend writes and paints a ghost's
+    per-state eyes/mouth today, so a validator that dropped the key would erase a
+    visible choice on an unrelated save with no way back. The sibling frontend
+    change that removes the picker is where this retires. Same forgiveness as the
+    trait coercer -- junk is dropped, never refused.
     """
     if not isinstance(value, dict):
         return {}
@@ -528,13 +549,31 @@ def _safe_expressions(value: object) -> dict:
         axes = {}
         for axis in _AVATAR_EXPRESSION_AXES:
             v = raw.get(axis)
-            # An empty string is "absent", which is what omitting the axis
-            # already means -- storing it would be a second spelling of the
-            # same state.
             if isinstance(v, str) and v:
                 axes[axis] = v[:_AVATAR_TRAIT_MAX_LEN]
         if axes:
             out[state] = axes
+    return out
+
+
+def _safe_motions(value: object) -> dict:
+    """Return validated per-state ghost motions, or ``{}``.
+
+    Same forgiveness as the trait coercer: junk is dropped silently rather than
+    refused, because config.json is hand-editable and a malformed motion must
+    never cost the crew its otherwise-valid avatar. Only the states
+    :data:`_AVATAR_MOTIONS` names carry a motion, and only a value from that
+    state's own tuple survives -- ``{"done": "shake"}`` is dropped, because
+    ``shake`` is the error vocabulary and a bounce-on-error is a different
+    reaction than the author wrote.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for state, allowed in _AVATAR_MOTIONS.items():
+        v = value.get(state)
+        if isinstance(v, str) and v in allowed:
+            out[state] = v
     return out
 
 
@@ -558,25 +597,33 @@ def _safe_sounds(value: object) -> dict:
 def _safe_avatar(value: object) -> dict:
     """Return a validated per-crew avatar override, or ``{}`` on junk.
 
-    Accepted shapes:
+    Each tier owns its own source of motion and sound, so what a record may
+    carry depends on its ``kind``:
 
-    - ``{"kind": "ghost", "traits": {...}}`` — pins the ghost face
-      trait-by-trait instead of deriving it from the crew name. ``traits`` may
-      be absent (or empty) when the override carries only ``expressions`` /
-      ``sounds``: that spelling means "name-derived face, plus these
-      per-state overrides", and the record omits the key entirely rather than
-      storing ``{}``.
-    - ``{"kind": "image"}`` (optional int ``v``, optional ``file``) — the crew
-      wears an uploaded picture, served from ``GET /api/agents/{name}/avatar``.
-      The file itself lives under the data home's agent-fenced
-      ``run/avatars/`` dir; the config
-      field only marks the choice. ``v`` is the upload's cache-busting stamp
-      (file mtime, nanoseconds): the frontend appends it as ``?v=`` so a
-      replaced picture is re-fetched without waiting out the browser cache.
-      ``file`` pins the exact committed file — a ``<digest>.<ext>`` suffix
-      under the crew's stem. Every install lands at a digest-named path, so a
-      replacement never overwrites the committed file before the config save
-      commits it, and serving resolves only the pinned file.
+    - ``{"kind": "ghost", "traits"?: {...}, "motions"?: {...}, "sounds"?: {...},
+      "expressions"?: {...}}`` — the built-in face. ``traits`` pins it trait-by-trait instead of deriving
+      it from the crew name, and may be absent (or empty) when the override
+      carries only reactions: that spelling means "name-derived face, plus these
+      per-state reactions", and the record omits the key entirely rather than
+      storing ``{}``. ``motions`` picks a built-in reaction animation per state
+      from :data:`_AVATAR_MOTIONS`; ``sounds`` picks a synthesized preset cue per
+      state from :data:`_AVATAR_SOUNDS`; ``expressions`` (a per-state eyes/mouth
+      pick, which ``motions`` supersedes) still round-trips because the shipped
+      renderer still draws it -- see :func:`_safe_expressions`.
+    - ``{"kind": "image"}`` (optional int ``v``, optional ``file``, optional
+      ``sounds``) — the crew wears an uploaded picture, served from
+      ``GET /api/agents/{name}/avatar``. A picture has no animation to play, so it
+      carries no ``motions``; it does still carry a cue, because the shipped
+      renderer plays a crew's cue whatever face it wears, and dropping the key
+      here would silence a crew on an unrelated save with no way to restore it.
+      The file itself lives under the data home's agent-fenced ``run/avatars/``
+      dir; the config field only marks the choice. ``v`` is the upload's cache-busting stamp (file
+      mtime, nanoseconds): the frontend appends it as ``?v=`` so a replaced
+      picture is re-fetched without waiting out the browser cache. ``file`` pins
+      the exact committed file — a ``<digest>.<ext>`` suffix under the crew's
+      stem. Every install lands at a digest-named path, so a replacement never
+      overwrites the committed file before the config save commits it, and
+      serving resolves only the pinned file.
     - ``{"kind": "pack", "id": "<pack id>"}`` — the crew wears an appearance
       pack from the crew library (``GET /api/appearances``). ``id`` is
       validated by :func:`kiro_crew.appearance_packs.safe_pack_id`, the same
@@ -585,42 +632,50 @@ def _safe_avatar(value: object) -> dict:
       ``{}``: an unrenderable pack reference is worse than the default face.
       Whether the pack still EXISTS is deliberately not checked — config load
       must not touch the disk — so a dangling id renders as the name-derived
-      ghost on the client.
+      ghost on the client. A pack carries its own per-state art
+      (``GET /api/appearances/{id}/slot/{slot}``) and its own per-state audio
+      (``GET /api/appearances/{id}/sound/{state}``), so it needs no ``motions``
+      here. It keeps accepting ``sounds`` for now, for the same reason the picture
+      tier does: the shipped renderer plays a crew-record cue on every tier, so
+      retiring the key before that renderer stops reading it would take away a
+      sound the user chose. Once the pack's own audio is what plays, the crew
+      record has no cue to hold and the key retires with that change.
+
+    ``<state>`` is one of ``working``, ``done``, ``error``. A key is omitted
+    from the record when validation leaves it empty, so a stored avatar never
+    carries ``{}`` for one, and a key illegal on this tier is DROPPED rather
+    than refused — the same forgiveness every other field here has, because a
+    hand-written or version-skewed record must not cost the crew its face. Two
+    keys are deliberately NOT retired that way even though ``motions`` supersedes
+    one of them: ``sounds`` is audible on every tier today, and a ghost's
+    ``expressions`` is drawn today, and a value a user can see or hear is not
+    dropped ahead of the renderer that shows it. ``expressions`` round-trips on
+    picture and pack too, even though neither has a face to move: the shipped
+    builder still SUBMITS it there, and a crew that switches from ghost to
+    picture and back would otherwise lose the picks in between. Only ``motions``
+    is tier-gated, because nothing has ever written it outside the ghost.
 
     Empty means "no override" — the frontend keeps rendering the name-seeded
     face. config.json is hand-editable (and agent-writable), so junk collapses
     to ``{}`` rather than crashing the load.
-
-    All three kinds may also carry two optional per-state keys, validated and
-    round-tripped through the endpoints and config persistence (a string axis is
-    normalized by the same 32-char truncation a trait gets, so a longer value
-    comes back shortened rather than verbatim):
-
-    - ``expressions: {"<state>": {"eyes"?: str, "mouth"?: str}}`` — the face
-      moves those two axes while the agent is in that state. Only ``eyes`` and
-      ``mouth`` are accepted, so the identity axes stay put and the crew
-      remains recognisable as itself. Legal on ``kind: "image"`` too — stored,
-      and ignored by the picture renderer.
-    - ``sounds: {"<state>": "none"|"chime"|"ding"|"blip"|"pop"|"pulse"}`` — a
-      shipped cue preset per state. ``"none"`` is explicit silence, kept
-      distinct from an absent state so one state can opt out of a cue the
-      others use.
-
-    ``<state>`` is one of ``working``, ``done``, ``error``. Either key is
-    omitted from the record when validation leaves it empty, so a stored
-    avatar never carries ``{}`` for one.
 
     Trait *values* are deliberately not checked against the frontend's trait
     vocabulary: the renderer resolves an unknown option to "absent"
     (``EYES[k] ?? ''``), and keeping the vocabulary in one place (the style
     module) means a new hat needs no backend release. ``tile`` is the one
     exception — it is interpolated into SVG markup, so it is pinned to a hex
-    color by the same validator session_color uses.
+    color by the same validator session_color uses. A motion or cue name is
+    pinned, because unlike a trait it names an animation or a synthesizer
+    preset rather than an option a renderer can resolve to nothing.
     """
     if not isinstance(value, dict):
         return {}
-    expressions = _safe_expressions(value.get("expressions"))
+    # Legal on every tier: the shipped renderer reads a crew-record cue
+    # kind-agnostically, so this is the one reaction key that is not the ghost's
+    # alone. `motions` IS ghost-only -- a picture has no face to move and a pack
+    # animates from its own files.
     sounds = _safe_sounds(value.get("sounds"))
+    expressions = _safe_expressions(value.get("expressions"))
     if value.get("kind") == "image":
         out: dict[str, object] = {"kind": "image"}
         v = value.get("v")
@@ -643,10 +698,6 @@ def _safe_avatar(value: object) -> dict:
             return {}
         pack: dict[str, object] = {"kind": "pack", "id": ident}
         if expressions:
-            # Accepted for symmetry with the other two kinds and round-tripped
-            # faithfully, but a pack renderer IGNORES it: the art is the pack's
-            # own files, not a trait-composed ghost, so there is no eyes/mouth
-            # axis to move. `sounds` behaves exactly as it does elsewhere.
             pack["expressions"] = expressions
         if sounds:
             pack["sounds"] = sounds
@@ -676,6 +727,9 @@ def _safe_avatar(value: object) -> dict:
     ghost: dict[str, object] = {"kind": "ghost"}
     if traits:
         ghost["traits"] = traits
+    motions = _safe_motions(value.get("motions"))
+    if motions:
+        ghost["motions"] = motions
     if expressions:
         ghost["expressions"] = expressions
     if sounds:
@@ -754,7 +808,14 @@ DEFAULT_CWD_ALLOWED_ROOTS = [
 class AgentConfig:
     approval_mode: str = field(
         default="auto",
-        metadata=_meta("Approval Mode", "Tool approval mode.", enum=["auto", "interactive"]),
+        metadata=_meta(
+            "Approval Mode",
+            "Tool approval mode. Every channel dispatcher resolves it once at start "
+            "(with the CLI --approval override), so a change takes effect at the "
+            "next restart.",
+            enum=["auto", "interactive"],
+            restart=True,
+        ),
     )
     streaming: bool = field(
         default=True,
@@ -1005,6 +1066,7 @@ class AgentConfig:
             "edition has none, so 'auto' and 'on' are no-ops there); 'off' disables "
             "it. Disable per-invocation with --no-jail or KIROCREW_NO_JAIL=1.",
             enum=list(_VALID_JAIL_MODES),
+            restart=True,
         ),
     )
     dangerously_skip_permissions: bool = field(
@@ -1017,6 +1079,7 @@ class AgentConfig:
             "config-file-only escape hatch — there is deliberately no dashboard "
             "toggle for it. An enterprise policy can forbid it, which falls back "
             "to the ad-hoc duration below.",
+            restart=True,
         ),
     )
     yolo_duration: str = field(
@@ -1499,11 +1562,11 @@ class SessionConfig:
         ),
     )
     watchdog_rss_max_mb: int = field(
-        default=0,
+        default=DEFAULT_WATCHDOG_RSS_MAX_MB,
         metadata=_meta(
             "Watchdog RSS Limit (MiB)",
             "Recycle a session when its process tree resident memory exceeds "
-            "this many MiB. 0 disables (default). Busy sessions (turn in "
+            "this many MiB (default 1536). 0 disables. Busy sessions (turn in "
             "flight) are never recycled.",
         ),
     )
@@ -1570,7 +1633,11 @@ class MessagingConfig:
             "How direct-message conversations map to sessions. 'per-channel-peer' "
             "(default) keeps one session per (channel, user), so the same person on "
             "Telegram vs WeCom stays isolated. 'unified' collapses all DMs into one "
-            "shared session per agent for cross-surface continuity.",
+            "shared session per agent for cross-surface continuity. Takes effect at "
+            "the next restart: each conversation's generation counter is seeded from "
+            "the namespace in force at boot, so switching namespaces live could "
+            "resume a stale session persisted under the other one.",
+            restart=True,
         ),
     )
     idle_reset_minutes: int = field(
@@ -1645,18 +1712,23 @@ class MemoryConfig:
     )
     embedding_dim: int = field(
         default=1024,
-        metadata=_meta("Embedding Dimension", "Dimensionality of embedding vectors."),
+        metadata=_meta(
+            "Embedding Dimension",
+            "Dimensionality of embedding vectors. Changing it changes the vector "
+            "space, so every stored embedding must be regenerated -- applied by the "
+            "Settings embedding-model action, not by a plain config write.",
+            restart=True,
+        ),
     )
     embedding_threads: int = field(
         default=4,
         metadata=_meta(
             "Embedding Threads",
-            "CPU threads llama.cpp may use per embedding call. Left unset, llama.cpp "
-            "sizes its batch pool from the host core count, so even a few-token embed "
-            "fans out across every core and competes with the rest of the gateway. "
-            "Embedding a short query does not need many threads; raise this only if "
-            "bulk re-embedding throughput matters more than interactive latency. "
-            "Clamped to the machine's core count.",
+            "CPU threads for an explicit memory query or user-started re-embedding. "
+            "Defaults to 4; explicit settings are honoured up to the machine's "
+            "core count. All memory stores share one model and inference worker. "
+            "V2 message context does not run an embedding search; V1 retains "
+            "its session-start retrieval.",
         ),
     )
     embedding_bulk_threads: int = field(
@@ -1667,9 +1739,10 @@ class MemoryConfig:
             "gives imported memories semantic reach, plus imports and consolidation — "
             "as opposed to a query you are waiting on. Defaults to 1: nothing waits on "
             "this work (those rows are keyword-searchable meanwhile), so it is tuned to "
-            "stay invisible rather than finish early. Raise it to get through a large "
-            "backlog sooner; interactive search keeps its own pool either way. 0 means "
-            "inherit Embedding Threads. Clamped to the machine's core count.",
+            "use fewer resources rather than finish early. Both classes share one "
+            "inference worker; waiting interactive queries take priority. 0 means "
+            "inherit Embedding Threads. Explicit settings are honoured up to "
+            "the machine's core count.",
         ),
     )
     embedding_bulk_duty: float = field(
@@ -1677,9 +1750,9 @@ class MemoryConfig:
         metadata=_meta(
             "Embedding Duty Cycle (bulk)",
             "Fraction of wall time a background embedding sweep targets for computing. "
-            "At the default 0.2 it idles four times as long as it works, so a sweep "
-            "over a freshly imported memory costs about a fifth of one core instead of "
-            "several — the same total work, spread thin enough that fans never react. "
+            "At the default 0.2 the shared worker targets an idle interval four times "
+            "as long as each bulk inference. Parallel stores share this pacing; "
+            "interactive queries can interrupt the idle interval. "
             "The sweep resumes across restarts, so it need not finish in one session. "
             "A target rather than a ceiling: one unusually slow row is capped at a "
             "30-second pause and so runs hotter than the configured share. 1.0 runs "
@@ -1707,6 +1780,7 @@ class MemoryConfig:
             "embedding_dim to the model's output width. Changing the model changes the "
             "vector space, so stored embeddings are regenerated automatically. The "
             "KIROCREW_EMBED_MODEL_PATH env var wins over this.",
+            restart=True,
         ),
     )
     embed_model_id: str = field(
@@ -1717,6 +1791,7 @@ class MemoryConfig:
             "'custom:<filename>:<size>', which changes when a different model file is "
             "used. Set this explicitly if you swap between models of identical byte size, "
             "which the default derivation cannot distinguish.",
+            restart=True,
         ),
     )
     semantic_confidence_threshold: float = field(
@@ -1739,12 +1814,16 @@ class MemoryConfig:
     )
     episodic_max_count: int = field(
         default=10_000,
-        metadata=_meta("Episodic Max Count", "Maximum total episodic memories stored."),
+        metadata=_meta(
+            "Episodic Max Count",
+            "V1 episodic storage cap. V2 retains memories without automatic capacity eviction.",
+        ),
     )
     decay_rates: dict[str, float] = field(
         default_factory=dict,
         metadata=_meta(
             "Memory Decay Rates",
+            "V1 only; V2 recall scores do not decay with age. "
             "Per-tag episodic recency decay rates, per day (retrieval score factor "
             "exp(-rate * days_old)). Keys are memory tags (case-insensitive); the "
             "reserved 'default' key replaces the built-in 0.03 for memories matching "
@@ -1771,6 +1850,31 @@ class MemoryConfig:
     history_max_days: int = field(
         default=365,
         metadata=_meta("History Max Days", "Maximum days of history to retain."),
+    )
+    private_provisioning_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "New Private Memory",
+            "Allow creating private V2 member stores and explicit V1-to-V2 setup. "
+            "Turn off to pause provisioning; existing V2 execution, management "
+            "and isolation continue.",
+        ),
+    )
+    backup_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Automatic Memory Backups",
+            "Take a daily rotating copy of each active member V2 store. Global and "
+            "named V1 backups remain manual. This does not delete active memories.",
+        ),
+    )
+    backup_keep: int = field(
+        default=7,
+        metadata=_meta(
+            "Memory Backups Kept",
+            "How many backups to keep per store after an automatic or requested backup. "
+            "Values below 1 are treated as 1 so retention cannot empty the directory.",
+        ),
     )
     migrated: bool = field(
         default=False,
@@ -1984,7 +2088,9 @@ class KnowledgeConfig:
             "Extraction Pool Size",
             "Number of concurrent LLM workers for document extraction. More "
             "workers = faster ingestion but higher peak cost. Each worker holds "
-            "a long-lived session. Requires restart to take effect.",
+            "a long-lived session. A change applies at the next idle boundary: "
+            "the pool keeps its current width until it scales to zero, so an "
+            "ingest already running is never resized under it.",
         ),
     )
 
@@ -2031,7 +2137,15 @@ class SlackConfig:
     )
     command: str = field(
         default="kirocrew",
-        metadata=_meta("Command", "Slack slash command trigger word."),
+        metadata=_meta(
+            "Command",
+            "Slack slash command trigger word.",
+            # Boot-read: the trigger is registered in the Slack app MANIFEST, so
+            # a local reload cannot make Slack route a new word. Applying it
+            # in-process would only change the help text and report success for a
+            # command that still does not exist on Slack's side.
+            restart=True,
+        ),
     )
     forward_to_agent_callback: str = field(
         default="",
@@ -2195,6 +2309,7 @@ class TailscaleConfig:
             "Tailscale is absent, stopped, or MagicDNS is off. Does NOT widen the "
             "network bind and does NOT change authentication — every request "
             "still needs a dashboard session.",
+            restart=True,
         ),
     )
     trust_identity: bool = field(
@@ -2209,6 +2324,7 @@ class TailscaleConfig:
             "load. Every failure to verify a peer falls back to the ordinary "
             "token path. Takes effect on the next gateway start (the trust "
             "settings are read once at startup).",
+            restart=True,
         ),
     )
     allowed_logins: list[str] = field(
@@ -2219,6 +2335,7 @@ class TailscaleConfig:
             "a shared tailnet can have hundreds of members, so identity trust "
             "without an allowlist would hand each of them the dashboard. A "
             "verified peer whose login is not listed is denied.",
+            restart=True,
         ),
     )
     pin_scope: str = field(
@@ -2231,6 +2348,7 @@ class TailscaleConfig:
             "unrecognised value falls back to 'node'. An ACL-tagged node is "
             "always pinned at node scope regardless of this setting. Takes "
             "effect on the next gateway start.",
+            restart=True,
         ),
     )
     bind_refresh_chains: bool = field(
@@ -2246,6 +2364,7 @@ class TailscaleConfig:
             "refresh cookie renews from any allowed node. Existing chains keep "
             "the binding they were opened with; the change applies to sessions "
             "started after the next gateway start.",
+            restart=True,
         ),
     )
     keep_awake: bool = field(
@@ -2459,6 +2578,47 @@ class JiraAuthEntry:
     )
 
 
+@dataclass
+class LinkPatternRule:
+    """One text-to-link rewrite rule for chat transcripts.
+
+    Rendering-only: the dashboard rewrites matching plain text into links at
+    display time; stored messages are never modified. The pattern is compiled
+    by the BROWSER (JavaScript regex dialect), so the backend validates only
+    shape and size, never regex semantics.
+    """
+
+    pattern: str = field(
+        default="",
+        metadata=_meta(
+            "Pattern",
+            "JavaScript regular expression matched against transcript text "
+            "(e.g. '\\\\bPROJ-\\\\d+\\\\b'). A rule that matches the empty string is "
+            "ignored.",
+        ),
+    )
+    url: str = field(
+        default="",
+        metadata=_meta(
+            "URL Template",
+            "Link target for each match: an absolute http(s) URL in which "
+            "'{match}' inserts the matched text, percent-encoded (e.g. "
+            "'https://tracker.example.com/browse/{match}'). The renderer "
+            "additionally requires the placeholder outside the host and "
+            "refuses userinfo.",
+        ),
+    )
+
+
+# dashboard.link_patterns -- bounds on operator-supplied transcript link rules.
+# The count cap bounds per-message scan work (each rule is one regex pass over
+# every rendered markdown block); the length caps bound pathological patterns
+# and keep the config API payload small.
+LINK_PATTERNS_MAX = 50
+LINK_PATTERN_PATTERN_MAX_LEN = 300
+LINK_PATTERN_URL_MAX_LEN = 2000
+
+
 # dashboard.loop_stall_exit_after_secs -- event-loop silence tolerated before
 # the gateway dumps all thread stacks and hard-exits. ``None`` is the
 # serializable "automatic" sentinel: launch class selects the desktop or
@@ -2493,6 +2653,7 @@ class DashboardConfig:
         metadata=_meta(
             "Dashboard URL",
             "Public URL for the dashboard (used in Slack links).",
+            restart=True,
         ),
     )
     tailscale: TailscaleConfig = field(
@@ -2507,6 +2668,7 @@ class DashboardConfig:
         metadata=_meta(
             "Restore Sessions",
             "Re-open recently active sessions on startup.",
+            restart=True,
         ),
     )
     qr_session_until_restart: bool = field(
@@ -2555,6 +2717,7 @@ class DashboardConfig:
             "Restore Window Minutes",
             "Time window (minutes) for session restoration, and for surfacing "
             "channel conversations in the chat list (0-1440). 0 = no limit.",
+            restart=True,
         ),
     )
     surface_channel_sessions: bool = field(
@@ -2564,6 +2727,7 @@ class DashboardConfig:
             "Show recently active Slack/Discord/Teams (etc.) conversations in the "
             "dashboard's chat list instead of only under History. Uses the same "
             "recency window as session restoration.",
+            restart=True,
         ),
     )
     bot_name: str = field(
@@ -2620,8 +2784,8 @@ class DashboardConfig:
             "host-dependent: a gateway with many concurrent slots overflows "
             "this bound while the byte ceiling still has headroom, and the "
             "cache hit rate collapses to zero (every save re-pays redaction). "
-            "Raise it on a many-slot host. Clamped to 256..262144. Read once "
-            "at first use; a change takes effect on the next gateway restart.",
+            "Raise it on a many-slot host. Clamped to 256..262144. Applies to "
+            "the next chat save; no restart needed.",
         ),
     )
     chat_entry_cache_max_bytes: int = field(
@@ -2631,8 +2795,8 @@ class DashboardConfig:
             "Memory ceiling in bytes for the chat save path's persisted-message "
             "entry memo. Evicted alongside the entry-count bound; raise it "
             "together with the entry bound when a many-slot host needs a "
-            "larger cache. Clamped to 4 MiB..512 MiB. Read once at first use; "
-            "a change takes effect on the next gateway restart.",
+            "larger cache. Clamped to 4 MiB..512 MiB. Applies to the next chat "
+            "save; no restart needed.",
         ),
     )
     cautious_boot: bool = field(
@@ -2645,6 +2809,7 @@ class DashboardConfig:
             "session restores — with short pauses instead of launching "
             "everything at once, so a host still under memory pressure is "
             "not pushed straight back into the same collapse.",
+            restart=True,
         ),
     )
     default_memory_mode: str = field(
@@ -2699,13 +2864,11 @@ class DashboardConfig:
             "filler, keep code/errors verbatim); 'ultra' writes for an ADHD "
             "reader — the answer lands in a 3-sentence opening, and any detail "
             "after it must be scannable bullets rather than prose; "
-            "'answer_only' drops explanation altogether — the answer or "
-            "artifact alone, with at most one sentence of context, and detail "
-            "only when the user asks for it, when the decision is "
-            "consequential enough (security, exposure, data loss, spend, "
-            "anything hard to undo) that they cannot choose correctly without "
-            "the reasoning, or as the undo path that rides along with a "
-            "destructive command. At every level security warnings and "
+            "'answer_only' drops explanation altogether — the answer alone, drawn "
+            "as a picture when it has a shape, in sentences of at most twelve "
+            "plain words; detail only when the user asks for it, plus one undo "
+            "line for a destructive command and one risk line for anything "
+            "touching security, data or spend. At every level security warnings and "
             "irreversible-action confirmations always appear but stay brief, "
             "and ordered multi-step instructions stay complete.",
             enum=["default", "concise", "ultra", "answer_only"],
@@ -2749,6 +2912,7 @@ class DashboardConfig:
         metadata=_meta(
             "Auto Open Browser",
             "Open the dashboard URL in the default browser on gateway startup.",
+            restart=True,
         ),
     )
     prevent_sleep: bool = field(
@@ -3084,6 +3248,19 @@ class DashboardConfig:
             "panel falls back to the link-out 'Open in Jira' behavior.",
         ),
     )
+    link_patterns: list[LinkPatternRule] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Transcript Link Patterns",
+            "Rewrite matching plain text in chat transcripts into clickable "
+            "links at display time (e.g. ticket ids like PROJ-123 to your "
+            "tracker). Each rule pairs a JavaScript regex with an absolute "
+            "http(s) URL template in which '{match}' inserts the matched "
+            "text, percent-encoded. Rendering-only: stored messages never change. Text "
+            "inside code blocks, existing links, and raw HTML is not rewritten; "
+            "an inline code span whose whole text matches becomes a link chip.",
+        ),
+    )
 
 
 @dataclass
@@ -3218,6 +3395,14 @@ class WorkspaceConfig:
 
 @dataclass
 class MemoryStoreConfig:
+    owner_member: str = field(
+        default="",
+        metadata=_meta("Owner Member", "The sole Crew Member owning this private memory store."),
+    )
+    memory_version: int = field(
+        default=1,
+        metadata=_meta("Memory Version", "1 for existing memory; 2 for private member memory."),
+    )
     description: str = field(
         default="",
         metadata=_meta("Description", "Human-readable purpose of this memory store."),
@@ -4541,6 +4726,7 @@ class McpGatewayConfig:
             "mismatch, so every forwarded key is one all co-tenants of that "
             "backend declared identically. Turn it OFF to make an env-declaring "
             "server run unwrapped (no stub, no pooling) instead.",
+            restart=True,
         ),
     )
     socket_path: str = field(
@@ -4551,6 +4737,7 @@ class McpGatewayConfig:
             "$KIROCREW_HOME/mcp-gateway/gateway.sock. A unix socket at this path "
             "on POSIX; on Windows the path is not created, it only derives the "
             "named-pipe name and locates the lock file beside it.",
+            restart=True,
         ),
     )
     overlay_dir: str = field(
@@ -4560,11 +4747,18 @@ class McpGatewayConfig:
             "Directory of rewritten agent JSON. Broker stubs from these specs are "
             "injected into each kiro-cli session via ACP session/new. "
             "Empty -> $KIROCREW_HOME/mcp-gateway/agents.",
+            restart=True,
         ),
     )
     idle_timeout_secs: int = field(
         default=300,
-        metadata=_meta("Idle Timeout", "Seconds a refcount=0 MCP backend is kept before drain."),
+        metadata=_meta(
+            "Idle Timeout",
+            "Seconds a refcount=0 MCP backend is kept before drain. Sizes the "
+            "daemon's idle sweeper at startup, so it rides the broker's command "
+            "line and a change needs a broker restart.",
+            restart=True,
+        ),
     )
     resolve_once_refresh_hours: int = field(
         default=24,
@@ -4591,6 +4785,7 @@ class McpGatewayConfig:
             "agents with ~S servers each need N*S slots. Bounded by design: idle "
             "backends drain after idle_timeout_secs, so steady-state RAM tracks real "
             "concurrency, not this ceiling.",
+            restart=True,
         ),
     )
     stub_servers: list[str] = field(
@@ -4605,6 +4800,7 @@ class McpGatewayConfig:
             "broker, and an empty list means no broker runs at all. Whether "
             "stubbed servers SHARE one backend is the separate global switch "
             "(mcp_gateway.enabled). Managed from MCP Management.",
+            restart=True,
         ),
     )
     poolable_servers: list[str] = field(
@@ -4617,6 +4813,7 @@ class McpGatewayConfig:
             "so migrating it to the stub set preserves its behaviour. There is no "
             "per-server sharing switch any more — sharing is global over the "
             "stub set.",
+            restart=True,
         ),
     )
     stub_overrides: dict[str, bool] = field(
@@ -4632,6 +4829,7 @@ class McpGatewayConfig:
             "without pinning yourself to today's roster. Written by MCP "
             "Management when a toggle disagrees with the roster, and dropped "
             "again when you toggle it back to agree. Empty by default.",
+            restart=True,
         ),
     )
     #: The roster EXACTLY as the file states it, carried so a full-file rewrite
@@ -4682,6 +4880,7 @@ class McpGatewayConfig:
             "AWS_SECRET*, AWS_SESSION*, SSH_AUTH_SOCK*, GNUPGHOME*, "
             "GIT_ASKPASS*) are ignored here — that scrub is a separate, broader "
             "guard this setting does not lift. Empty by default.",
+            restart=True,
         ),
     )
     prewarm_count: int = field(
@@ -4697,6 +4896,7 @@ class McpGatewayConfig:
             "socket; channel_id is a stable id, so a prewarmed backend is "
             "reused by every later new-chat in that channel. 0 (default) "
             "disables prewarming — no hot-key file is read or written.",
+            restart=True,
         ),
     )
     read_buffer_limit_bytes: int = field(
@@ -4706,6 +4906,7 @@ class McpGatewayConfig:
             "Maximum bytes for a single MCP response line before asyncio drops it. "
             "Default 64 MiB. Responses exceeding this are fast-failed with -32000. "
             "Env override: KIROCREW_MCP_READ_LIMIT.",
+            restart=True,
         ),
     )
     response_spill_threshold_bytes: int = field(
@@ -4715,7 +4916,9 @@ class McpGatewayConfig:
             "Tool-call responses larger than this (bytes) have their text content "
             "written to ~/.kiro/crew/mcp_spill/ and truncated inline to 16 KiB + "
             "a file path marker. Default 256 KiB. Set 0 to disable spilling. "
-            "Env override: KIROCREW_MCP_SPILL_THRESHOLD.",
+            "Env override: KIROCREW_MCP_SPILL_THRESHOLD. Read by the MCP broker "
+            "when it starts, like every other field of this section.",
+            restart=True,
         ),
     )
 
@@ -4780,6 +4983,7 @@ class InstancesConfig:
             "Enable multi-instance management — lets this gateway open SSH tunnels "
             "to remote Kiro Crews and embed their dashboards. Default off (opt-in). "
             "Enabling also scopes a CSP frame-src relaxation to active tunnel ports.",
+            restart=True,
         ),
     )
     warm_set_cap: int = field(
@@ -4804,6 +5008,7 @@ class InstancesConfig:
             "Tunnel Base Port",
             "First local loopback port used for an SSH -L forward. The allocator "
             "increments from here, skipping ports already in use.",
+            restart=True,
         ),
     )
     ssh_compression: bool = field(
@@ -5312,7 +5517,9 @@ class ResourceLimitsConfig:
 class TunnelConfig:
     enabled: bool = field(
         default=False,
-        metadata=_meta("Enabled", "Enable a tunnel to expose the dashboard for remote access."),
+        metadata=_meta(
+            "Enabled", "Enable a tunnel to expose the dashboard for remote access.", restart=True
+        ),
     )
     name_mode: str = field(
         default="username",
@@ -5321,6 +5528,7 @@ class TunnelConfig:
             "Tunnel naming: 'username' uses 'kirocrew', "
             "'hash' uses 'kirocrew-<hostHash>' for multi-host disambiguation.",
             enum=["username", "hash"],
+            restart=True,
         ),
     )
     name_override: str = field(
@@ -5329,6 +5537,7 @@ class TunnelConfig:
             "Name Override",
             "Explicit tunnel name (overrides name_mode). "
             "Note: some tunnel providers prefix your username (e.g. 'foo' becomes '<user>-foo').",
+            restart=True,
         ),
     )
 
@@ -5721,6 +5930,92 @@ def _coerce_jira_hosts(raw: object) -> list[str]:
             continue
         out.append(host)
     return out
+
+
+def _coerce_link_patterns(raw: object) -> list[LinkPatternRule]:
+    """Coerce the transcript link rules, skipping malformed entries.
+
+    Same fail-open-per-entry discipline as the host allowlists: a hand-edited
+    bad entry is dropped rather than failing the whole config load. Regex
+    VALIDITY is deliberately not checked here -- the pattern is compiled by the
+    browser in the JavaScript dialect, and Python's ``re`` accepts/rejects a
+    different language; the frontend skips rules that fail to compile.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[LinkPatternRule] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if len(out) >= LINK_PATTERNS_MAX:
+            break
+        if not isinstance(entry, dict):
+            continue
+        pattern = entry.get("pattern")
+        url = entry.get("url")
+        if not isinstance(pattern, str) or not isinstance(url, str):
+            continue
+        # Whitespace in a regex is load-bearing (`PROJ-\d+ ` and `PROJ-\d+`
+        # match different text), so the pattern is stored EXACTLY as authored;
+        # strip() decides only whether it is blank. URLs are the opposite:
+        # the validator below refuses whitespace in the authority and the
+        # template is expanded, not matched, so edge-trimming cannot change
+        # meaning.
+        url = url.strip()
+        if not pattern.strip() or len(pattern) > LINK_PATTERN_PATTERN_MAX_LEN:
+            continue
+        if len(url) > LINK_PATTERN_URL_MAX_LEN:
+            continue
+        # http(s) only: the rewrite mints anchors into every transcript, so a
+        # javascript:/file: template must never survive to the renderer even
+        # though the frontend re-checks. link_pattern_url_ok also mirrors the
+        # renderer's origin-stability rule (no userinfo, no '{match}' in the
+        # authority) so what the config stores is what actually renders.
+        if not link_pattern_url_ok(url):
+            continue
+        # First-wins on duplicate patterns. The settings PUT rejects
+        # duplicates outright, so this only meets hand-edited config files —
+        # where dropping the shadowed twin beats dropping the whole list.
+        if pattern in seen:
+            continue
+        seen.add(pattern)
+        out.append(LinkPatternRule(pattern=pattern, url=url))
+    return out
+
+
+def link_pattern_url_ok(url: str) -> bool:
+    """True when *url* is a link-pattern template the renderer will accept.
+
+    Mirrors the frontend's ``normaliseHref``: beyond the http(s) + ``{match}``
+    floor, the renderer substitutes two DIFFERENT canary tokens and requires
+    the same origin both times, which rejects a ``{match}`` sitting in the
+    authority (where the token could steer the host) and any userinfo (which
+    ``safeHttpUrl`` refuses outright). Enforcing the same rules here keeps the
+    save honest: without them a template like ``https://{match}.example/x`` or
+    ``https://u:p@host/{match}`` stores fine, renders nothing, and shows no
+    warning anywhere.
+    """
+    # Scheme case-insensitively, like the browser's URL parser the editor
+    # validates with: `HTTPS://x/{match}` must not pass the inline check and
+    # then die at the PUT with no warning. urlsplit below lowercases the
+    # scheme itself, so the origin comparison already agrees.
+    if not url.lower().startswith(("https://", "http://")) or "{match}" not in url:
+        return False
+    try:
+        origins = set()
+        for canary in ("aaa", "bbb"):
+            parts = _urlsplit(url.replace("{match}", canary))
+            # Userinfo never survives the renderer's safeHttpUrl, and the
+            # browser's URL parser refuses whitespace in the authority that
+            # Python's urlsplit tolerates — either way the rule would store
+            # fine and silently never linkify.
+            if "@" in parts.netloc or not parts.hostname:
+                return False
+            if any(ch.isspace() for ch in parts.netloc):
+                return False
+            origins.add((parts.scheme, parts.hostname, parts.port))
+        return len(origins) == 1
+    except ValueError:
+        return False
 
 
 def _coerce_int(raw: object, default: int) -> int:
@@ -6116,6 +6411,7 @@ class WhatsAppConfig:
             "and moving it elsewhere would take the credential out from behind "
             "the one control that stops an agent reading it.",
             tags=["whatsapp"],
+            restart=True,
         ),
     )
     soft_threshold_pct: int = field(

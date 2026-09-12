@@ -1175,6 +1175,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.text-link-patterns",
+    "label": "Text Link Patterns",
+    "labelKey": "pages.settings.chatPanel.link_patterns",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "dashboard.link_patterns"
+  },
+  {
     "id": "chat.text-streaming-style",
     "label": "Text Streaming Style",
     "labelKey": "pages.settings.chatPanel.text_streaming_style",
@@ -1264,10 +1273,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
-    "id": "developer.crew-members-and-crew-mode",
-    "label": "Crew Members and Crew Mode",
-    "labelKey": "pages.developer.featurePreviewsTab.crew",
-    "description": "The Crew Members page and Crew Mode chats. Both are still being built, so neither is offered until you turn this on.",
+    "id": "developer.crew-members",
+    "label": "Crew Members",
+    "labelKey": "pages.developer.featurePreviewsTab.crew_members",
+    "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1576,15 +1585,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "label": "Webhook",
     "description": "External hook triggers"
-  },
-  {
-    "id": "overview.kiro-sign-in",
-    "labelKey": "pages.settings.kiroSignInCard.title",
-    "tab": "overview",
-    "type": "buttonGroup",
-    "occurrence": 1,
-    "label": "Kiro sign-in",
-    "description": "Sign in to the Kiro account your agents run as, or sign out of it."
   },
   {
     "id": "privacy.record-metrics",
