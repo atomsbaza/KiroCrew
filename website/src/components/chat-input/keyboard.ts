@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { consumeComposerRelease } from '../../pages/chat/composerFocus'
 import { isTouchDevice } from '../../utils/isTouchDevice'
+import { IS_MAC } from '../../hooks/useKeyboardShortcuts'
 import { activeElementIsEditable, isEditableTarget } from '../../utils/editableTarget'
 import type { useImeGuard } from '../../hooks/useImeGuard'
 import type { SendMode } from '../../pages/chat/ChatSettings'
@@ -100,7 +101,7 @@ export function useComposerFocus({ autoFocusKey, disabled, isMobile, composerCon
   }, [typedCommandMenus, composerCollapsed, expandComposer, composerControl])
 }
 
-export function useComposerKeyDown({ rawPasteRef, handleUndoKey, handleTokenKey, promptOptimizer, connected, optimizePrompt, sendOnEnter, onChange, optimizingRef, fireComposer, ime, sentMessages, anyPickerOpenRef, promptHistory, valueRef, inputRef }: {
+export function useComposerKeyDown({ rawPasteRef, handleUndoKey, handleTokenKey, promptOptimizer, connected, optimizePrompt, sendOnEnter, onChange, optimizingRef, fireComposer, ime, sentMessages, onEditLastRequest, anyPickerOpenRef, promptHistory, valueRef, inputRef }: {
   rawPasteRef: React.MutableRefObject<boolean>
   handleUndoKey: (e: React.KeyboardEvent<HTMLTextAreaElement>) => boolean
   handleTokenKey: (e: React.KeyboardEvent<HTMLTextAreaElement>) => boolean
@@ -113,6 +114,7 @@ export function useComposerKeyDown({ rawPasteRef, handleUndoKey, handleTokenKey,
   fireComposer: (alternate?: unknown) => void
   ime: ReturnType<typeof useImeGuard>
   sentMessages?: PromptHistoryItem[]
+  onEditLastRequest?: () => void
   anyPickerOpenRef: React.RefObject<boolean>
   promptHistory: ReturnType<typeof usePromptHistory>
   valueRef: React.MutableRefObject<string>
@@ -189,6 +191,19 @@ export function useComposerKeyDown({ rawPasteRef, handleUndoKey, handleTokenKey,
       if (connected) fireComposer(alternate)
       return
     }
+    // ⌘↑ / Ctrl+↑: edit the last user message. Fires only from an
+    // EMPTY composer (the same gate the plain-↑ recall below uses, so it can
+    // never shadow multi-line caret movement), and not while a picker menu
+    // owns the composer or IME composition is in flight.
+    if (
+      e.key === 'ArrowUp' && (IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey) && !e.altKey && !e.shiftKey &&
+      onEditLastRequest && valueRef.current === '' &&
+      !anyPickerOpenRef.current && !ime.isComposing(e)
+    ) {
+      e.preventDefault()
+      onEditLastRequest()
+      return
+    }
     // Prompt history: ↑/↓ cycles through prior user messages.
     // Ignore when IME composing, no history, modifier keys, or when
     // slash-command / file-picker / skill-picker menus are open (they own ↑/↓).
@@ -199,7 +214,7 @@ export function useComposerKeyDown({ rawPasteRef, handleUndoKey, handleTokenKey,
       e.metaKey || e.ctrlKey || e.altKey || e.shiftKey
     ) return
     promptHistory.recall(e, { sentMessages, current: valueRef.current, onChange, inputRef })
-  }, [rawPasteRef, handleUndoKey, handleTokenKey, promptOptimizer, connected, optimizePrompt, sendOnEnter, onChange, optimizingRef, fireComposer, ime, sentMessages, anyPickerOpenRef, promptHistory, valueRef, inputRef])
+  }, [rawPasteRef, handleUndoKey, handleTokenKey, promptOptimizer, connected, optimizePrompt, sendOnEnter, onChange, optimizingRef, fireComposer, ime, sentMessages, onEditLastRequest, anyPickerOpenRef, promptHistory, valueRef, inputRef])
 }
 
 /** The editor's change handlers. Both mark the edit as the user's (the undo

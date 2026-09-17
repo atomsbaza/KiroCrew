@@ -166,6 +166,7 @@ function ChatInput({
   projectDetached,
   memoryMode,
   sentMessages,
+  onEditLastRequest,
   onAutomationClick,
   automation,
   automationOpen,
@@ -453,7 +454,7 @@ function ChatInput({
   } = usePasteTokens({ value, onChange, pasteBlocks, onPasteBlocksChange, showFullPastes, onUploadFiles, inputRef, valueRef, valueFromUserRef, recordCaret, ime })
   const handleKeyDown = useComposerKeyDown({
     rawPasteRef, handleUndoKey, handleTokenKey, promptOptimizer, connected, optimizePrompt, sendOnEnter, onChange, optimizingRef,
-    fireComposer, ime, sentMessages, anyPickerOpenRef, promptHistory, valueRef, inputRef,
+    fireComposer, ime, sentMessages, onEditLastRequest, anyPickerOpenRef, promptHistory, valueRef, inputRef,
   })
   const { handleTextareaChange, handleLexicalChange } = useEditorInput({ onChange, valueFromUserRef, openPickersForText, recordCaret, lexicalControlRef, voiceCaretRef })
 
@@ -868,6 +869,7 @@ function ChatInput({
                 onSelectionChange={publishLexicalSelection}
                 sentMessages={sentMessages}
                 historyScope={slotId}
+                onEditLastRequest={onEditLastRequest}
                 ariaLabel={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
                 placeholder={activePlaceholder}
                 disabled={disabled}

@@ -254,6 +254,11 @@ export interface ChatInputProps {
   memoryMode?: string
   /** User-sent messages for ↑/↓ history navigation (oldest → newest). */
   sentMessages?: PromptHistoryItem[]
+  /** ⌘↑ (macOS) / Ctrl+↑ elsewhere — edit the last user message.
+   *  Claimed by the composer, not the global shortcut handler; fires only from
+   *  an EMPTY composer so it never shadows multi-line caret movement or the
+   *  ↑/↓ history recall. */
+  onEditLastRequest?: () => void
   /** Authoritative automation record for this slot (if any). */
   onAutomationClick?: (open: boolean) => void
   automation?: AutomationRecord | null
