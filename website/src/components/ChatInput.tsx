@@ -640,6 +640,11 @@ interface ChatInputProps {
   memoryMode?: string
   /** User-sent messages for ↑/↓ history navigation (oldest → newest). */
   sentMessages?: string[]
+  /** ⌘↑ (macOS) / Ctrl+↑ elsewhere — edit the last user message.
+   *  Claimed by the composer, not the global shortcut handler; fires only from
+   *  an EMPTY composer so it never shadows multi-line caret movement or the
+   *  ↑/↓ history recall. */
+  onEditLastRequest?: () => void
   /** Authoritative automation record for this slot (if any). */
   onAutomationClick?: (open: boolean) => void
   automation?: AutomationRecord | null
@@ -989,6 +994,7 @@ function ChatInput({
   projectDetached,
   memoryMode,
   sentMessages,
+  onEditLastRequest,
   onAutomationClick,
   automation,
   automationOpen,
@@ -2922,6 +2928,20 @@ function ChatInput({
       if (connected) fireComposer(alternate)
       return
     }
+    // ⌘↑ / Ctrl+↑: edit the last user message. Fires only from an
+    // EMPTY composer (the same gate the plain-↑ recall below uses, so it can
+    // never shadow multi-line caret movement), and not while a picker menu
+    // owns the composer or IME composition is in flight.
+    if (
+      e.key === 'ArrowUp' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey &&
+      onEditLastRequest && valueRef.current === '' &&
+      !slashMenuOpenRef.current && !filePickerOpenRef.current && !skillPickerOpenRef.current &&
+      !ime.isComposing(e)
+    ) {
+      e.preventDefault()
+      onEditLastRequest()
+      return
+    }
     // Prompt history: ↑/↓ cycles through prior user messages.
     // Ignore when IME composing, no history, modifier keys, or when
     // slash-command / file-picker / skill-picker menus are open (they own ↑/↓).
@@ -2984,7 +3004,7 @@ function ChatInput({
       }
       e.preventDefault()
     }
-  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt, promptOptimizer])
+  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt, promptOptimizer, onEditLastRequest])
 
   /** Intercept clipboard paste — files go to upload path, big text gets collapsed into a token. */
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -4202,6 +4222,7 @@ function ChatInput({
                 onReady={markLexicalReady}
                 onSelectionChange={publishLexicalSelection}
                 sentMessages={sentMessages}
+                onEditLastRequest={onEditLastRequest}
                 ariaLabel={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
                 placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : transcribingIsHonest ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder}
                 disabled={disabled}
