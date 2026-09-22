@@ -2689,10 +2689,6 @@ def _tailnet_governance_pinned_off() -> bool:
 
 async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     """PATCH /api/config/kirocrew — update a single config field."""
-    denied = await require_owner_dashboard_request(request, "config.patch")
-    if denied is not None:
-        return denied
-
     from kiro_crew.config.loader import ConfigReadError, config_path, update_config_locked
 
     caller = request.get("user")
@@ -2718,10 +2714,42 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
+        body = None
+
+    path_key: str = ""
+    value: Any = None
+    if isinstance(body, dict):
+        path_key = body.get("path", "")
+        value = body.get("value")
+
+    # ── Owner gate: every write but the one that STOPS billed spend ──
+    # The route is owner-only because a dashboard token is not ownership: an
+    # allow-listed messaging user holds one, and these fields are machine-global.
+    #
+    # `dashboard.usage_text_scrape_enabled` is asymmetric. Enabling it makes the
+    # credit pill fall back to a REAL billed `kiro-cli /usage` turn and repeat it
+    # every refresh interval, and nothing self-corrects an enabled state, so the
+    # ENABLE needs the owner like every other write here. The DISABLE does not:
+    # refusing it would leave someone able to see spend they cannot stop, and the
+    # narrower choice always composes.
+    # `test_a_non_owner_may_still_switch_the_billing_off` pins that direction.
+    #
+    # This gate is the ONE place that distinction is enforced. A second per-field
+    # gate for the same field, sitting with the telemetry ones below, would be
+    # unreachable behind this one -- an authorization record that cannot fire and
+    # is free to drift from the one that does.
+    #
+    # Reading the requested direction first is what makes the carve-out possible;
+    # an unparseable or bodyless request names no direction, so it is not the
+    # carve-out and is refused here, before any field is validated.
+    if not (path_key == "dashboard.usage_text_scrape_enabled" and value is False):
+        denied = await require_owner_dashboard_request(request, "config.patch")
+        if denied is not None:
+            return denied
+
+    if not isinstance(body, dict):
         return _deny("invalid JSON", "invalid JSON body")
 
-    path_key = body.get("path", "")
-    value = body.get("value")
     spec = _EDITABLE_CONFIG.get(path_key)
     if not spec:
         # `agent.apps_allow_third_party` was deliberately REMOVED from the editable
@@ -2869,26 +2897,6 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 },
                 status=400,
             )
-
-    # ── Enabling the billed credit-meter fallback is owner-only ──
-    # Every other path in the allowlist is a preference, so the route's "any
-    # authenticated caller" bar is the right one for them. It is not the right bar
-    # for this one: enabling it makes the credit pill fall back to a REAL billed
-    # `kiro-cli /usage` turn, and repeat it every refresh interval for as long as
-    # any tab is open. A dashboard token does not imply ownership -- an
-    # allow-listed messaging user holds one -- so without this gate a non-owner
-    # could start recurring spend on the owner's account, and nothing
-    # self-corrects an enabled state.
-    #
-    # Only the ENABLE is gated, exactly like the two telemetry writes below:
-    # turning billing OFF must never require authorization. Refusing that would
-    # leave someone able to see spend they cannot stop, and the narrower choice
-    # always composes.
-    if path_key == "dashboard.usage_text_scrape_enabled" and value is True:
-        denial = await require_owner_dashboard_request(request, "config.patch.usage_text_scrape")
-        if denial is not None:
-            _log_sel("denied", f"{path_key}={value}")
-            return denial
 
     # ── Governance: refuse a write an enterprise ceiling has pinned ──
     # Only re-ENABLING is refused. Writing `false` is always allowed even under a
