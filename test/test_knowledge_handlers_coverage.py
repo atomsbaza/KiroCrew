@@ -767,10 +767,16 @@ class TestImportBundle:
         # foreign key this arm exists for. An undeclared source is refused earlier,
         # by the store's own typed rejection, and is covered separately.
         bundle = {
-            "sources": [{"id": "s1", "name": "A", "source_type": "local_file",
-                         "uri": "/a.md", "created_at": "2024-01-01T00:00:00"}],
-            "source_locations": [
-                {"id": "sl1", "item_id": "missing-item", "source_id": "s1"}],
+            "sources": [
+                {
+                    "id": "s1",
+                    "name": "A",
+                    "source_type": "local_file",
+                    "uri": "/a.md",
+                    "created_at": "2024-01-01T00:00:00",
+                }
+            ],
+            "source_locations": [{"id": "sl1", "item_id": "missing-item", "source_id": "s1"}],
         }
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
@@ -1137,10 +1143,16 @@ class TestImportBundle:
         # insert; the missing ITEM is what trips the foreign key, which is the arm
         # whose driver text must not escape.
         bundle = {
-            "sources": [{"id": "s1", "name": "A", "source_type": "local_file",
-                         "uri": "/a.md", "created_at": "2024-01-01T00:00:00"}],
-            "source_locations": [
-                {"id": "sl1", "item_id": "missing-item", "source_id": "s1"}],
+            "sources": [
+                {
+                    "id": "s1",
+                    "name": "A",
+                    "source_type": "local_file",
+                    "uri": "/a.md",
+                    "created_at": "2024-01-01T00:00:00",
+                }
+            ],
+            "source_locations": [{"id": "sl1", "item_id": "missing-item", "source_id": "s1"}],
         }
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
@@ -1157,28 +1169,38 @@ class TestImportBundle:
         to be the real text -- and it carries no length bound, so the account naming it
         is where bundle text would otherwise reach a reader unfiltered."""
         bundle = {
-            "sources": [{"id": "s1", "name": "Auto-added", "source_type": "agent",
-                         "uri": "agent://", "created_at": "2024-01-01T00:00:00"}],
-            "agent_item_state": [{
-                "source_id": "s1",
-                "slug": "doc-AKIAIOSFODNN7EXAMPLE",
-                "content_hash": "h",
-                "item_ids": json.dumps(["absent-AKIAIOSFODNN7EXAMPLE"]),
-                "updated_at": "2024-01-01T00:00:00",
-                "name": "N",
-            }],
+            "sources": [
+                {
+                    "id": "s1",
+                    "name": "Auto-added",
+                    "source_type": "agent",
+                    "uri": "agent://",
+                    "created_at": "2024-01-01T00:00:00",
+                }
+            ],
+            "agent_item_state": [
+                {
+                    "source_id": "s1",
+                    "slug": "doc-AKIAIOSFODNN7EXAMPLE",
+                    "content_hash": "h",
+                    "item_ids": json.dumps(["absent-AKIAIOSFODNN7EXAMPLE"]),
+                    "updated_at": "2024-01-01T00:00:00",
+                    "name": "N",
+                }
+            ],
         }
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
             assert resp.status == 200
             result = await resp.json()
 
-        named = [w for w in result["withheld"]
-                 if w.get("reason") == "ownership_row_names_absent_items"]
+        named = [
+            w for w in result["withheld"] if w.get("reason") == "ownership_row_names_absent_items"
+        ]
         assert named, f"fixture must produce a withheld entry: {result['withheld']}"
-        assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(result), (
-            "bundle-authored credential text reached the import response"
-        )
+        assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(
+            result
+        ), "bundle-authored credential text reached the import response"
         assert "REDACTED" in named[0]["key"]
         assert "REDACTED" in named[0]["items"]
 
@@ -1189,18 +1211,34 @@ class TestImportBundle:
         document."""
         slug = "doc-AKIAIOSFODNN7EXAMPLE"
         bundle = {
-            "sources": [{"id": "s1", "name": "Auto-added", "source_type": "agent",
-                         "uri": "agent://", "created_at": "2024-01-01T00:00:00"}],
-            "items": [{"id": "i1", "title": "T", "content": "body",
-                       "item_type": "document", "source_id": "s1"}],
-            "agent_item_state": [{
-                "source_id": "s1",
-                "slug": slug,
-                "content_hash": "h",
-                "item_ids": json.dumps(["i1"]),
-                "updated_at": "2024-01-01T00:00:00",
-                "name": "N",
-            }],
+            "sources": [
+                {
+                    "id": "s1",
+                    "name": "Auto-added",
+                    "source_type": "agent",
+                    "uri": "agent://",
+                    "created_at": "2024-01-01T00:00:00",
+                }
+            ],
+            "items": [
+                {
+                    "id": "i1",
+                    "title": "T",
+                    "content": "body",
+                    "item_type": "document",
+                    "source_id": "s1",
+                }
+            ],
+            "agent_item_state": [
+                {
+                    "source_id": "s1",
+                    "slug": slug,
+                    "content_hash": "h",
+                    "item_ids": json.dumps(["i1"]),
+                    "updated_at": "2024-01-01T00:00:00",
+                    "name": "N",
+                }
+            ],
         }
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
