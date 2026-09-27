@@ -1277,7 +1277,7 @@ def _handle_app(args: argparse.Namespace) -> None:
                 elif safe_output:
                     print(f"   onEnable: {safe_output}")
                 # The script just ran with WRITE access to the app directory,
-                # so app.json on disk may no longer match the manifest this
+                # so app.json on disk may not match the manifest this
                 # enable was admitted under — the same tamper window the
                 # dashboard route's post-onEnable re-check closes. Re-read,
                 # re-verify identity, and re-run admission BEFORE

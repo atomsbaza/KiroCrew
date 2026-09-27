@@ -1107,8 +1107,8 @@ def install_app(
     install_script = manifest.setup.onInstall
     # A second, script-window-scoped backup of pre-existing data/, distinct
     # from tmp_data above: tmp_data is already consumed (moved into dest/data)
-    # by the time the script runs, so it is no longer available as a fallback
-    # if the script mutates or destroys data/ before failing. See
+    # by the time the script runs, so it is unavailable as a fallback if the
+    # script mutates or destroys data/ before failing. See
     # _remove_installed_tree_except_data's restore_data_from for why a bare
     # preserve_data is not enough here.
     data_backup = dest.parent / f".{name}-data-script-backup"

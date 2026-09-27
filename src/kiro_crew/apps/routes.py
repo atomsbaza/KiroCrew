@@ -2000,7 +2000,7 @@ async def handle_enable_app(request: web.Request) -> web.Response:
                         },
                         status=400,
                     )
-                # Fresh enable of a previously-disabled app: roll back fully.
+                # Fresh enable of a disabled app: roll back fully.
                 # stop_app_backend runs unconditionally (was_enabled is
                 # already False here, so there is nothing left to gate on) —
                 # a gateway app with backend.entryPoint can have its backend
