@@ -51,6 +51,8 @@ import { SIDE_PANEL_MOTION_MS, sidePanelDimTransition } from './sidePanelMount'
 import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
 import { mcpAppKey } from '../../store/chatSlice'
+import { runBelongsToSlot } from '../../apps/workflows/runModel'
+import type { WfRunRow } from './WorkflowSidebarRow'
 import McpAppFrame from '../../components/McpAppFrame'
 import { dashboardPreviewTargetFromRef } from '../../utils/dashboardPreview'
 import type { ExtractedLink } from '../../utils/extractChatLinks'
@@ -226,7 +228,8 @@ const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context', 'crewl
 /** Which `+`-menu entries are offered, given the gates that hide entries:
  *  Terminal is hidden when the feature is disabled server-side, the
  *  diagnostics views (Logs, Context breakdown) are hidden unless Developer
- *  Mode is on, and **Summary is hidden while session summaries are disabled**.
+ *  Mode is on, **Summary is hidden while session summaries are disabled**, and
+ *  **Workflows waits for the chat's run list to confirm a run**.
  *  The permanently pinned views (Changes / Files / Artifacts) are never listed;
  *  they are always present in the strip.
  *
@@ -249,7 +252,7 @@ const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context', 'crewl
  *  bucket would be orphaned by the re-key). Withheld here and from the pinned
  *  block alike — an empty view is worse than no view. */
 export function newMenuSections(
-  opts: { devMode: boolean; terminalEnabled: boolean; summaryEnabled: boolean; hiddenViews?: ReadonlySet<SidePanelWithholdable> },
+  opts: { devMode: boolean; terminalEnabled: boolean; summaryEnabled: boolean; workflowRunPresence: 'unknown' | 'none' | 'present'; hiddenViews?: ReadonlySet<SidePanelWithholdable> },
 ): { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] {
   return NEW_MENU_GROUPS
     .map(group => ({
@@ -258,6 +261,7 @@ export function newMenuSections(
         (opts.terminalEnabled || item.kind !== 'terminal')
         && (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind))
         && (opts.summaryEnabled || item.kind !== 'summary')
+        && (item.kind !== 'workflows' || opts.workflowRunPresence === 'present')
         && !opts.hiddenViews?.has(item.kind)
         && !(PINNED_VIEWS as string[]).includes(item.kind),
       ),
@@ -523,6 +527,7 @@ export default function SidePanel({
 }: SidePanelProps) {
   const { tabs, activeId: storedActiveId, openView, openPanelTab, openTerminal, openFolder, setActive, closeTab, patchTab, setOrder, syncPinned } = tabsCtl
   const hiddenViews = hostHiddenViews
+  const queryClient = useQueryClient()
   // A permanent panel has no close control and answers Escape with nothing —
   // the views' `onToggle` still needs a function, so it gets a no-op.
   const closable = !!onClose
@@ -545,6 +550,11 @@ export default function SidePanel({
   // panel is open, so the subscription now costs nothing when it is closed.
   const subagents = useAppSelector(s => selectSlotSubagents(s, slot))
   const toolLog = useAppSelector(s => selectSlotToolLog(s, slot))
+  // Live workflow activity is positive evidence that this chat has a run. Its
+  // absence is not negative evidence: terminal rows are deliberately cleared.
+  const slotHasWorkflowActivity = useAppSelector(s =>
+    Object.values(s.chat.workflowRuns ?? {}).some(run => runBelongsToSlot(run.sessionKey, slot)),
+  )
   const terminalEnabled = useTerminalEnabled()
   const devMode = useDevMode()
   // Whether to offer the Summary row at all. Read from the panel's OWN endpoint
@@ -565,11 +575,36 @@ export default function SidePanel({
     retry: false,
   })
   const summaryEnabled = summaryMeta?.enabled !== false
+  // The panel body and this gate share one run-list cache. A loaded list is
+  // filtered to this slot; a list that never loaded stays `unknown` and offers
+  // no row, so an unreadable first read never becomes an affirmative "none".
+  const workflowRunsQuery = useQuery<WfRunRow[]>({
+    queryKey: ['workflow-runs'],
+    queryFn: () => api.workflowRuns().then(d => (Array.isArray(d?.runs) ? (d.runs as WfRunRow[]) : [])),
+    enabled: !!slot,
+    staleTime: 0,
+  })
+  // A first SSE event means the authority now has the run this menu needs;
+  // refresh the shared list once rather than polling it while the chat idles.
+  useEffect(() => {
+    if (!slotHasWorkflowActivity) return
+    queryClient.invalidateQueries({ queryKey: ['workflow-runs'] })
+  }, [slotHasWorkflowActivity, queryClient])
+  // The loaded list is the only source of an affirmative "none"; stale answers
+  // keep their last known presence through a failed refresh.
+  const workflowRunsReadable = workflowRunsQuery.data !== undefined
+  const listHasSlotRun = workflowRunsReadable
+    && (workflowRunsQuery.data ?? []).some(run => runBelongsToSlot(run.session_key, slot))
+  const workflowRunPresence = slotHasWorkflowActivity || listHasSlotRun
+    ? 'present'
+    : workflowRunsReadable
+      ? 'none'
+      : 'unknown'
   // The + menu / empty-state launcher hide Terminal when the feature is
   // disabled server-side and Context breakdown unless Developer Mode is on, and
   // never list the permanently pinned views (Changes / Files / Artifacts) —
   // those are always present in the strip (see the syncPinned reconcile below).
-  const menuSections = newMenuSections({ devMode, terminalEnabled, summaryEnabled, hiddenViews })
+  const menuSections = newMenuSections({ devMode, terminalEnabled, summaryEnabled, workflowRunPresence, hiddenViews })
   // The empty-state launcher shows the same entries flat: its two-column grid
   // has nowhere to put a separator, but it must not disagree with the menu
   // about ORDER, so it reads the groups rather than its own list.

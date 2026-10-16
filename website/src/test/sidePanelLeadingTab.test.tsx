@@ -28,6 +28,7 @@ import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
+import { api } from '../api/client'
 
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
 vi.mock('../components/DiffPanel', () => ({ default: () => null }))
@@ -81,6 +82,8 @@ const THREE_TITLES = ['Notes', 'Work log', 'Dashboard'] as const
 let ctl: ReturnType<typeof usePanelTabs> | null = null
 /** What the strip reported it SHOWS (the `onActiveTabChange` contract). */
 let shown: string | null | undefined
+const sessionSummaryMock = vi.spyOn(api, 'sessionSummary')
+const workflowRunsMock = vi.spyOn(api, 'workflowRuns')
 
 interface HarnessProps {
   closable: boolean
@@ -139,7 +142,11 @@ const chips = () => screen.getAllByRole('tab')
 const nameOf = (el: HTMLElement) => el.getAttribute('aria-label') ?? el.textContent
 
 describe('SidePanel leading tab', () => {
-  beforeEach(() => { localStorage.clear(); __resetPanelTabs(); ctl = null; shown = undefined })
+  beforeEach(() => {
+    localStorage.clear(); __resetPanelTabs(); ctl = null; shown = undefined
+    sessionSummaryMock.mockResolvedValue({ enabled: true } as never)
+    workflowRunsMock.mockResolvedValue({ runs: [] })
+  })
 
   it('renders first, ahead of the pinned block, labelled, with the host icon and no close control', () => {
     renderPanel({ closable: false })
@@ -241,7 +248,7 @@ describe('SidePanel leading tab', () => {
     expect(screen.queryByRole('menuitem', { name: 'Terminal' })).toBeNull()
     expect(screen.queryByRole('menuitem', { name: 'Open Pippin' })).toBeNull()
     // Chat views are untouched by those two switches.
-    expect(screen.getByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'Links' })).toBeTruthy()
   })
 
   it('a withheld kind ALREADY in the bucket is neither rendered nor focused, but stays stored', () => {
@@ -351,7 +358,11 @@ describe('SidePanel leading tab', () => {
 })
 
 describe('SidePanel leading tabs — three host tabs', () => {
-  beforeEach(() => { localStorage.clear(); __resetPanelTabs(); ctl = null; shown = undefined })
+  beforeEach(() => {
+    localStorage.clear(); __resetPanelTabs(); ctl = null; shown = undefined
+    sessionSummaryMock.mockResolvedValue({ enabled: true } as never)
+    workflowRunsMock.mockResolvedValue({ runs: [] })
+  })
 
   const chipFor = (id: string) => screen.getByTestId(`side-panel-leading-tab-${id}`)
 

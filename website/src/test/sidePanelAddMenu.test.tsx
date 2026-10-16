@@ -13,6 +13,7 @@ import { render, screen, fireEvent, act, waitFor, within } from '@testing-librar
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
+import { api } from '../api/client'
 
 // Heavy tab bodies — none of them are what this test drives.
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
@@ -36,7 +37,6 @@ vi.mock('../utils/terminalRegistry', () => ({
 }))
 vi.mock('../hooks/useDevMode', () => ({ useDevMode: () => false }))
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => false }))
-
 // Disk preflight for a clean file tab's close batch (SidePanel.handleCloseTabs).
 // Default: every file is present on disk, so a clean tab needs no confirmation;
 // a test overrides this to make a file read 404 (gone) or fail.
@@ -51,8 +51,24 @@ globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} 
 import SidePanel, { newMenuSections, NEW_MENU_LABEL_KEY } from '../pages/chat/SidePanel'
 import { usePanelTabs, __resetPanelTabs } from '../hooks/usePanelTabs'
 import { LONG_PRESS_MS } from '../hooks/useLongPressReorder'
+import { sseWorkflowEvent } from '../store/chatSlice'
 
 let panelController: ReturnType<typeof usePanelTabs>
+let panelStore: ReturnType<typeof createTestStore>
+const sessionSummaryMock = vi.spyOn(api, 'sessionSummary')
+const workflowRunsMock = vi.spyOn(api, 'workflowRuns')
+
+const workflowRun = {
+  run_id: 'wf-run-1',
+  name: 'Plan release',
+  status: 'running',
+  session_key: 'dashboard:slot-a',
+}
+
+beforeEach(() => {
+  sessionSummaryMock.mockResolvedValue({ enabled: true } as never)
+  workflowRunsMock.mockResolvedValue({ runs: [] })
+})
 
 function Harness() {
   const tabsCtl = usePanelTabs('slot-a')
@@ -69,9 +85,10 @@ function Harness() {
 
 function renderPanel() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  panelStore = createTestStore()
   return render(
     <QueryClientProvider client={queryClient}>
-      <Provider store={createTestStore()}>
+      <Provider store={panelStore}>
         <Harness />
       </Provider>
     </QueryClientProvider>,
@@ -91,11 +108,160 @@ afterEach(() => { expect(unregisteredMarkers()).toEqual([]) })
 describe('side panel + menu (shadcn dropdown)', () => {
   beforeEach(() => { localStorage.clear() })
 
-  it('opens as an ARIA menu with the view items', () => {
+  it('offers Workflows after the run list confirms a chat run', async () => {
+    workflowRunsMock.mockResolvedValue({ runs: [workflowRun] })
     renderPanel()
-    expect(screen.queryByRole('menu')).toBeNull()
+    openMenu()
+    expect(await screen.findByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+  })
+
+  it('does not offer Workflows while the run list is loading', () => {
+    workflowRunsMock.mockReturnValue(new Promise(() => {}))
+    renderPanel()
+    openMenu()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+  })
+
+  it('does not offer Workflows after an empty run list loads', async () => {
+    renderPanel()
+    await act(async () => {})
     openMenu()
     expect(screen.getByRole('menu')).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+  })
+
+  it('does not offer Workflows after the run list fails', async () => {
+    workflowRunsMock.mockRejectedValue(new Error('run list unavailable'))
+    renderPanel()
+    await act(async () => {})
+    openMenu()
+    expect(screen.getByRole('menu')).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+  })
+
+  it('offers Workflows immediately from this slot\'s workflow event while its list loads', async () => {
+    workflowRunsMock.mockReturnValue(new Promise(() => {}))
+    renderPanel()
+    openMenu()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+    act(() => {
+      panelStore.dispatch(sseWorkflowEvent({
+        run_id: 'wf-run-1',
+        session_key: 'dashboard:slot-a',
+        type: 'run_started',
+        data: { name: 'Plan release' },
+      }))
+    })
+    expect(await screen.findByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+  })
+
+  it('offers Workflows immediately from this slot\'s workflow event after an empty list', async () => {
+    workflowRunsMock.mockResolvedValue({ runs: [] })
+    renderPanel()
+    await act(async () => {})
+    openMenu()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+    act(() => {
+      panelStore.dispatch(sseWorkflowEvent({
+        run_id: 'wf-run-1',
+        session_key: 'dashboard:slot-a',
+        type: 'run_started',
+        data: { name: 'Plan release' },
+      }))
+    })
+    expect(await screen.findByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+  })
+
+  it('offers Workflows immediately from this slot\'s workflow event after a failed list', async () => {
+    workflowRunsMock.mockRejectedValue(new Error('run list unavailable'))
+    renderPanel()
+    await act(async () => {})
+    openMenu()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+    act(() => {
+      panelStore.dispatch(sseWorkflowEvent({
+        run_id: 'wf-run-1',
+        session_key: 'dashboard:slot-a',
+        type: 'run_started',
+        data: { name: 'Plan release' },
+      }))
+    })
+    expect(await screen.findByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+  })
+
+  it('does not offer Workflows for another chat\'s workflow event', async () => {
+    workflowRunsMock.mockResolvedValue({ runs: [] })
+    renderPanel()
+    await act(async () => {})
+    openMenu()
+    act(() => {
+      panelStore.dispatch(sseWorkflowEvent({
+        run_id: 'wf-run-other',
+        session_key: 'dashboard:other-slot',
+        type: 'run_started',
+        data: { name: 'Other chat run' },
+      }))
+    })
+    expect(await screen.findByRole('menuitem', { name: 'Links' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+  })
+
+  it('offers Workflows while the menu is open once its first run arrives', async () => {
+    workflowRunsMock
+      .mockResolvedValueOnce({ runs: [] })
+      .mockResolvedValue({ runs: [workflowRun] })
+    renderPanel()
+    openMenu()
+    expect(await screen.findByRole('menuitem', { name: 'Links' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+    act(() => {
+      panelStore.dispatch(sseWorkflowEvent({
+        run_id: 'wf-run-1',
+        session_key: 'dashboard:slot-a',
+        type: 'run_started',
+        data: { name: 'Plan release' },
+      }))
+    })
+    expect(await screen.findByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+  })
+
+  it('keeps Workflows offered when a refresh of a loaded list fails', async () => {
+    workflowRunsMock
+      .mockResolvedValueOnce({ runs: [workflowRun] })
+      .mockRejectedValueOnce(new Error('refresh unavailable'))
+    renderPanel()
+    openMenu()
+    expect(await screen.findByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+    const callsBeforeRefresh = workflowRunsMock.mock.calls.length
+    fireEvent(window, new Event('visibilitychange'))
+    await waitFor(() => expect(workflowRunsMock).toHaveBeenCalledTimes(callsBeforeRefresh + 1))
+    expect(screen.getByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
+  })
+
+  it('does not offer Workflows when the loaded runs belong to another chat', async () => {
+    workflowRunsMock.mockResolvedValue({ runs: [{ ...workflowRun, session_key: 'dashboard:other-slot' }] })
+    renderPanel()
+    openMenu()
+    expect(await screen.findByRole('menuitem', { name: 'Links' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+  })
+
+  it('keeps an open Workflows tab while no run is offered', async () => {
+    renderPanel()
+    await waitFor(() => expect(workflowRunsMock).toHaveBeenCalled())
+    await act(async () => {})
+    act(() => { panelController.openView('workflows') })
+    expect(screen.getByRole('tab', { name: /Workflows/ })).toBeTruthy()
+    openMenu()
+    expect(screen.getByRole('menu')).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Workflows' })).toBeNull()
+  })
+
+  it('opens as an ARIA menu with the available view items', async () => {
+    workflowRunsMock.mockResolvedValue({ runs: [workflowRun] })
+    renderPanel()
+    openMenu()
+    expect(await screen.findByRole('menuitem', { name: 'Workflows' })).toBeTruthy()
     for (const label of ['Pins', 'Issues', 'Subagents', 'Workflows', 'Side Chat', 'Browser']) {
       expect(screen.getByRole('menuitem', { name: label })).toBeTruthy()
     }
@@ -107,10 +273,11 @@ describe('side panel + menu (shadcn dropdown)', () => {
     expect(screen.queryByRole('menuitem', { name: 'Context breakdown' })).toBeNull()
   })
 
-  it('opens the picked view as a tab', () => {
+  it('opens the picked Workflows view as a tab once a run is loaded', async () => {
+    workflowRunsMock.mockResolvedValue({ runs: [workflowRun] })
     renderPanel()
     openMenu()
-    act(() => { fireEvent.click(screen.getByRole('menuitem', { name: 'Workflows' })) })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Workflows' }))
     expect(screen.getByRole('tab', { name: /Workflows/ })).toBeTruthy()
   })
 
@@ -121,11 +288,13 @@ describe('side panel + menu (shadcn dropdown)', () => {
     expect(screen.queryByRole('menu')).toBeNull()
   })
 
-  it('puts the Browser row\'s find_ui marker on that menu item alone', () => {
+  it('puts the Browser row\'s find_ui marker on that menu item alone', async () => {
     // AddMenuItem forwards the marker to the menu item a person picks, and only
     // the Browser row carries one.
+    workflowRunsMock.mockResolvedValue({ runs: [workflowRun] })
     renderPanel()
     openMenu()
+    await screen.findByRole('menuitem', { name: 'Workflows' })
     const marked = document.body.querySelectorAll('[data-ui-location="chat.side-panel.browser"]')
     expect(marked).toHaveLength(1)
     expect(marked[0].getAttribute('role')).toBe('menuitem')
@@ -181,7 +350,18 @@ describe('side panel Dashboard view', () => {
 
 describe('newMenuSections', () => {
   const kinds = (o: { devMode: boolean; terminalEnabled: boolean; summaryEnabled?: boolean }) =>
-    newMenuSections({ summaryEnabled: true, ...o }).map(g => g.items.map(i => i.kind))
+    newMenuSections({ summaryEnabled: true, workflowRunPresence: 'present', ...o }).map(g => g.items.map(i => i.kind))
+
+  it('hides Workflows unless the loaded run list confirms one for the chat', () => {
+    const base = { devMode: true, terminalEnabled: true, summaryEnabled: true }
+    for (const workflowRunPresence of ['unknown', 'none'] as const) {
+      const flat = newMenuSections({ ...base, workflowRunPresence }).flatMap(g => g.items).map(i => i.kind)
+      expect(flat).not.toContain('workflows')
+      expect(flat).toContain('subagents')
+    }
+    expect(newMenuSections({ ...base, workflowRunPresence: 'present' }).flatMap(g => g.items).map(i => i.kind))
+      .toContain('workflows')
+  })
 
   it('partitions every catalogued view exactly once', () => {
     // Both gates open, so nothing is filtered but the auto-pinned views. Any
