@@ -1073,12 +1073,13 @@ async def _build_fleet() -> dict:
     legacy_prefixes = tuple(
         f"{r.split('/')[-1].lower()}-wt-" for r in (repository._FALLBACK_REPOS or [])
     )
+    repository._git_facts_retain({wt.get("path", "") for wt in worktrees})
     wts = []
     for wt in worktrees:
         path = wt.get("path", "")
         branch = wt.get("branch")
         is_main = wt.get("is_main", False)
-        g = await repository._git_info(path)
+        g, ahead = await repository._git_facts(path)
         pr = (await _pr_status_cached(branch, g.get("head_oid"))) if branch else None
         name = Path(path).name if not is_main else repository.BASE_BRANCH
 
@@ -1127,7 +1128,8 @@ async def _build_fleet() -> dict:
                 except Exception:  # noqa: BLE001
                     pass
 
-        ahead = await repository._git_ahead(path)
+        # `ahead` came from the cached facts read above (git cherry is the
+        # costliest fact and moves only when HEAD or the base ref does).
         # "shipped" drives the UI's "safe to remove" affordance — require a
         # POSITIVELY clean worktree (dirty is False, not merely unknown), so
         # the confirm dialog never promises a removal the backend will refuse.

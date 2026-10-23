@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 from pathlib import Path, PurePosixPath
 
 from kiro_crew.apps.builtins.dev_fleet import runtime
@@ -697,6 +698,157 @@ async def _git_ahead(path: str) -> int | None:
     return int(ar) if ar and ar.isdigit() else None
 
 
+# --- fleet-poll git facts cache (#23364) ---
+# A fleet rebuild needs six facts per worktree (branch, head, behind, ahead,
+# last commit time, dirty). Reading them costs ~8 git spawns -- `git cherry`
+# alone is seconds of CPU in a worktree far behind main -- and a /fleet tab
+# rebuilds every poll, so an idle fleet burned a core re-deriving answers that
+# had not changed. Every fact except `dirty` is a pure function of three things
+# git stores as small files: HEAD, the branch ref, and the base ref. So each
+# worktree's facts are cached against a stat signature of those files plus the
+# index, which is read without spawning anything.
+#
+# `dirty` also depends on the working tree, which no cheap stat can see (an
+# edited tracked file does not touch the index, an untracked file touches
+# nothing git owns). It is therefore re-queried once its own TTL lapses even
+# while the signature holds, bounding how stale a row's dirty flag can get.
+#
+# Only the fleet-row path reads through this. `_git_info`, `_git_ahead`,
+# `_real_dirty` and `_dirty_split` stay uncached, so every removal, discard,
+# rebase and prune decision still asks git fresh.
+_GIT_FACTS_DIRTY_TTL = 300.0
+_GIT_FACTS: dict[str, dict] = {}
+_GIT_SMALL_READ = 4096
+
+
+def _stat_sig(p: Path) -> tuple[int, int, int] | None:
+    """``(mtime_ns, size, inode)`` of *p*, or None when it cannot be stat'ed.
+
+    Inode joins the signature because git rewrites refs and the index by
+    renaming a lock file over them, so a same-size rewrite within one mtime tick
+    still changes it.
+    """
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def _read_small(p: Path) -> str | None:
+    try:
+        with p.open("rb") as fh:
+            return fh.read(_GIT_SMALL_READ).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+
+
+def _git_dirs(path: str) -> tuple[Path, Path] | None:
+    """``(gitdir, commondir)`` of the checkout at *path*, or None if unreadable.
+
+    A linked worktree's ``.git`` is a FILE pointing at its private admin dir,
+    whose ``commondir`` file locates the shared dir holding refs. Blocking --
+    executor only.
+    """
+    dotgit = Path(path) / ".git"
+    if dotgit.is_dir():
+        gitdir = dotgit
+    else:
+        ptr = _read_small(dotgit)
+        if ptr is None or not ptr.startswith("gitdir:"):
+            return None
+        gitdir = Path(path, ptr[len("gitdir:") :].strip())
+    common = gitdir
+    rel = _read_small(gitdir / "commondir")
+    if rel:
+        common = Path(gitdir, rel)
+    return gitdir, common
+
+
+def _git_state_key(dirs: tuple[Path, Path], remote: str) -> tuple | None:
+    """Stat signature of everything the cached ref-derived facts depend on.
+
+    Returns ``(refs_part, index_sig)``; the index is kept apart because the
+    status git runs for us can legitimately rewrite it. None means "do not
+    cache" -- an unrecognised layout (reftable, a HEAD that names no ``refs/``
+    entry) is safer re-queried than guessed at. Only stats and reads files, never
+    executes anything from the repository. Blocking -- executor only.
+    """
+    gitdir, common = dirs
+    if (common / "reftable").exists():
+        return None
+    head = _read_small(gitdir / "HEAD")
+    if not head:
+        return None
+    branch_ref: Path | None = None
+    if head.startswith("ref:"):
+        ref = head[len("ref:") :].strip()
+        if not ref.startswith("refs/") or ".." in ref.split("/"):
+            return None
+        branch_ref = common / ref
+    refs_part = (
+        remote,
+        head,
+        _stat_sig(gitdir / "HEAD"),
+        _stat_sig(branch_ref) if branch_ref is not None else None,
+        _stat_sig(common / "packed-refs"),
+        _stat_sig(common / "refs" / "remotes" / remote / BASE_BRANCH),
+    )
+    return refs_part, _stat_sig(gitdir / "index")
+
+
+def _git_facts_retain(paths: set[str]) -> None:
+    """Drop cached facts for worktrees that no longer exist."""
+    for gone in [p for p in _GIT_FACTS if p not in paths]:
+        del _GIT_FACTS[gone]
+
+
+async def _git_facts(path: str) -> tuple[dict, int | None]:
+    """``(_git_info, _git_ahead)`` for the fleet row, served from cache while the
+    worktree's ref/index signature is unchanged. See the cache note above.
+
+    A failed read (no HEAD, no ahead count) is never stored: a transient git
+    timeout must not be pinned until the next ref move.
+    """
+    loop = asyncio.get_running_loop()
+    dirs = await loop.run_in_executor(subprocess_executor(), _git_dirs, path)
+    if dirs is None:
+        _GIT_FACTS.pop(path, None)
+        return await _git_info(path), await _git_ahead(path)
+    remote = await _upstream_remote()
+    key = await loop.run_in_executor(subprocess_executor(), _git_state_key, dirs, remote)
+    ent = _GIT_FACTS.get(path)
+    if key is not None and ent is not None and ent["key"] == key:
+        info = dict(ent["info"])
+        if time.monotonic() - ent["dirty_at"] > _GIT_FACTS_DIRTY_TTL:
+            st = await _git(path, "status", "--porcelain")
+            if st is not None:
+                info["dirty"] = len(st) > 0
+                ent["info"]["dirty"] = info["dirty"]
+                ent["dirty_at"] = time.monotonic()
+        return info, ent["ahead"]
+    info = await _git_info(path)
+    ahead = await _git_ahead(path)
+    if key is None or info.get("head_oid") is None or ahead is None:
+        _GIT_FACTS.pop(path, None)
+        return info, ahead
+    # The status inside `_git_info` may have refreshed (rewritten) the index.
+    # Adopt the post-run index signature when nothing else moved, otherwise the
+    # next poll would see its own side effect as a change and re-run everything.
+    # A user's `git add` landing inside this window is indistinguishable from
+    # that refresh; its effect on `dirty` is bounded by the dirty TTL.
+    after = await loop.run_in_executor(subprocess_executor(), _git_state_key, dirs, remote)
+    if after is not None and after[0] == key[0]:
+        key = after
+    _GIT_FACTS[path] = {
+        "key": key,
+        "info": dict(info),
+        "ahead": ahead,
+        "dirty_at": time.monotonic(),
+    }
+    return info, ahead
+
+
 async def _own_commits_count(path: str) -> int | None:
     remote = await _upstream_remote()
     out = await _git(path, "rev-list", "--count", f"{remote}/{BASE_BRANCH}..HEAD")
@@ -1059,6 +1211,8 @@ __all__ = (
     "_find_worktree_sync",
     "_git",
     "_git_ahead",
+    "_git_facts",
+    "_git_facts_retain",
     "_git_info",
     "_is_kirocrew_checkout",
     "_load_dev_fleet_cfg",
